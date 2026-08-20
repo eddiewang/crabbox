@@ -40,6 +40,7 @@
 ### Added
 
 - Added Linux SSH `--download-on-failure` retrieval after an owned nonzero workload exit, preserving the exit code and collecting selected evidence before failure bundles and teardown.
+- Added mutually exclusive `runnerPhases` timing telemetry for provider acquire/borrow, connectivity and readiness, workspace seed/overlay, command, artifact collection, cleanup, delegated opaque work, and unattributed time while preserving the existing timing fields.
 - Added opt-in Linux SSH `--require-artifact-change` checks with bounded content snapshots, created/changed/unchanged/missing timing states, and collection of only accepted bytes.
 - Added coordinator-owned brokered native checkpoints with transactional checkpoint and fork-claim admission limits, bounded recent audit events, opt-in unused-checkpoint expiry, and promotion-safe cleanup.
 - Added durable fixed-ID Incus leases and private container disk checkpoints that survive source deletion, with ownership-checked cleanup and fresh SSH identity before fork startup.

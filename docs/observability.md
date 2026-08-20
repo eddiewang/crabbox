@@ -172,6 +172,16 @@ errors separately and may be present even after confirmed removal, for example
 when local finalization fails. Run finalization emits timing after cleanup and
 the failure digest; a failing CLI invocation can append its normal exit diagnostic.
 
+`runnerPhases` is the sum-safe lifecycle view. Its positive-duration entries
+are mutually exclusive and add up to `runnerTotalMs`; any observed time that
+cannot be assigned from an existing measurement is named `unattributed`.
+Provider acquire or pool borrow, provider/SSH readiness, workspace seed and
+overlay, command, artifacts, and cleanup appear when Crabbox observes them.
+Provider-owned delegated setup is named `delegated.opaque` rather than split
+into invented timings. The older `leaseMs`, `bootstrapMs`, `syncMs`,
+`syncPhases`, `commandMs`, and `commandPhases` fields remain unchanged for
+compatibility.
+
 Commands can define their own phases by printing marker lines to stdout or
 stderr:
 

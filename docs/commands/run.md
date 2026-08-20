@@ -703,6 +703,22 @@ cleanup error: it can accompany `leaseStopped=true` when the remote resource is
 gone but local finalization failed. An existing workload failure keeps its exit
 code. Accepted pending or retained cleanup does not itself turn a successful
 workload into a command failure.
+
+The additive `runnerTotalMs` and `runnerPhases` fields provide one mutually
+exclusive partition of the observed runner lifecycle. Phase names distinguish
+provider acquire, ready-pool borrow or lease resolution, provider and SSH
+readiness, workspace seed and overlay work, command execution, artifact
+collection, cleanup, delegated opaque work, and `unattributed` time. Existing
+timing fields keep their current meanings and may overlap; use `runnerPhases`
+when a sum-safe breakdown is required.
+
+Crabbox emits provider startup subdivisions only when the coordinator returned
+measured request, network-readiness, or bootstrap timing. It does not infer
+provider-internal timings. Delegated providers expose known sync and command
+time and place the provider-owned remainder in an explicit
+`delegated.opaque` phase. Phase identity fields and artifact transfer counts or
+bytes appear only when the underlying run already has those values.
+
 Commands can emit
 phase markers on stdout or stderr as
 `CRABBOX_PHASE:<name>`; Crabbox records those as `commandPhases` without removing
