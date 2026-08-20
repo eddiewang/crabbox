@@ -19,6 +19,7 @@ const (
 	workspaceOwnerWaitTimeout   = 2 * time.Minute
 	workspaceOwnerPollInterval  = time.Second
 	workspaceOwnerProgressEvery = 10 * time.Second
+	workspaceOwnerReconcileWait = 250 * time.Millisecond
 )
 
 type workspaceOwnerAction string
@@ -116,8 +117,9 @@ type workspaceOwner struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	mu       sync.Mutex
-	renewErr error
+	mu             sync.Mutex
+	renewErr       error
+	confirmedUntil time.Time
 }
 
 type workspaceOwnerContextKey struct{}
@@ -292,33 +294,44 @@ func acquireWorkspaceOwnerWithTransport(ctx context.Context, target SSHTarget, l
 	defer cancel()
 	started := time.Now()
 	nextProgress := workspaceOwnerProgressEvery
+	var lastCallErr error
 	for {
+		requestStarted := time.Now()
 		response, callErr := transport.Do(waitCtx, workspaceOwnerRemoteRequest{Action: workspaceOwnerAcquire, Key: owner.key, Token: owner.token, TTL: ttl})
+		retryDelay := workspaceOwnerPollInterval
 		if callErr != nil {
-			return nil, exit(7, "acquire remote workspace owner: ambiguous remote state: %v", callErr)
-		}
-		switch response {
-		case "ACQUIRED", "RECOVERED":
-			owner.ctx, owner.cancel = context.WithCancel(ctx)
-			go owner.renewLoop(renewInterval)
-			fmt.Fprintf(stderr, "workspace owner acquired wait=%s recovered=%t\n", time.Since(started).Round(time.Millisecond), response == "RECOVERED")
-			return owner, nil
-		case "BUSY", "CHILD":
-			elapsed := time.Since(started)
-			if elapsed >= nextProgress {
-				fmt.Fprintf(stderr, "waiting for reusable workspace owner elapsed=%s state=%s\n", elapsed.Round(time.Second), strings.ToLower(response))
-				nextProgress += workspaceOwnerProgressEvery
+			lastCallErr = callErr
+			retryDelay = workspaceOwnerReconcileWait
+		} else {
+			lastCallErr = nil
+			switch response {
+			case "ACQUIRED", "RECOVERED":
+				owner.ctx, owner.cancel = context.WithCancel(ctx)
+				owner.confirmedAt(requestStarted)
+				go owner.renewLoop(renewInterval)
+				fmt.Fprintf(stderr, "workspace owner acquired wait=%s recovered=%t\n", time.Since(started).Round(time.Millisecond), response == "RECOVERED")
+				return owner, nil
+			case "BUSY", "CHILD":
+				elapsed := time.Since(started)
+				if elapsed >= nextProgress {
+					fmt.Fprintf(stderr, "waiting for reusable workspace owner elapsed=%s state=%s\n", elapsed.Round(time.Second), strings.ToLower(response))
+					nextProgress += workspaceOwnerProgressEvery
+				}
+			case "AMBIGUOUS":
+				lastCallErr = errors.New("ambiguous protocol state")
+				retryDelay = workspaceOwnerReconcileWait
+			default:
+				return nil, exit(7, "acquire remote workspace owner: unexpected protocol response %q", response)
 			}
-		case "AMBIGUOUS":
-			return nil, exit(7, "acquire remote workspace owner: ambiguous protocol state")
-		default:
-			return nil, exit(7, "acquire remote workspace owner: unexpected protocol response %q", response)
 		}
-		timer := time.NewTimer(workspaceOwnerPollInterval)
+		timer := time.NewTimer(retryDelay)
 		select {
 		case <-waitCtx.Done():
 			timer.Stop()
 			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				if lastCallErr != nil {
+					return nil, exit(7, "acquire remote workspace owner: ambiguous remote state after reconciliation: %v", lastCallErr)
+				}
 				return nil, exit(7, "timed out after %s waiting for reusable workspace owner", waitTimeout)
 			}
 			return nil, waitCtx.Err()
@@ -349,20 +362,64 @@ func (o *workspaceOwner) renewLoopWithTicks(ticks <-chan time.Time, callTimeout 
 		case <-o.ctx.Done():
 			return
 		case <-ticks:
-			callCtx, cancel := context.WithTimeout(context.WithoutCancel(o.ctx), callTimeout)
-			response, err := o.transport.Do(callCtx, workspaceOwnerRemoteRequest{Action: workspaceOwnerRenew, Key: o.key, Token: o.token, TTL: o.ttl})
-			cancel()
-			if err == nil && response == "RENEWED" {
-				continue
-			}
+			err := o.reconcileRenewal(callTimeout)
 			if err == nil {
-				err = fmt.Errorf("unexpected protocol response %q", response)
+				continue
 			}
 			o.mu.Lock()
 			o.renewErr = exit(7, "remote workspace owner renewal failed closed: %v", err)
 			o.mu.Unlock()
 			o.cancel()
 			return
+		}
+	}
+}
+
+func (o *workspaceOwner) confirmedAt(requestStarted time.Time) {
+	o.mu.Lock()
+	o.confirmedUntil = requestStarted.Add(o.ttl)
+	o.mu.Unlock()
+}
+
+func (o *workspaceOwner) reconcileRenewal(callTimeout time.Duration) error {
+	for {
+		o.mu.Lock()
+		deadline := o.confirmedUntil
+		o.mu.Unlock()
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errors.New("confirmed renewal deadline exhausted")
+		}
+		requestStarted := time.Now()
+		callCtx, cancel := context.WithTimeout(context.WithoutCancel(o.ctx), min(callTimeout, remaining))
+		response, err := o.transport.Do(callCtx, workspaceOwnerRemoteRequest{Action: workspaceOwnerRenew, Key: o.key, Token: o.token, TTL: o.ttl})
+		cancel()
+		switch response {
+		case "RENEWED":
+			if err == nil {
+				o.confirmedAt(requestStarted)
+				return nil
+			}
+		case "MISMATCH", "EXPIRED":
+			return fmt.Errorf("owner %s", strings.ToLower(response))
+		default:
+			if err == nil {
+				return fmt.Errorf("unexpected protocol response %q", response)
+			}
+		}
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("confirmed renewal deadline exhausted: %w", err)
+		}
+		timer := time.NewTimer(min(workspaceOwnerReconcileWait, remaining))
+		select {
+		case <-o.stop:
+			timer.Stop()
+			return nil
+		case <-o.ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
 		}
 	}
 }
@@ -566,7 +623,10 @@ case "$action" in
   acquire)
     if read_state; then
       now=$(date +%s)
-      if [ "$state_expiry" -gt "$now" ]; then printf BUSY; exit 0; fi
+      if [ "$state_expiry" -gt "$now" ]; then
+        if [ "$state_token" = "$token" ]; then write_state; printf ACQUIRED; else printf BUSY; fi
+        exit 0
+      fi
       if child_status; then printf CHILD; exit 0; else child_rc=$?; fi
       if [ "$child_rc" -eq 2 ]; then printf AMBIGUOUS; exit 74; fi
       rm -f "$child"
@@ -712,10 +772,14 @@ try {
   switch ($action) {
     "acquire" {
       if ($null -eq $current) { Write-State; Write-Output "ACQUIRED"; break }
-      if ($current.Expiry -gt [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) { Write-Output "BUSY"; break }
+      if ($current.Expiry -gt [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) {
+        if ($current.Token -eq $token) { Write-State; Write-Output "ACQUIRED" } else { Write-Output "BUSY" }
+        break
+      }
       $childStatus = Get-ChildStatus
       if ($childStatus -eq "live") { Write-Output "CHILD"; break }
       if ($childStatus -eq "ambiguous") { throw "workspace owner child state is ambiguous" }
+      Get-ChildItem -Path (Join-Path $root ($key + ".run." + $current.Token + ".*")) -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
       Remove-Item -LiteralPath $child -Force -ErrorAction SilentlyContinue
       Write-State
       Write-Output "RECOVERED"
@@ -949,7 +1013,7 @@ $token = ` + psQuote(token) + `
 $state = Join-Path $root ($key + ".owner")
 $child = Join-Path $root ($key + ".child")
 $gate = Join-Path $root ($key + ".gate")
-$runDir = Join-Path $root ($key + ".run." + $token)
+$runDir = Join-Path $root ($key + ".run." + $token + "." + [Guid]::NewGuid().ToString("N"))
 $start = Join-Path $runDir "start"
 function Enter-Gate {
 	for ($i = 0; $i -lt 50; $i++) {
@@ -996,7 +1060,6 @@ function Get-ExistingChildStatus {
 		catch { return "ambiguous" }
 	}
 }
-Remove-Item -LiteralPath $runDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $runDir -ErrorAction Stop | Out-Null
 ` + inputSetup + `
 $childSource = @'
@@ -1018,28 +1081,83 @@ $childFileArg = '"' + $childScript + '"'
 $process = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $childFileArg) -NoNewWindow -PassThru` + inputArgument + `
 $null = $process.Handle
 $identity = [string]$process.StartTime.ToUniversalTime().Ticks
+$supervisorSource = @'
+$ErrorActionPreference = "Stop"
+$state = '__STATE__'
+$child = '__CHILD__'; $ready = '__READY__'; $published = '__PUBLISHED__'; $token = '__TOKEN__'
+$pidValue = [int]'__PID__'
+$identity = '__IDENTITY__'
+$supervisorIdentity = [string][Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks
+$jobType = 'using System; using System.Runtime.InteropServices; [StructLayout(LayoutKind.Sequential)] public struct CrabboxJobBasic { public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass; } [StructLayout(LayoutKind.Sequential)] public struct CrabboxJobIO { public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount, ReadTransferCount, WriteTransferCount, OtherTransferCount; } [StructLayout(LayoutKind.Sequential)] public struct CrabboxJobLimits { public CrabboxJobBasic BasicLimitInformation; public CrabboxJobIO IoInfo; public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed; } [StructLayout(LayoutKind.Sequential)] public struct CrabboxJobTime { public uint Low, High; } [StructLayout(LayoutKind.Sequential)] public struct CrabboxJobAccounting { public long TotalUserTime, TotalKernelTime, PeriodUserTime, PeriodKernelTime; public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses; } public static class CrabboxJob { [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr a, string n); [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr j, int c, ref CrabboxJobLimits i, uint l); [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr j, int c, out CrabboxJobAccounting i, uint l, IntPtr r); [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint a, bool i, int p); [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessTimes(IntPtr p, out CrabboxJobTime c, out CrabboxJobTime e, out CrabboxJobTime k, out CrabboxJobTime u); [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); public static IntPtr Attach(int pid,long identity) { IntPtr j=CreateJobObject(IntPtr.Zero,null); if(j==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(); CrabboxJobLimits l=new CrabboxJobLimits(); l.BasicLimitInformation.LimitFlags=0x2000; if(!SetInformationJobObject(j,9,ref l,(uint)Marshal.SizeOf(l))) { CloseHandle(j); throw new System.ComponentModel.Win32Exception(); } IntPtr p=OpenProcess(0x1101,false,pid); if(p==IntPtr.Zero) { CloseHandle(j); throw new System.ComponentModel.Win32Exception(); } try { CrabboxJobTime c,e,k,u; if(!GetProcessTimes(p,out c,out e,out k,out u)) throw new System.ComponentModel.Win32Exception(); long created=((long)c.High<<32)|c.Low; if(created+504911232000000000L!=identity) throw new InvalidOperationException("process identity changed"); if(!AssignProcessToJobObject(j,p)) throw new System.ComponentModel.Win32Exception(); } catch { CloseHandle(j); throw; } finally { CloseHandle(p); } return j; } public static uint Active(IntPtr j) { CrabboxJobAccounting i; if(!QueryInformationJobObject(j,1,out i,(uint)Marshal.SizeOf(typeof(CrabboxJobAccounting)),IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(); return i.ActiveProcesses; } }'
+Add-Type -TypeDefinition $jobType
+$job = [CrabboxJob]::Attach($pidValue, [Int64]$identity); if ($job -eq [IntPtr]::Zero) { throw "job attachment failed" }
+function Close-WorkloadJob {
+	if ($script:job -ne [IntPtr]::Zero) { $null = [CrabboxJob]::CloseHandle($script:job); $script:job = [IntPtr]::Zero }
+}
+function Test-OwnerExpired {
+	$current = @(Get-Content -LiteralPath $state -ErrorAction SilentlyContinue)
+	if ($current.Count -ne 3 -or $current[0] -ne "v1" -or $current[1] -ne $token -or $current[2] -notmatch "^[0-9]+$") { return $true }
+	return [Int64]$current[2] -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+}
+function Test-SupervisorRecord {
+	$recorded = @(Get-Content -LiteralPath $child -ErrorAction SilentlyContinue)
+	return $recorded.Count -eq 2 -and $recorded[0] -eq [string]$PID -and $recorded[1] -eq $supervisorIdentity
+}
+New-Item -ItemType File -Path $ready -Force | Out-Null; $ErrorActionPreference = "SilentlyContinue"
+while (-not (Test-Path -LiteralPath $published)) {
+	if (Test-OwnerExpired) { Close-WorkloadJob; exit 0 }
+	Start-Sleep -Milliseconds 20
+}
+try { while ($true) {
+	$leaderLive = $false
+	try {
+		$process = [Diagnostics.Process]::GetProcessById($pidValue)
+		$leaderLive = [string]$process.StartTime.ToUniversalTime().Ticks -eq $identity
+	} catch {}
+	if ((Test-OwnerExpired) -or -not (Test-SupervisorRecord)) {
+		Close-WorkloadJob
+		exit 0
+	}
+	if (-not $leaderLive -and [CrabboxJob]::Active($job) -eq 0) { exit 0 }
+	Start-Sleep -Milliseconds 200
+} } finally { Close-WorkloadJob }
+'@
+$ready = Join-Path $runDir "supervisor.ready"
+$published = Join-Path $runDir "supervisor.published"
+$supervisorSource = $supervisorSource.Replace('__STATE__', $state.Replace("'", "''")).Replace('__CHILD__', $child.Replace("'", "''")).Replace('__READY__', $ready.Replace("'", "''")).Replace('__PUBLISHED__', $published.Replace("'", "''")).Replace('__TOKEN__', $token).Replace('__PID__', [string]$process.Id).Replace('__IDENTITY__', $identity)
+$supervisorScript = Join-Path $runDir "supervisor.ps1"
+[IO.File]::WriteAllText($supervisorScript, $supervisorSource, [Text.UTF8Encoding]::new($true))
+# The detached supervisor owns the exact process handle before publication.
+$supervisorFileArg = '"' + $supervisorScript + '"'; $supervisor = $null
+function Stop-NewWitness([int]$code) { if ($null -ne $supervisor -and -not $supervisor.HasExited) { $supervisor.Kill() }; if ($null -ne $supervisor) { $supervisor.WaitForExit() }; if (-not $process.HasExited) { $process.Kill() }; $process.WaitForExit(); Remove-Item -LiteralPath $runDir -Recurse -Force -ErrorAction SilentlyContinue; exit $code }
+try { $supervisor = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $supervisorFileArg) -WindowStyle Hidden -PassThru; $null = $supervisor.Handle; $supervisorIdentity = [string]$supervisor.StartTime.ToUniversalTime().Ticks } catch { Stop-NewWitness 74 }
+$supervisorDeadline = [DateTime]::UtcNow.AddSeconds(10)
+while (-not (Test-Path -LiteralPath $ready) -and -not $supervisor.HasExited -and [DateTime]::UtcNow -lt $supervisorDeadline) { Start-Sleep -Milliseconds 20 }
+if (-not (Test-Path -LiteralPath $ready)) { Stop-NewWitness 74 }
 $gateStream = Enter-Gate
-if ($null -eq $gateStream) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; throw "ambiguous owner gate" }
+if ($null -eq $gateStream) { Stop-NewWitness 74 }
 try {
-	if ((Read-Token) -ne $token) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; exit 75 }
-	if ((Read-Expiry) -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; exit 75 }
+	if ((Read-Token) -ne $token) { Stop-NewWitness 75 }
+	if ((Read-Expiry) -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) { Stop-NewWitness 75 }
 	$existingStatus = Get-ExistingChildStatus
-	if ($existingStatus -eq "live") { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; exit 75 }
-	if ($existingStatus -eq "ambiguous") { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; exit 74 }
+	if ($existingStatus -eq "live") { Stop-NewWitness 75 }
+	if ($existingStatus -eq "ambiguous") { Stop-NewWitness 74 }
 	Remove-Item -LiteralPath $child -Force -ErrorAction SilentlyContinue
 	$tmp = $child + ".tmp." + [Guid]::NewGuid().ToString("N")
-	[IO.File]::WriteAllLines($tmp, @([string]$process.Id, $identity), [Text.UTF8Encoding]::new($false))
+	[IO.File]::WriteAllLines($tmp, @([string]$supervisor.Id, $supervisorIdentity), [Text.UTF8Encoding]::new($false))
 	Move-Item -LiteralPath $tmp -Destination $child -Force
-} finally { $gateStream.Dispose(); Remove-Item -LiteralPath $gate -Force -ErrorAction SilentlyContinue }
+	New-Item -ItemType File -Path $published -Force -ErrorAction Stop | Out-Null
+} catch { Stop-NewWitness 74 } finally { $gateStream.Dispose(); Remove-Item -LiteralPath $gate -Force -ErrorAction SilentlyContinue }
 New-Item -ItemType File -Path $start -Force | Out-Null
 $process.WaitForExit()
 $code = $process.ExitCode
+$supervisor.WaitForExit()
 $clear = $false
 $gateStream = Enter-Gate
 if ($null -ne $gateStream) {
 	try {
-		$recorded = @(Get-Content -LiteralPath $child -ErrorAction Stop)
-    if ((Read-Token) -eq $token -and $recorded.Count -eq 2 -and $recorded[0] -eq [string]$process.Id -and $recorded[1] -eq $identity) {
+		$recorded = @(Get-Content -LiteralPath $child -ErrorAction SilentlyContinue)
+    if ((Read-Token) -eq $token -and $recorded.Count -eq 2 -and $recorded[0] -eq [string]$supervisor.Id -and $recorded[1] -eq $supervisorIdentity) {
       Remove-Item -LiteralPath $child -Force -ErrorAction Stop
       $clear = $true
     }

@@ -221,9 +221,16 @@ exclusive and bypass this owner.
 Ownership is fenced with a random token and renewed while the lifecycle is
 active. If the local client disappears, Crabbox recovers an expired owner only
 after verifying that its witnessed remote child is no longer alive. Ambiguous
-renewal, release, token, or child state fails closed instead of risking a
-concurrent checkout. POSIX, WSL2, and native Windows targets implement the same
-protocol; the small sync-finalization lock remains nested inside it.
+acquire responses are reconciled within the configured wait, and ambiguous
+renewals are retried only through the last confirmed ownership TTL. Release,
+token, or child-state uncertainty still fails closed instead of risking a
+concurrent checkout.
+
+Native Windows runs additionally place the remote process tree in a Job Object
+owned by an identity-checked supervisor. Removing or changing its published
+child record closes the job before the workspace can be reused. Linux, macOS,
+and WSL2 retain the two-line PID/start-identity witness for the direct remote
+child; they do not claim kernel-backed descendant containment.
 
 Use `--full-resync` (alias `--fresh-sync`) when a warm lease smells stale:
 Crabbox deletes the remote workdir, skips the fingerprint fast path, reseeds Git

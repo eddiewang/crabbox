@@ -48,6 +48,10 @@ type fakeWorkspaceOwnerRemote struct {
 	expires          time.Time
 	childAlive       bool
 	failRenew        bool
+	failRenewCount   int
+	terminalRenewErr bool
+	loseAcquireCount int
+	acquireCalls     int
 	ambiguousRelease bool
 	blockBusyAcquire bool
 	changed          chan struct{}
@@ -67,10 +71,26 @@ func (f *fakeWorkspaceOwnerRemote) Do(ctx context.Context, req workspaceOwnerRem
 		f.mu.Lock()
 		switch req.Action {
 		case workspaceOwnerAcquire:
+			f.acquireCalls++
 			if f.token == "" {
 				f.token = req.Token
 				f.expires = time.Now().Add(req.TTL)
 				f.signalLocked()
+				if f.loseAcquireCount > 0 {
+					f.loseAcquireCount--
+					f.mu.Unlock()
+					return "", errors.New("acquire response lost")
+				}
+				f.mu.Unlock()
+				return "ACQUIRED", nil
+			}
+			if f.token == req.Token && time.Now().Before(f.expires) {
+				f.expires = time.Now().Add(req.TTL)
+				if f.loseAcquireCount > 0 {
+					f.loseAcquireCount--
+					f.mu.Unlock()
+					return "", errors.New("acquire response lost")
+				}
 				f.mu.Unlock()
 				return "ACQUIRED", nil
 			}
@@ -98,13 +118,30 @@ func (f *fakeWorkspaceOwnerRemote) Do(ctx context.Context, req workspaceOwnerRem
 				continue
 			}
 		case workspaceOwnerRenew:
+			if f.failRenewCount > 0 {
+				f.failRenewCount--
+				f.mu.Unlock()
+				return "", errors.New("renew response lost")
+			}
 			if f.failRenew {
 				f.mu.Unlock()
 				return "", errors.New("renew transport lost")
 			}
 			if f.token != req.Token {
+				err := error(nil)
+				if f.terminalRenewErr {
+					err = errors.New("remote exit 75")
+				}
 				f.mu.Unlock()
-				return "MISMATCH", nil
+				return "MISMATCH", err
+			}
+			if !time.Now().Before(f.expires) {
+				err := error(nil)
+				if f.terminalRenewErr {
+					err = errors.New("remote exit 75")
+				}
+				f.mu.Unlock()
+				return "EXPIRED", err
 			}
 			f.expires = time.Now().Add(req.TTL)
 			f.mu.Unlock()
@@ -312,6 +349,113 @@ func TestWorkspaceOwnerTokenAndTransportFailuresFailClosed(t *testing.T) {
 	})
 }
 
+func TestWorkspaceOwnerReconcilesAmbiguousAcquireAndRenewal(t *testing.T) {
+	t.Run("response-loss acquire", func(t *testing.T) {
+		remote := newFakeWorkspaceOwnerRemote()
+		remote.loseAcquireCount = 1
+		owner, err := acquireWorkspaceOwnerWithTransport(context.Background(), SSHTarget{}, "cbx_acquire_reconcile", &bytes.Buffer{}, remote, 2*time.Second, time.Second, 100*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := owner.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("acquire ambiguity respects wait deadline", func(t *testing.T) {
+		remote := newFakeWorkspaceOwnerRemote()
+		remote.token = strings.Repeat("f", 64)
+		remote.expires = time.Now().Add(time.Minute)
+		remote.blockBusyAcquire = true
+		started := time.Now()
+		_, err := acquireWorkspaceOwnerWithTransport(context.Background(), SSHTarget{}, "cbx_acquire_deadline", &bytes.Buffer{}, remote, 120*time.Millisecond, time.Second, 100*time.Millisecond)
+		var exitErr ExitError
+		if err == nil || !errors.As(err, &exitErr) || exitErr.Code != 7 {
+			t.Fatalf("acquire deadline err=%v", err)
+		}
+		if !strings.Contains(err.Error(), "ambiguous remote state after reconciliation") {
+			t.Fatalf("acquire deadline err=%v, want reconciled ambiguity", err)
+		}
+		if elapsed := time.Since(started); elapsed < 100*time.Millisecond || elapsed > time.Second {
+			t.Fatalf("acquire deadline elapsed=%s", elapsed)
+		}
+	})
+
+	t.Run("transient renewal", func(t *testing.T) {
+		remote := newFakeWorkspaceOwnerRemote()
+		owner, err := acquireWorkspaceOwnerWithTransport(context.Background(), SSHTarget{}, "cbx_renew_reconcile", &bytes.Buffer{}, remote, time.Second, 700*time.Millisecond, 50*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		remote.mu.Lock()
+		remote.failRenewCount = 1
+		remote.mu.Unlock()
+		select {
+		case <-owner.Context().Done():
+			t.Fatalf("transient renewal canceled owner: %v", owner.Err())
+		case <-time.After(450 * time.Millisecond):
+		}
+		if err := owner.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("deadline exhaustion", func(t *testing.T) {
+		remote := newFakeWorkspaceOwnerRemote()
+		owner, err := acquireWorkspaceOwnerWithTransport(context.Background(), SSHTarget{}, "cbx_renew_deadline", &bytes.Buffer{}, remote, time.Second, 120*time.Millisecond, 20*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		remote.mu.Lock()
+		remote.failRenew = true
+		remote.mu.Unlock()
+		select {
+		case <-owner.Context().Done():
+		case <-time.After(time.Second):
+			t.Fatal("renewal ambiguity outlived the confirmed deadline")
+		}
+		if err := owner.Err(); err == nil || !strings.Contains(err.Error(), "deadline exhausted") {
+			t.Fatalf("renewal err=%v, want deadline exhaustion", err)
+		}
+		_ = owner.Close(context.Background())
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*fakeWorkspaceOwnerRemote)
+		want   string
+	}{
+		{name: "mismatch cancels immediately", mutate: func(remote *fakeWorkspaceOwnerRemote) {
+			remote.token = strings.Repeat("f", 64)
+			remote.terminalRenewErr = true
+		}, want: "mismatch"},
+		{name: "expiry cancels immediately", mutate: func(remote *fakeWorkspaceOwnerRemote) {
+			remote.expires = time.Now().Add(-time.Second)
+			remote.terminalRenewErr = true
+		}, want: "expired"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			remote := newFakeWorkspaceOwnerRemote()
+			owner, err := acquireWorkspaceOwnerWithTransport(context.Background(), SSHTarget{}, "cbx_renew_"+test.want, &bytes.Buffer{}, remote, time.Second, time.Second, 20*time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			remote.mu.Lock()
+			test.mutate(remote)
+			remote.mu.Unlock()
+			select {
+			case <-owner.Context().Done():
+			case <-time.After(200 * time.Millisecond):
+				t.Fatalf("renewal %s did not cancel immediately", test.want)
+			}
+			if err := owner.Err(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("renewal err=%v, want %s", err, test.want)
+			}
+			_ = owner.Close(context.Background())
+		})
+	}
+}
+
 func TestWorkspaceOwnerAcquisitionBoundary(t *testing.T) {
 	nonExclusive := newWatchTestBackend()
 	if !shouldAcquireWorkspaceOwner(true, false, nonExclusive) {
@@ -502,11 +646,31 @@ func TestWorkspaceOwnerProtocolGeneration(t *testing.T) {
 			t.Fatalf("POSIX child witness missing %q:\n%s", want, posixWitness)
 		}
 	}
+	if strings.Index(posixWitness, `mv "$child_tmp" "$child"`) > strings.Index(posixWitness, `touch "$start"`) {
+		t.Fatal("POSIX payload barrier opens before the child record is published")
+	}
 	windowsWitness := remoteWorkspaceOwnerWindowsWitness(key, token, "Write-Output ok", nil)
-	for _, want := range []string{"Start-Process", "$null = $process.Handle", "StartTime.ToUniversalTime().Ticks", "Read-Expiry", "(Read-Expiry) -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()", "Move-Item -LiteralPath $tmp -Destination $child", "$payloadExitCode = $global:LASTEXITCODE", "if (-not $payloadSucceeded) { exit 1 }", "$process.WaitForExit()", "Remove-Item -LiteralPath $child"} {
+	for _, want := range []string{"Start-Process", "$null = $process.Handle", "StartTime.ToUniversalTime().Ticks", "Read-Expiry", "(Read-Expiry) -le [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()", "Move-Item -LiteralPath $tmp -Destination $child", "$payloadExitCode = $global:LASTEXITCODE", "if (-not $payloadSucceeded) { exit 1 }", "$process.WaitForExit()", "$supervisor.WaitForExit()", "Stop-NewWitness 74", "LimitFlags=0x2000", "OpenProcess(0x1101", "GetProcessTimes", "AssignProcessToJobObject", "[CrabboxJob]::Attach($pidValue, [Int64]$identity); if ($job -eq [IntPtr]::Zero)", "[CrabboxJob]::Active($job)", "supervisor.ready", "supervisor.published", "$child = '__CHILD__'", "$supervisorIdentity = [string][Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks", "Get-Content -LiteralPath $child", "$recorded[0] -eq [string]$PID", "$recorded[1] -eq $supervisorIdentity", "Close-WorkloadJob", "[CrabboxJob]::CloseHandle($script:job)", "Remove-Item -LiteralPath $child", "Remove-Item -LiteralPath $runDir -Recurse"} {
 		if !strings.Contains(windowsWitness, want) {
 			t.Fatalf("Windows child witness missing %q:\n%s", want, windowsWitness)
 		}
+	}
+	if strings.Index(windowsWitness, "GetProcessTimes") > strings.Index(windowsWitness, "AssignProcessToJobObject") {
+		t.Fatal("Windows supervisor assigns a PID before validating its start identity")
+	}
+	if strings.Contains(windowsWitness, "taskkill.exe") {
+		t.Fatal("Windows supervisor bypasses its identity-bound job object")
+	}
+	if !strings.Contains(windowsWitness, `@([string]$supervisor.Id, $supervisorIdentity)`) || strings.Contains(windowsWitness, `@([string]$process.Id, $identity)`) {
+		t.Fatal("Windows child record does not retain the live supervisor identity")
+	}
+	if strings.Index(windowsWitness, `$supervisor = Start-Process`) > strings.Index(windowsWitness, "Move-Item -LiteralPath $tmp -Destination $child") {
+		t.Fatal("Windows child record is published before the durable supervisor starts")
+	}
+	publishedIndex := strings.Index(windowsWitness, "New-Item -ItemType File -Path $published")
+	if strings.Index(windowsWitness, "Move-Item -LiteralPath $tmp -Destination $child") > publishedIndex ||
+		publishedIndex > strings.Index(windowsWitness, "New-Item -ItemType File -Path $start") {
+		t.Fatal("Windows payload barrier opens before supervisor record publication is acknowledged")
 	}
 	windowsInputSize := int64(len("input"))
 	windowsInputWitness := remoteWorkspaceOwnerWindowsWitness(key, token, "Write-Output ok", &windowsInputSize)
@@ -1443,6 +1607,35 @@ func runPOSIXWorkspaceOwnerScript(t *testing.T, home, script string) (string, er
 	return strings.TrimSpace(string(out)), err
 }
 
+func posixToolsWithoutSessionHelpers(t *testing.T, home string) string {
+	t.Helper()
+	tools := filepath.Join(home, "tools-no-session-helpers")
+	if err := os.Mkdir(tools, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"base64", "cat", "chmod", "cut", "date", "mkdir", "mv", "ps", "rm", "rmdir", "sed", "sh", "sleep", "touch", "tr", "wc"}
+	lockFound := false
+	for _, name := range append(names, "flock", "lockf") {
+		source, err := exec.LookPath(name)
+		if err != nil {
+			if name == "flock" || name == "lockf" {
+				continue
+			}
+			t.Skipf("required POSIX test tool %s is unavailable", name)
+		}
+		if name == "flock" || name == "lockf" {
+			lockFound = true
+		}
+		if err := os.Symlink(source, filepath.Join(tools, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !lockFound {
+		t.Skip("flock or lockf is required")
+	}
+	return tools
+}
+
 func TestWorkspaceOwnerPOSIXProtocolBehavior(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX protocol execution requires sh")
@@ -1456,6 +1649,9 @@ func TestWorkspaceOwnerPOSIXProtocolBehavior(t *testing.T) {
 	}
 	if out, err := runPOSIXWorkspaceOwnerScript(t, home, remoteWorkspaceOwnerPOSIX(request(workspaceOwnerAcquire, tokenA))); err != nil || out != "ACQUIRED" {
 		t.Fatalf("acquire out=%q err=%v", out, err)
+	}
+	if out, err := runPOSIXWorkspaceOwnerScript(t, home, remoteWorkspaceOwnerPOSIX(request(workspaceOwnerAcquire, tokenA))); err != nil || out != "ACQUIRED" {
+		t.Fatalf("same-token acquire replay out=%q err=%v", out, err)
 	}
 	if out, err := runPOSIXWorkspaceOwnerScript(t, home, remoteWorkspaceOwnerPOSIX(request(workspaceOwnerRenew, tokenB))); err == nil || out != "MISMATCH" {
 		t.Fatalf("mismatched renew out=%q err=%v", out, err)
@@ -1595,6 +1791,45 @@ func TestWorkspaceOwnerPOSIXProtocolBehavior(t *testing.T) {
 	}
 }
 
+func TestWorkspaceOwnerPOSIXCompletesWithoutSessionHelpers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX protocol execution requires sh")
+	}
+	home := t.TempDir()
+	tools := posixToolsWithoutSessionHelpers(t, home)
+	key := workspaceOwnerKey("cbx_no_session_helpers")
+	token := strings.Repeat("a", 64)
+	request := func(action workspaceOwnerAction) workspaceOwnerRemoteRequest {
+		return workspaceOwnerRemoteRequest{Action: action, Key: key, Token: token, TTL: 30 * time.Second}
+	}
+	run := func(script string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, filepath.Join(tools, "sh"), "-c", script)
+		cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+tools)
+		out, err := cmd.CombinedOutput()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("POSIX workspace owner hung without optional session helpers: %s", out)
+		}
+		return strings.TrimSpace(string(out)), err
+	}
+	if out, err := run(remoteWorkspaceOwnerPOSIX(request(workspaceOwnerAcquire))); err != nil || out != "ACQUIRED" {
+		t.Fatalf("acquire out=%q err=%v", out, err)
+	}
+	if out, err := run(remoteWorkspaceOwnerPOSIXWitness(key, token, "true")); err != nil || out != "" {
+		t.Fatalf("witness out=%q err=%v", out, err)
+	}
+	if out, err := run(remoteWorkspaceOwnerPOSIX(request(workspaceOwnerRelease))); err != nil || out != "RELEASED" {
+		t.Fatalf("release out=%q err=%v", out, err)
+	}
+	root := filepath.Join(home, ".crabbox", "workspace-owners")
+	for _, path := range []string{filepath.Join(root, key+".child"), filepath.Join(root, key+".run."+token)} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("completed witness left state %q: %v", path, err)
+		}
+	}
+}
+
 func TestWorkspaceOwnerPOSIXRecoversAbandonedGate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX protocol execution requires sh")
@@ -1636,6 +1871,9 @@ Set-Content -LiteralPath (Join-Path $root (` + psQuote(key) + ` + ".gate")) -Val
 	if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindows(req)); err != nil || !strings.Contains(string(out), "ACQUIRED") {
 		t.Fatalf("Windows acquire out=%q err=%v", out, err)
 	}
+	if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindows(req)); err != nil || !strings.Contains(string(out), "ACQUIRED") {
+		t.Fatalf("Windows same-token acquire replay out=%q err=%v", out, err)
+	}
 	expire := `$root = Join-Path $HOME ".crabbox\workspace-owners"
 $state = Join-Path $root (` + psQuote(key) + ` + ".owner")
 Set-Content -LiteralPath $state -Value @("v1", ` + psQuote(token) + `, "1") -Encoding ASCII
@@ -1674,8 +1912,231 @@ if (Test-Path -LiteralPath $child) { throw "late witness published child" }
 	if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindowsWitness(key, token, "exit 23", nil)); err == nil || exitCode(err) != 23 {
 		t.Fatalf("Windows nonzero witnessed child out=%q err=%v", out, err)
 	}
+	descendantState := filepath.Join(t.TempDir(), "descendant-state")
+	rejectedPath := filepath.Join(t.TempDir(), "rejected-overlap")
+	descendantPayload := `$descendant = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Milliseconds 1500") -WindowStyle Hidden -PassThru
+[IO.File]::WriteAllText(` + psQuote(descendantState) + `, ([string]$PID + [Environment]::NewLine + [string]$descendant.Id))
+exit 42`
+	powerShell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	witnessScript := filepath.Join(t.TempDir(), "descendant-witness.ps1")
+	if err := os.WriteFile(witnessScript, []byte(remoteWorkspaceOwnerWindowsWitness(key, token, descendantPayload, nil)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var descendantOutput bytes.Buffer
+	descendantWitness := exec.Command(powerShell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", witnessScript)
+	descendantWitness.Stdout = &descendantOutput
+	descendantWitness.Stderr = &descendantOutput
+	started := time.Now()
+	if err := descendantWitness.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = descendantWitness.Process.Kill() })
+	var leaderPID int
+	deadline := time.Now().Add(5 * time.Second)
+	for leaderPID == 0 {
+		data, _ := os.ReadFile(descendantState)
+		fields := strings.Fields(string(data))
+		if len(fields) == 2 {
+			leaderPID, _ = strconv.Atoi(fields[0])
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Windows descendant payload did not publish PIDs: %q", data)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for {
+		checkLeader := `if (Get-Process -Id ` + strconv.Itoa(leaderPID) + ` -ErrorAction SilentlyContinue) { exit 1 }`
+		if _, err := runWindowsPowerShellScript(t, checkLeader); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Windows workload leader %d remained live", leaderPID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	req.Action = workspaceOwnerInspect
+	if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindows(req)); err != nil || !strings.Contains(string(out), "CHILD") {
+		t.Fatalf("Windows descendant-only inspect out=%q err=%v", out, err)
+	}
+	if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindowsWitness(key, token, `[IO.File]::WriteAllText(`+psQuote(rejectedPath)+`, "bad")`, nil)); err == nil || exitCode(err) != 75 {
+		t.Fatalf("Windows overlapping descendant witness out=%q err=%v", out, err)
+	}
+	if err := descendantWitness.Wait(); err == nil || exitCode(err) != 42 {
+		t.Fatalf("Windows descendant witness out=%q err=%v", descendantOutput.String(), err)
+	}
+	if time.Since(started) < time.Second {
+		t.Fatal("Windows normal completion did not wait for its job descendants")
+	}
+	if _, err := os.Stat(rejectedPath); !os.IsNotExist(err) {
+		t.Fatalf("Windows overlapping descendant witness executed: %v", err)
+	}
 	req.Action = workspaceOwnerRelease
 	if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindows(req)); err != nil || !strings.Contains(string(out), "RELEASED") {
 		t.Fatalf("Windows release out=%q err=%v", out, err)
+	}
+}
+
+func TestWorkspaceOwnerNativeWindowsChildRecordChangesExpireJob(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("native Windows job behavior runs in Windows CI")
+	}
+	home := filepath.Join(filepath.VolumeName(os.TempDir())+string(os.PathSeparator), "cbx"+strconv.FormatInt(time.Now().UnixNano(), 36))
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	t.Setenv("home", home)
+	t.Setenv("USERPROFILE", home)
+	root := filepath.Join(home, ".crabbox", "workspace-owners")
+	powerShell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := []struct {
+		name   string
+		mutate func(string) error
+	}{
+		{name: "removed", mutate: os.Remove},
+		{name: "identity-tampered", mutate: func(path string) error {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			fields := strings.Fields(string(data))
+			if len(fields) != 2 {
+				return fmt.Errorf("child record fields=%d, want 2", len(fields))
+			}
+			identity, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(path, []byte(fields[0]+"\n"+strconv.FormatInt(identity+1, 10)+"\n"), 0o600)
+		}},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			key := workspaceOwnerKey("cbx_windows_record_" + mutation.name + "_" + strconv.FormatInt(time.Now().UnixNano(), 10))
+			token := strings.Repeat("e", 64)
+			statePath := filepath.Join(root, key+".owner")
+			childPath := filepath.Join(root, key+".child")
+			req := workspaceOwnerRemoteRequest{Action: workspaceOwnerAcquire, Key: key, Token: token, TTL: 30 * time.Second}
+			if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindows(req)); err != nil || !strings.Contains(string(out), "ACQUIRED") {
+				t.Fatalf("Windows acquire out=%q err=%v", out, err)
+			}
+
+			pidPath := filepath.Join(t.TempDir(), "workload-pids")
+			payload := `$descendant = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30") -WindowStyle Hidden -PassThru
+[IO.File]::WriteAllLines(` + psQuote(pidPath) + `, @([string]$PID, [string]$descendant.Id), [Text.UTF8Encoding]::new($false))
+Wait-Process -Id $descendant.Id`
+			witnessScript := filepath.Join(t.TempDir(), "record-witness.ps1")
+			if err := os.WriteFile(witnessScript, []byte(remoteWorkspaceOwnerWindowsWitness(key, token, payload, nil)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var witnessOutput bytes.Buffer
+			witness := exec.Command(powerShell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", witnessScript)
+			witness.Stdout = &witnessOutput
+			witness.Stderr = &witnessOutput
+			if err := witness.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waited := false
+			waitResult := make(chan error, 1)
+			go func() { waitResult <- witness.Wait() }()
+			var workloadPIDs []int
+			t.Cleanup(func() {
+				_ = os.Remove(statePath)
+				if !waited {
+					select {
+					case <-waitResult:
+						waited = true
+					case <-time.After(5 * time.Second):
+						_ = witness.Process.Kill()
+						<-waitResult
+						waited = true
+					}
+				}
+				for _, pid := range workloadPIDs {
+					_ = exec.Command(powerShell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `Stop-Process -Id `+strconv.Itoa(pid)+` -Force -ErrorAction SilentlyContinue`).Run()
+				}
+				matches, _ := filepath.Glob(filepath.Join(root, key+".*"))
+				for _, match := range matches {
+					_ = os.RemoveAll(match)
+				}
+			})
+
+			deadline := time.Now().Add(10 * time.Second)
+			for len(workloadPIDs) != 2 {
+				data, _ := os.ReadFile(pidPath)
+				fields := strings.Fields(string(data))
+				if len(fields) == 2 {
+					for _, field := range fields {
+						pid, parseErr := strconv.Atoi(field)
+						if parseErr != nil {
+							t.Fatalf("parse workload PID %q: %v", field, parseErr)
+						}
+						workloadPIDs = append(workloadPIDs, pid)
+					}
+				}
+				if len(workloadPIDs) != 2 {
+					if time.Now().After(deadline) {
+						childData, _ := os.ReadFile(childPath)
+						t.Fatalf("Windows workload did not publish two PIDs: pids=%q child=%q output=%q", data, childData, witnessOutput.String())
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+			for {
+				if _, err := os.Stat(childPath); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("Windows supervisor record was not published")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			liveCheck := `if (-not (Get-Process -Id ` + strconv.Itoa(workloadPIDs[0]) + ` -ErrorAction SilentlyContinue)) { exit 1 }
+if (-not (Get-Process -Id ` + strconv.Itoa(workloadPIDs[1]) + ` -ErrorAction SilentlyContinue)) { exit 1 }`
+			if out, err := runWindowsPowerShellScript(t, liveCheck); err != nil {
+				t.Fatalf("Windows workload was not live before %s mutation: out=%q err=%v", mutation.name, out, err)
+			}
+			if err := mutation.mutate(childPath); err != nil {
+				t.Fatalf("%s child record: %v", mutation.name, err)
+			}
+
+			select {
+			case err := <-waitResult:
+				waited = true
+				if err == nil || exitCode(err) != 74 {
+					t.Fatalf("Windows witness after %s record out=%q err=%v", mutation.name, witnessOutput.String(), err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("Windows witness remained live after its child record was %s", mutation.name)
+			}
+			for _, pid := range workloadPIDs {
+				exitedCheck := `if (Get-Process -Id ` + strconv.Itoa(pid) + ` -ErrorAction SilentlyContinue) { exit 1 }`
+				if out, err := runWindowsPowerShellScript(t, exitedCheck); err != nil {
+					t.Fatalf("Windows workload process %d survived %s record: out=%q err=%v", pid, mutation.name, out, err)
+				}
+			}
+			req.Action = workspaceOwnerInspect
+			if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindows(req)); err != nil || !strings.Contains(string(out), "OWNED") {
+				t.Fatalf("Windows inspect after %s record out=%q err=%v", mutation.name, out, err)
+			}
+			if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindowsWitness(key, token, "Write-Output reuse-ok", nil)); err != nil || !strings.Contains(string(out), "reuse-ok") {
+				t.Fatalf("Windows reuse after %s record out=%q err=%v", mutation.name, out, err)
+			}
+			req.Action = workspaceOwnerRelease
+			if out, err := runWindowsPowerShellScript(t, remoteWorkspaceOwnerWindows(req)); err != nil || !strings.Contains(string(out), "RELEASED") {
+				t.Fatalf("Windows release after %s record out=%q err=%v", mutation.name, out, err)
+			}
+			if matches, err := filepath.Glob(filepath.Join(root, key+".*")); err != nil || len(matches) != 0 {
+				t.Fatalf("Windows %s record left residue %q: %v", mutation.name, matches, err)
+			}
+			t.Logf("native Windows %s record closed workload before reuse; residue=0", mutation.name)
+		})
 	}
 }
