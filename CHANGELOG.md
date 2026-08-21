@@ -18,6 +18,7 @@
 - Made two timing-sensitive tests robust on loaded CI runners.
 - Required exact, locked resource ownership claims before Tencent Cloud, Nebius, Vast, Orgo, Upstash Box, Coder, and EC2 Mac host lifecycle mutations, preventing name-matched, stale, cross-namespace, or concurrently renewed resources from being destroyed.
 - Added authoritative Machine0 machine-class discovery while preserving explicit native size selections and the five-provider legacy class compatibility boundary.
+- Restored Azure SKU fallback after immediate capacity failures by safely rolling back the exact owned VM-less NIC and public IP set. Thanks @vincentkoc.
 
 ## 0.46.0 - 2026-08-20
 
