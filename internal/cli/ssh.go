@@ -659,7 +659,7 @@ func runWSL2ControlScriptCombinedOutput(ctx context.Context, target SSHTarget, r
 		}
 	}()
 	remote = prepared.command
-	command := wsl2StdinScriptCommandWithWaitTimeout(waitTimeout)
+	command := wsl2StdinScriptCommandWithWaitTimeout(len(remote), waitTimeout)
 	input, err := newReplayableSSHInput([]byte(remote))
 	if err != nil {
 		return "", err
@@ -1146,10 +1146,23 @@ func wrapRemoteForTargetWithWaitTimeout(target SSHTarget, remote string, waitTim
 }
 
 func wsl2CommandWithWaitTimeout(remote string, waitTimeout time.Duration) string {
-	encoded := base64.StdEncoding.EncodeToString([]byte(remote))
+	script := []byte(remote)
+	copyScript := `$scriptBytes = [Convert]::FromBase64String("` + base64.StdEncoding.EncodeToString(script) + `")
+  $stage.StandardInput.BaseStream.Write($scriptBytes, 0, $scriptBytes.Length)
+`
+	return wsl2StagedScriptCommand(len(script), copyScript, waitTimeout)
+}
+
+func wsl2StdinScriptCommandWithWaitTimeout(inputSize int, waitTimeout time.Duration) string {
+	return wsl2StagedScriptCommand(inputSize, `$script = $stage.StandardInput.BaseStream
+  [Console]::OpenStandardInput().CopyTo($script)
+`, waitTimeout)
+}
+
+func wsl2StagedScriptCommand(inputSize int, copyScript string, waitTimeout time.Duration) string {
 	wait := `$process.WaitForExit()
   $code = $process.ExitCode`
-	invoke := `& wsl.exe --exec bash $wslPath
+	invoke := `& wsl.exe --exec bash $path
   $code = $LASTEXITCODE`
 	if waitTimeout > 0 {
 		waitMS := int(waitTimeout / time.Millisecond)
@@ -1161,69 +1174,64 @@ func wsl2CommandWithWaitTimeout(remote string, waitTimeout time.Duration) string
     }
     $process.WaitForExit(5000) | Out-Null
     throw "WSL2 command timed out after %s"
-  }
-  $code = $process.ExitCode`, waitMS, waitTimeout.Round(time.Second))
+	  }
+	  $code = $process.ExitCode`, waitMS, waitTimeout.Round(time.Second))
 		invoke = `$psi = [System.Diagnostics.ProcessStartInfo]::new("wsl.exe")
-  $psi.UseShellExecute = $false
-  $psi.Arguments = "--exec bash " + $wslPath
-  $process = [System.Diagnostics.Process]::Start($psi)
-  ` + wait
+	  $psi.UseShellExecute = $false
+	  $psi.Arguments = "--exec bash " + $path
+	  $process = [System.Diagnostics.Process]::Start($psi)
+	  ` + wait
 	}
 	return powershellCommand(`$ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$dir = "C:\ProgramData\crabbox\commands"
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$name = "cmd-" + [Guid]::NewGuid().ToString("N") + ".sh"
-$path = Join-Path $dir $name
-$scriptBytes = [Convert]::FromBase64String("` + encoded + `")
-[System.IO.File]::WriteAllBytes($path, $scriptBytes)
-$wslPath = "/mnt/c/ProgramData/crabbox/commands/" + $name
+$dir = "/tmp/crabbox-command-" + [Guid]::NewGuid().ToString("N")
+$path = $dir + "/script.sh"
+$expected = ` + strconv.Itoa(inputSize) + `
+$stageInfo = [System.Diagnostics.ProcessStartInfo]::new("wsl.exe")
+$stageInfo.UseShellExecute = $false
+$stageInfo.RedirectStandardInput = $true
+$stageInfo.Arguments = '--exec sh -c "set -eu;umask 077;final=$1;expected=$2;mkdir -m 700 -- $final;trap ''rm -rf -- $final'' EXIT;cat >$final/script.sh;actual=$(wc -c <$final/script.sh);test $actual = $expected;trap - EXIT" sh ' + $dir + ' ' + $expected
+$stage = [System.Diagnostics.Process]::Start($stageInfo)
+$staged = $false
+$failure = $null
 try {
-  ` + invoke + `
-} finally {
-  Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-}
-exit $code`)
-}
-
-func wsl2StdinScriptCommandWithWaitTimeout(waitTimeout time.Duration) string {
-	wait := `$process.WaitForExit()
-  $code = $process.ExitCode`
-	if waitTimeout > 0 {
-		waitMS := int(waitTimeout / time.Millisecond)
-		wait = fmt.Sprintf(`if (-not $process.WaitForExit(%d)) {
-    try {
-      $process.Kill($true)
-    } catch {
-      $process.Kill()
-    }
-    $process.WaitForExit(5000) | Out-Null
-    throw "WSL2 command timed out after %s"
-  }
-  $code = $process.ExitCode`, waitMS, waitTimeout.Round(time.Second))
-	}
-	return powershellCommand(`$ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
-$dir = "C:\ProgramData\crabbox\commands"
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$name = "cmd-" + [Guid]::NewGuid().ToString("N") + ".sh"
-$path = Join-Path $dir $name
-try {
-  $script = [System.IO.File]::Open($path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
   try {
-    [Console]::OpenStandardInput().CopyTo($script)
-  } finally {
-    $script.Close()
+` + copyScript + `  } finally {
+    $stage.StandardInput.Close()
   }
-  $wslPath = "/mnt/c/ProgramData/crabbox/commands/" + $name
-  $psi = [System.Diagnostics.ProcessStartInfo]::new("wsl.exe")
-  $psi.UseShellExecute = $false
-  $psi.Arguments = "--exec bash " + $wslPath
-  $process = [System.Diagnostics.Process]::Start($psi)
-  ` + wait + `
-} finally {
-  Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+  $stage.WaitForExit()
+  if ($stage.ExitCode -ne 0) { throw "WSL2 command staging failed with exit $($stage.ExitCode)" }
+  $staged = $true
+  ` + invoke + `
+} catch {
+  $failure = $_
 }
+$cleanupCode = 0
+$cleanupFailure = $null
+if ($staged) {
+  try {
+    $cleanupInfo = [System.Diagnostics.ProcessStartInfo]::new("wsl.exe")
+    $cleanupInfo.UseShellExecute = $false
+    $cleanupInfo.RedirectStandardOutput = $true
+    $cleanupInfo.Arguments = "--exec rm -rf -- " + $dir
+    $cleanup = [System.Diagnostics.Process]::Start($cleanupInfo)
+    $cleanup.StandardOutput.ReadToEnd() | Out-Null
+    $cleanup.WaitForExit()
+    $cleanupCode = $cleanup.ExitCode
+  } catch {
+    $cleanupFailure = $_
+  }
+}
+if ($null -ne $cleanupFailure -or $cleanupCode -ne 0) {
+  $detail = if ($null -ne $cleanupFailure) { $cleanupFailure.Exception.Message } else { "exit $cleanupCode" }
+  [Console]::Error.WriteLine("WSL2 command cleanup failed: " + $detail)
+  if ($null -eq $failure -and ($null -eq $code -or $code -eq 0)) {
+    if ($null -ne $cleanupFailure) { throw $cleanupFailure }
+    exit $cleanupCode
+  }
+}
+if ($null -ne $failure) { throw $failure }
+if ($null -eq $code) { $code = 0 }
 exit $code`)
 }
 

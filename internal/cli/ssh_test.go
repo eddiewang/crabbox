@@ -735,8 +735,14 @@ func TestWSL2WrapsRemoteCommand(t *testing.T) {
 	decoded := decodePowerShellCommand(t, got)
 	for _, want := range []string{
 		`[Convert]::FromBase64String("`,
-		`[System.IO.File]::WriteAllBytes($path, $scriptBytes)`,
-		`& wsl.exe --exec bash $wslPath`,
+		`/tmp/crabbox-command-`,
+		`$stageInfo.UseShellExecute = $false`,
+		`$stageInfo.RedirectStandardInput = $true`,
+		`umask 077`,
+		`mkdir -m 700 -- $final`,
+		`actual=$(wc -c <$final/script.sh)`,
+		`& wsl.exe --exec bash $path`,
+		`$cleanupInfo.Arguments = "--exec rm -rf -- " + $dir`,
 		`$code = $LASTEXITCODE`,
 		`exit $code`,
 	} {
@@ -760,6 +766,14 @@ func TestWSL2WrapsRemoteCommand(t *testing.T) {
 	}
 	if string(raw) != remote {
 		t.Fatalf("WSL2 command payload=%q want %q", string(raw), remote)
+	}
+	for _, stale := range []string{`/mnt/`, `C:\ProgramData`} {
+		if strings.Contains(decoded, stale) {
+			t.Fatalf("WSL2 command still depends on host automount %q: %q", stale, decoded)
+		}
+	}
+	if strings.Contains(decoded, `${final}.stage`) {
+		t.Fatalf("WSL2 command exposes a nestable staging directory: %q", decoded)
 	}
 }
 
@@ -789,9 +803,10 @@ func TestWSL2WrapRemoteCommandWithWaitTimeout(t *testing.T) {
 }
 
 func TestWSL2StdinScriptCommandWithWaitTimeoutReadsPayloadFromStdin(t *testing.T) {
-	got := wsl2StdinScriptCommandWithWaitTimeout(15 * time.Second)
+	got := wsl2StdinScriptCommandWithWaitTimeout(12_345, 15*time.Second)
 	decoded := decodePowerShellCommand(t, got)
 	for _, want := range []string{
+		`$expected = 12345`,
 		`[Console]::OpenStandardInput().CopyTo($script)`,
 		`$process.WaitForExit(15000)`,
 		`throw "WSL2 command timed out after 15s"`,
