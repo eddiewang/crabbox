@@ -465,6 +465,7 @@ CRABBOX_COORDINATOR_TOKEN          broker user/shared token
 CRABBOX_COORDINATOR_TOKEN_COMMAND  JSON argv array that prints a fresh bearer token
 CRABBOX_COORDINATOR_ADMIN_TOKEN    broker admin token
 CRABBOX_COORDINATOR_CANDIDATE_TOKEN restricted image-candidate token (environment only)
+CRABBOX_COORDINATOR_PROMOTION_TOKEN broker protected image-promotion token; environment-only
 CRABBOX_COORDINATOR_MODE           managed|registered
 CRABBOX_COORDINATOR_AUTO_WEBVNC    auto-start portal bridge for kept registered desktops
 CRABBOX_ADMIN_TOKEN                alias for CRABBOX_COORDINATOR_ADMIN_TOKEN

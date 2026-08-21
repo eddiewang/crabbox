@@ -24,11 +24,17 @@ Every `image` subcommand except direct Hetzner snapshot deletion requires a
 configured coordinator. `image create`, exact image inspection during polling,
 and ordinary `image delete` prefer the environment-only
 `CRABBOX_COORDINATOR_CANDIDATE_TOKEN`, falling back to the admin token for
-operator compatibility. Promotion, Fast Snapshot Restore, catalog retirement,
-and other image actions still require `broker.adminToken` or
-`CRABBOX_COORDINATOR_ADMIN_TOKEN`. The Worker validates the candidate token
-against `CRABBOX_IMAGE_CANDIDATE_TOKEN` and binds its fixed owner/org identity;
-normal GitHub browser-login users cannot use these routes.
+operator compatibility. Fast Snapshot Restore, catalog retirement, and other
+legacy image actions still require `broker.adminToken` or
+`CRABBOX_COORDINATOR_ADMIN_TOKEN`.
+
+Protected AWS default promotion reads `CRABBOX_COORDINATOR_PROMOTION_TOKEN`
+from the environment and calls the dedicated `/v1/image-promotions` route. The
+Worker validates candidate and promotion credentials against the independent
+`CRABBOX_IMAGE_CANDIDATE_TOKEN` and `CRABBOX_IMAGE_PROMOTION_TOKEN`; admin,
+shared, browser-login, and runtime-adapter credentials cannot authorize either
+protected scope. Neither protected credential is accepted as a command-line
+flag.
 
 Image bytes live in the provider account, never in git or coordinator durable
 state. AWS images are AMIs backed by EBS snapshots; Azure promotion uses
@@ -113,6 +119,76 @@ scoped coordinator default.
 crabbox image promote ami-1234567890abcdef0
 crabbox image promote snapshot-devtools --provider azure --target linux --region westeurope
 ```
+
+Omitting `--expected-current-image` preserves the legacy admin mutation path
+for unprotected slots. Once a default is protected, legacy admin promotion is
+rejected for that scope.
+
+The promotion-only credential also authorizes read-only default-state discovery
+and provider-neutral versioned CAS for unprotected defaults. Azure OS-disk
+snapshots are the currently supported non-AWS CAS implementation; this does not
+extend signed qualification or protected promotion to Azure.
+
+### Protected AWS/Linux promotion
+
+Protected promotion derives the desired AMI and normalized scope only from a
+locally verified, immutable Q2 qualification artifact:
+
+```sh
+CRABBOX_COORDINATOR_PROMOTION_TOKEN=... \
+  crabbox image promote \
+    --qualification-ref ghcr.io/example-org/my-app-aws-image-qualifications@sha256:... \
+    --promotion-evidence ./promotion-evidence.json \
+    --expected-current-image ami-current \
+    --expected-current-revision revision-current \
+    --idempotency-key promotion-123-1-promote \
+    --workflow-run-id 123 \
+    --workflow-run-attempt 1 \
+    --json
+```
+
+Use `--expected-current-image none` without a revision only when the exact
+default is absent. The wire precondition is either `{state:"absent"}` or
+`{state:"present",imageId,revision}`. Every successful write gets a new
+revision, including a return to an earlier AMI, so stale and ABA attempts fail
+with HTTP 409 and sanitized current scope evidence.
+
+The protected path rejects positional AMI IDs, provider/scope/capability flags,
+catalog-only promotion, and Fast Snapshot Restore before provider mutation.
+The coordinator queries AWS immediately before mutation and requires the actual
+AMI owner account and exact backing snapshot set to match the signed evidence;
+configured or request-supplied ownership alone is not sufficient. Retrying the
+same idempotency key returns the persisted attempt without replaying a completed
+mutation; reusing it with different inputs fails.
+
+Protected rollback is an explicit dispatch using the same candidate image and
+revision precondition plus `--rollback`. The target comes from the coordinator's
+previous persisted successful attempt, never from candidate metadata or an
+operator-supplied previous AMI. A mutation that applied but failed its fresh
+selection or cleanup proof remains an eligible manual rollback source:
+
+```sh
+CRABBOX_COORDINATOR_PROMOTION_TOKEN=... \
+  crabbox image promote \
+    --qualification-ref ghcr.io/example-org/my-app-aws-image-qualifications@sha256:... \
+    --promotion-evidence ./promotion-evidence.json \
+    --expected-current-image ami-candidate \
+    --expected-current-revision revision-candidate \
+    --idempotency-key promotion-124-1-rollback \
+    --workflow-run-id 124 \
+    --workflow-run-attempt 1 \
+    --rollback \
+    --json
+```
+
+The protected GitHub workflow is dispatch-only and AWS/Linux-only. It verifies
+the signed qualification without coordinator or cloud secrets, mutates under
+the `image-promoter` environment, probes one fresh non-pool lease under a
+lease-only `image-prober` credential with all explicit image overrides cleared,
+finalizes the persisted attempt, and signs that authoritative record without
+replaying promotion. Post-mutation probe failures are finalized and signable
+even when no lease ID was created; cancelled or pre-approval runs do not promise
+a receipt. It never enables FSR or performs automatic rollback.
 
 Flags:
 
