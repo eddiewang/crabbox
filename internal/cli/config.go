@@ -61,6 +61,7 @@ type Config struct {
 	CoordCandidateToken           string
 	CoordAdminToken               string
 	coordImageCandidate           bool
+	CoordPromotionToken           string
 	credentialProvenance          credentialDestinationProvenance
 	HostID                        string
 	Access                        AccessConfig
@@ -8362,6 +8363,7 @@ func applyEnv(cfg *Config) error {
 		cfg.CoordAdminToken = value
 		cfg.credentialProvenance.coordAdminToken = credentialSourceEnvironment
 	}
+	cfg.CoordPromotionToken = strings.TrimSpace(os.Getenv("CRABBOX_COORDINATOR_PROMOTION_TOKEN"))
 	cfg.HostID = getenv("CRABBOX_HOST_ID", cfg.HostID)
 	if value, ok := firstNonEmptyEnv("CRABBOX_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_ID"); ok {
 		cfg.Access.ClientID = value
