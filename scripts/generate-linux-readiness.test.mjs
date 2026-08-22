@@ -10,6 +10,7 @@ import {
   assertBuilderSuperset,
   assertProfile,
   digest,
+  goSource,
   minimalBootstrap,
 } from "./generate-linux-readiness.mjs";
 
@@ -178,6 +179,40 @@ test("generated readiness contracts are current and bind repository toolchain ve
     () => assertBuilderSuperset(minimal, weakened, versions),
     /missing exact minimal probe flock/u,
   );
+});
+
+test("generated Go preserves schema-valid probe command bytes", async (t) => {
+  const { minimal, builder } = await readProfiles();
+  const command = "printf '%s\\\\n' \"quoted\" `echo tick` /tmp/probe/path\ntrue";
+  minimal.probes.find((probe) => probe.name === "flock").command = command;
+  builder.probes.find((probe) => probe.name === "flock").command = command;
+  const bootstrap = minimalBootstrap(minimal, digest(minimal), digest(builder));
+  assert.ok(bootstrap.includes(command));
+
+  const root = await mkdtemp(join(tmpdir(), "crabbox-readiness-go-"));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const sourcePath = join(root, "main.go");
+  const source = `${goSource(
+    {
+      minimal: { digest: digest(minimal) },
+      builder: { digest: digest(builder) },
+    },
+    bootstrap,
+  ).replace("package cli", 'package main\n\nimport "os"')}
+
+func main() {
+	os.Stdout.WriteString(linuxMinimalReadinessBootstrap)
+}
+`;
+  await writeFile(sourcePath, source);
+  const compiled = spawnSync("go", ["run", sourcePath], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  assert.equal(compiled.status, 0, compiled.stderr || compiled.stdout);
+  assert.equal(compiled.stdout, bootstrap);
 });
 
 test("profile validation enforces the complete strict schema", async () => {
