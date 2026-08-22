@@ -398,6 +398,28 @@ class: standard
 	}
 }
 
+func TestPrewarmPoolIdentityRequiresPoolBeforeConfigOrProviderAcquisition(t *testing.T) {
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "invalid.yaml")
+	if err := os.WriteFile(configPath, []byte("provider: [invalid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+	t.Setenv("CRABBOX_CONFIG", configPath)
+
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err := app.Run(context.Background(), []string{"prewarm", "--pool-identity-file", filepath.Join(dir, "missing.json")})
+	if err == nil || !strings.Contains(err.Error(), "--pool-identity-file requires --pool") {
+		t.Fatalf("error=%v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	}
+	if strings.Contains(err.Error(), "yaml") || stdout.Len() != 0 {
+		t.Fatalf("validation acquired config or emitted a plan: error=%v stdout=%s", err, stdout.String())
+	}
+}
+
 func TestPrewarmReadyPoolCommitUsesOnlyKnownHydratedSHA(t *testing.T) {
 	repo := Repo{Root: t.TempDir(), Head: strings.Repeat("a", 40), BaseRef: "main"}
 	cfg := Config{}

@@ -39,6 +39,9 @@ func (a App) prewarmWithPoolFillClaim(ctx context.Context, args []string, poolFi
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
+	if strings.TrimSpace(*poolIdentityFile) != "" && strings.TrimSpace(*poolKey) == "" {
+		return exit(2, "--pool-identity-file requires --pool")
+	}
 	_ = reclaim
 	requestedSlug, err := requestedLeaseSlug(*leaseFlags.Slug)
 	if err != nil {
