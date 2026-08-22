@@ -9,7 +9,7 @@ const workflow = fs.readFileSync(
   "utf8",
 );
 
-test("AWS candidate publication is protected, manual, and candidate-only", () => {
+test("developer image publication is protected and manual", () => {
   assert.match(workflow, /^  workflow_dispatch:$/m);
   assert.doesNotMatch(workflow, /^  (?:push|pull_request|schedule):/m);
   assert.match(workflow, /environment: image-publisher/);
@@ -23,7 +23,7 @@ test("AWS candidate publication is protected, manual, and candidate-only", () =>
   assert.match(workflow, /\[\[ "\$WORKFLOW_SHA" == "\$RUN_SHA" \]\]/);
   assert.match(workflow, /ref: \$\{\{ github\.workflow_sha \}\}/);
   assert.match(workflow, /persist-credentials: false/);
-  assert.doesNotMatch(workflow, /(?:^|\s)- macos$/m);
+  assert.match(workflow, /(?:^|\s)- macos$/m);
 });
 
 test("candidate workflow has OCI and keyless-signing permissions and tools", () => {
@@ -42,6 +42,15 @@ test("candidate workflow has OCI and keyless-signing permissions and tools", () 
     workflow,
     /--certificate-identity "https:\/\/github\.com\/\$GITHUB_WORKFLOW_REF"/,
   );
+  assert.match(workflow, /name: Build trusted OCI tools[\s\S]*if: inputs\.target != 'macos'/);
+  assert.match(workflow, /name: Authenticate to GHCR[\s\S]*if: inputs\.target != 'macos'/);
+});
+
+test("macOS keeps the protected publication path", () => {
+  assert.match(workflow, /name: Build, smoke, and promote macOS image/);
+  assert.match(workflow, /if: inputs\.target == 'macos'/);
+  assert.match(workflow, /scripts\/mint-macos-devtools-image\.sh/);
+  assert.match(workflow, /"--\$MACOS_HOST"/);
 });
 
 test("workflow explicitly disables promotion, FSR, and promoted warmup", () => {
@@ -75,7 +84,7 @@ test("workflow keeps cloud credentials environment-scoped and retains proof", ()
   assert.match(workflow, /Set CRABBOX_IMAGE_PUBLISHER_OWNER to a valid email/);
   assert.match(workflow, /Set CRABBOX_IMAGE_PUBLISHER_ORG to a valid tenant/);
   assert.doesNotMatch(workflow, /image-publisher@example\.invalid|CRABBOX_ORG: example-org/);
-  assert.match(workflow, /name: Upload candidate proof[\s\S]*if: always\(\)/);
+  assert.match(workflow, /name: Upload publication proof[\s\S]*if: always\(\)/);
   assert.match(workflow, /if-no-files-found: error/);
   assert.match(workflow, /retention-days: 30/);
 });

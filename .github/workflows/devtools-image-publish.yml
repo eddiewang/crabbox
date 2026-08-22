@@ -1,5 +1,5 @@
-name: Publish AWS Image Candidate
-run-name: Publish ${{ inputs.target }} AWS image candidate in ${{ inputs.region }}
+name: Publish Developer Image
+run-name: Publish ${{ inputs.target }} developer image in ${{ inputs.region }}
 
 on:
   workflow_dispatch:
@@ -11,9 +11,10 @@ on:
         options:
           - linux
           - windows
+          - macos
       region:
         description: AWS region
-        required: true
+        required: false
         default: eu-west-1
         type: string
       base_image:
@@ -42,6 +43,19 @@ on:
         required: true
         default: m7i.large
         type: string
+      macos_type:
+        description: macOS source instance type
+        required: true
+        default: mac-m4.metal
+        type: string
+      macos_host:
+        description: Use an available EC2 Mac host or allocate one
+        required: true
+        default: use-existing
+        type: choice
+        options:
+          - use-existing
+          - allocate
 
 permissions:
   contents: read
@@ -85,15 +99,21 @@ jobs:
           ARCHITECTURE: ${{ inputs.architecture }}
           LINUX_TYPE: ${{ inputs.linux_type }}
           WINDOWS_TYPE: ${{ inputs.windows_type }}
+          MACOS_TYPE: ${{ inputs.macos_type }}
+          MACOS_HOST: ${{ inputs.macos_host }}
         run: |
           set -euo pipefail
-          [[ "$TARGET" =~ ^(linux|windows)$ ]]
+          [[ "$TARGET" =~ ^(linux|windows|macos)$ ]]
           [[ "$REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]+$ ]]
-          [[ "$BASE_IMAGE" =~ ^ami-[0-9a-z]+$ ]]
-          [[ -z "$PREVIOUS_DEFAULT" || "$PREVIOUS_DEFAULT" =~ ^ami-[0-9a-z]+$ ]]
-          [[ "$ARCHITECTURE" =~ ^(x86_64|arm64)$ ]]
+          if [[ "$TARGET" != macos ]]; then
+            [[ "$BASE_IMAGE" =~ ^ami-[0-9a-z]+$ ]]
+            [[ -z "$PREVIOUS_DEFAULT" || "$PREVIOUS_DEFAULT" =~ ^ami-[0-9a-z]+$ ]]
+            [[ "$ARCHITECTURE" =~ ^(x86_64|arm64)$ ]]
+          fi
           [[ "$LINUX_TYPE" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$WINDOWS_TYPE" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$MACOS_TYPE" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$MACOS_HOST" =~ ^(use-existing|allocate)$ ]]
 
   publish:
     name: Build, smoke, and publish candidate evidence
@@ -116,6 +136,8 @@ jobs:
       ARCHITECTURE: ${{ inputs.architecture }}
       LINUX_TYPE: ${{ inputs.linux_type }}
       WINDOWS_TYPE: ${{ inputs.windows_type }}
+      MACOS_TYPE: ${{ inputs.macos_type }}
+      MACOS_HOST: ${{ inputs.macos_host }}
     steps:
       - name: Verify publisher configuration
         shell: bash
@@ -153,16 +175,20 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Build trusted tools
+      - name: Build trusted Crabbox CLI
+        run: go build -trimpath -o bin/crabbox ./cmd/crabbox
+
+      - name: Build trusted OCI tools
+        if: inputs.target != 'macos'
         shell: bash
         run: |
           set -euo pipefail
-          go build -trimpath -o bin/crabbox ./cmd/crabbox
           GOBIN="$RUNNER_TEMP/image-tools" go install oras.land/oras/cmd/oras@v1.3.3
           GOBIN="$RUNNER_TEMP/image-tools" go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.5
           echo "$RUNNER_TEMP/image-tools" >>"$GITHUB_PATH"
 
       - name: Authenticate to GHCR
+        if: inputs.target != 'macos'
         shell: bash
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -174,6 +200,7 @@ jobs:
               --password-stdin
 
       - name: Build and prove candidate
+        if: inputs.target != 'macos'
         shell: bash
         env:
           CRABBOX_IMAGE_LOG_DIR: ${{ runner.temp }}/devtools-image-proof/aws
@@ -223,6 +250,7 @@ jobs:
             tee "$proof_dir/verification.json"
 
       - name: Publish and sign immutable OCI evidence
+        if: inputs.target != 'macos'
         shell: bash
         run: |
           set -euo pipefail
@@ -234,12 +262,33 @@ jobs:
             --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" |
             tee "$proof_dir/publication.json"
 
-      - name: Summarize candidate publication
+      - name: Build, smoke, and promote macOS image
+        if: inputs.target == 'macos'
+        shell: bash
+        env:
+          CRABBOX_MACOS_ARTIFACT_DIR: ${{ runner.temp }}/devtools-image-proof/macos
+        run: |
+          set -euo pipefail
+          proof_dir="$RUNNER_TEMP/devtools-image-proof"
+          mkdir -p "$proof_dir"
+          command=(
+            scripts/mint-macos-devtools-image.sh
+            --region "$REGION"
+            --type "$MACOS_TYPE"
+            "--$MACOS_HOST"
+          )
+          printf 'Publishing from protected commit %s\n' "$GITHUB_SHA"
+          printf 'Command:'
+          printf ' %q' "${command[@]}"
+          printf '\n'
+          "${command[@]}" 2>&1 | tee "$proof_dir/publish.log"
+
+      - name: Summarize publication
         if: always()
         shell: bash
         run: |
           {
-            echo "## AWS image candidate"
+            echo "## Developer image publication"
             echo
             echo "- Target: \`$TARGET\`"
             echo "- Region: \`$REGION\`"
@@ -254,13 +303,17 @@ jobs:
                 console.log(`- Candidate digest: \`${value.candidateDigest}\``);
               ' "$RUNNER_TEMP/devtools-image-proof/publication.json"
             fi
+            if [[ -f "$RUNNER_TEMP/devtools-image-proof/publish.log" ]]; then
+              grep -E 'promoted macOS image lifecycle passed' \
+                "$RUNNER_TEMP/devtools-image-proof/publish.log" || true
+            fi
           } >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Upload candidate proof
+      - name: Upload publication proof
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: aws-image-candidate-${{ inputs.target }}-${{ github.run_id }}
+          name: devtools-image-${{ inputs.target }}-${{ github.run_id }}
           path: ${{ runner.temp }}/devtools-image-proof
           if-no-files-found: error
           retention-days: 30

@@ -100,9 +100,15 @@ oci_digest="$(oras resolve "$tagged_ref")"
   exit 1
 }
 immutable_ref="$repository@$oci_digest"
-cosign sign --yes "$immutable_ref" >/dev/null
+cosign sign \
+  --yes \
+  --new-bundle-format \
+  --registry-referrers-mode=oci-1-1 \
+  "$immutable_ref" >/dev/null
 
 cosign verify \
+  --new-bundle-format \
+  --experimental-oci11 \
   --certificate-identity "$certificate_identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   "$immutable_ref" >/dev/null
