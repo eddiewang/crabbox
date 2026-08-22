@@ -2,6 +2,7 @@ package aws
 
 import (
 	"flag"
+	"regexp"
 	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -42,6 +43,11 @@ var memoryGiBPerVCPU = map[string]int{
 
 var classProfiles = buildClassProfiles()
 
+var (
+	readyPoolImagePattern        = regexp.MustCompile(`^ami-[0-9a-z]+$`)
+	readyPoolInstanceTypePattern = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+)
+
 func (Provider) Name() string      { return "aws" }
 func (Provider) Aliases() []string { return nil }
 func (Provider) Spec() core.ProviderSpec {
@@ -62,6 +68,25 @@ func (Provider) Spec() core.ProviderSpec {
 }
 func (Provider) RegisterFlags(*flag.FlagSet, core.Config) any { return core.NoProviderFlags() }
 func (Provider) ApplyFlags(*core.Config, *flag.FlagSet, any) error {
+	return nil
+}
+
+func (Provider) ValidateReadyPoolIdentityCreateLease(lease core.CoordinatorLease, expected core.ReadyPoolIdentityCreateExpected) error {
+	if lease.Provider != "aws" {
+		return core.Exit(7, "ready-pool identity creation requires an AWS lease")
+	}
+	if !readyPoolImagePattern.MatchString(expected.ImageID) {
+		return core.Exit(2, "--expected-image must be an exact AMI id")
+	}
+	if !readyPoolInstanceTypePattern.MatchString(expected.ServerType) {
+		return core.Exit(2, "--expected-type must be an exact AWS instance type")
+	}
+	if lease.Image == nil || strings.TrimSpace(lease.Image.ID) != expected.ImageID {
+		return core.Exit(7, "coordinator lease image does not match the expected AMI")
+	}
+	if strings.TrimSpace(lease.ServerType) != expected.ServerType {
+		return core.Exit(7, "coordinator lease type does not match the expected AWS instance type")
+	}
 	return nil
 }
 

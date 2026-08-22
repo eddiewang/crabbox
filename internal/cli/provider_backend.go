@@ -195,6 +195,11 @@ type ProviderEvidenceSanitizer interface {
 	SanitizeImageIDEvidence(imageID string) string
 }
 
+// ReadyPoolIdentityLeaseValidator owns provider-specific lease identity checks.
+type ReadyPoolIdentityLeaseValidator interface {
+	ValidateReadyPoolIdentityCreateLease(lease CoordinatorLease, expected ReadyPoolIdentityCreateExpected) error
+}
+
 type RunFailureEvidenceRequest struct {
 	Lease LeaseTarget
 }

@@ -6,6 +6,42 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
+func TestValidateReadyPoolIdentityCreateLease(t *testing.T) {
+	expected := core.ReadyPoolIdentityCreateExpected{
+		ImageID:    "ami-0123456789abcdef0",
+		ServerType: "m7i.large",
+	}
+	valid := core.CoordinatorLease{
+		Provider:   "aws",
+		ServerType: expected.ServerType,
+		Image:      &core.CoordinatorLeaseImage{ID: expected.ImageID},
+	}
+	if err := (Provider{}).ValidateReadyPoolIdentityCreateLease(valid, expected); err != nil {
+		t.Fatalf("valid lease rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name     string
+		lease    core.CoordinatorLease
+		expected core.ReadyPoolIdentityCreateExpected
+	}{
+		{name: "provider", lease: func() core.CoordinatorLease { value := valid; value.Provider = "gcp"; return value }(), expected: expected},
+		{name: "image syntax", lease: valid, expected: core.ReadyPoolIdentityCreateExpected{ImageID: "image-1", ServerType: expected.ServerType}},
+		{name: "image mismatch", lease: func() core.CoordinatorLease {
+			value := valid
+			value.Image = &core.CoordinatorLeaseImage{ID: "ami-other"}
+			return value
+		}(), expected: expected},
+		{name: "type syntax", lease: valid, expected: core.ReadyPoolIdentityCreateExpected{ImageID: expected.ImageID, ServerType: "bad type"}},
+		{name: "type mismatch", lease: func() core.CoordinatorLease { value := valid; value.ServerType = "m7i.xlarge"; return value }(), expected: expected},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := (Provider{}).ValidateReadyPoolIdentityCreateLease(test.lease, test.expected); err == nil {
+				t.Fatal("invalid lease accepted")
+			}
+		})
+	}
+}
+
 func TestNativeCheckpointCapabilitySupportsWindowsImages(t *testing.T) {
 	req := core.NativeCheckpointRequest{
 		Server:           core.Server{CloudID: "i-123"},

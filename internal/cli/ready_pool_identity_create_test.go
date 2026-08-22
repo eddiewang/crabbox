@@ -2,14 +2,40 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
+type readyPoolIdentityValidatorFunc func(CoordinatorLease, ReadyPoolIdentityCreateExpected) error
+
+func (fn readyPoolIdentityValidatorFunc) ValidateReadyPoolIdentityCreateLease(lease CoordinatorLease, expected ReadyPoolIdentityCreateExpected) error {
+	return fn(lease, expected)
+}
+
+func TestValidateReadyPoolIdentityProviderLeaseRoutesCapability(t *testing.T) {
+	want := errors.New("provider rejected lease")
+	called := false
+	err := validateReadyPoolIdentityProviderLease(
+		readyPoolIdentityValidatorFunc(func(CoordinatorLease, ReadyPoolIdentityCreateExpected) error {
+			called = true
+			return want
+		}),
+		CoordinatorLease{},
+		ReadyPoolIdentityCreateExpected{},
+	)
+	if !called || !errors.Is(err, want) {
+		t.Fatalf("called=%t error=%v", called, err)
+	}
+	if err := validateReadyPoolIdentityProviderLease(struct{}{}, CoordinatorLease{}, ReadyPoolIdentityCreateExpected{}); err != nil {
+		t.Fatalf("optional capability error=%v", err)
+	}
+}
+
 func TestValidateReadyPoolIdentityCreateLeaseRequiresExactAWSShape(t *testing.T) {
-	expected := readyPoolIdentityCreateExpected{
+	expected := ReadyPoolIdentityCreateExpected{
 		ImageID:      "ami-0123456789abcdef0",
 		ServerType:   "m7i.large",
 		Architecture: ArchitectureAMD64,
@@ -32,11 +58,8 @@ func TestValidateReadyPoolIdentityCreateLeaseRequiresExactAWSShape(t *testing.T)
 		mutate func(*CoordinatorLease)
 		want   string
 	}{
-		{name: "provider", mutate: func(lease *CoordinatorLease) { lease.Provider = "gcp" }, want: "requires an AWS lease"},
 		{name: "target", mutate: func(lease *CoordinatorLease) { lease.TargetOS = targetWindows }, want: "native Linux"},
 		{name: "host key", mutate: func(lease *CoordinatorLease) { lease.SSHHostKey = "" }, want: "authoritative coordinator SSH host key"},
-		{name: "image", mutate: func(lease *CoordinatorLease) { lease.Image.ID = "ami-other" }, want: "expected AMI"},
-		{name: "type", mutate: func(lease *CoordinatorLease) { lease.ServerType = "m7i.xlarge" }, want: "expected AWS instance type"},
 		{name: "architecture", mutate: func(lease *CoordinatorLease) { lease.Architecture = ArchitectureARM64 }, want: "expected architecture"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

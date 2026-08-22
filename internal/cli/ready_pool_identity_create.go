@@ -6,16 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
-var (
-	readyPoolAWSImagePattern        = regexp.MustCompile(`^ami-[0-9a-z]+$`)
-	readyPoolAWSInstanceTypePattern = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
-)
-
-type readyPoolIdentityCreateExpected struct {
+type ReadyPoolIdentityCreateExpected struct {
 	ImageID      string
 	ServerType   string
 	Architecture string
@@ -64,12 +58,6 @@ func (a App) readyPoolIdentityCreate(ctx context.Context, args []string) error {
 	if !readyPoolDigestPattern.MatchString(*cacheABIDigest) {
 		return exit(2, "--cache-abi-digest must be sha256:<64 lowercase hex>")
 	}
-	if !readyPoolAWSImagePattern.MatchString(strings.TrimSpace(*expectedImage)) {
-		return exit(2, "--expected-image must be an exact AMI id")
-	}
-	if !readyPoolAWSInstanceTypePattern.MatchString(strings.TrimSpace(*expectedType)) {
-		return exit(2, "--expected-type must be an exact AWS instance type")
-	}
 	if !isGitCommitSHA(strings.TrimSpace(*commit)) {
 		return exit(2, "--commit must be an exact 40-character Git commit")
 	}
@@ -89,7 +77,7 @@ func (a App) readyPoolIdentityCreate(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	expected := readyPoolIdentityCreateExpected{
+	expected := ReadyPoolIdentityCreateExpected{
 		ImageID:      strings.TrimSpace(*expectedImage),
 		ServerType:   strings.TrimSpace(*expectedType),
 		Architecture: architecture,
@@ -97,6 +85,13 @@ func (a App) readyPoolIdentityCreate(ctx context.Context, args []string) error {
 		RecipeDigest: strings.TrimSpace(*expectedRecipeDigest),
 	}
 	if err := validateReadyPoolIdentityCreateLease(lease, expected); err != nil {
+		return err
+	}
+	provider, err := ProviderFor(lease.Provider)
+	if err != nil {
+		return err
+	}
+	if err := validateReadyPoolIdentityProviderLease(provider, lease, expected); err != nil {
 		return err
 	}
 	_, target, _ := leaseToServerTarget(lease, cfg)
@@ -138,21 +133,20 @@ func (a App) readyPoolIdentityCreate(ctx context.Context, args []string) error {
 	return json.NewEncoder(a.Stdout).Encode(identity)
 }
 
-func validateReadyPoolIdentityCreateLease(lease CoordinatorLease, expected readyPoolIdentityCreateExpected) error {
-	if lease.Provider != "aws" {
-		return exit(7, "ready-pool identity creation requires an AWS lease")
+func validateReadyPoolIdentityProviderLease(provider any, lease CoordinatorLease, expected ReadyPoolIdentityCreateExpected) error {
+	validator, ok := provider.(ReadyPoolIdentityLeaseValidator)
+	if !ok {
+		return nil
 	}
+	return validator.ValidateReadyPoolIdentityCreateLease(lease, expected)
+}
+
+func validateReadyPoolIdentityCreateLease(lease CoordinatorLease, expected ReadyPoolIdentityCreateExpected) error {
 	if lease.TargetOS != targetLinux {
 		return exit(7, "ready-pool identity creation requires a native Linux lease")
 	}
 	if strings.TrimSpace(lease.SSHHostKey) == "" {
 		return exit(7, "ready-pool identity creation requires an authoritative coordinator SSH host key")
-	}
-	if lease.Image == nil || strings.TrimSpace(lease.Image.ID) != expected.ImageID {
-		return exit(7, "coordinator lease image does not match the expected AMI")
-	}
-	if strings.TrimSpace(lease.ServerType) != expected.ServerType {
-		return exit(7, "coordinator lease type does not match the expected AWS instance type")
 	}
 	if strings.TrimSpace(lease.Architecture) == "" {
 		return exit(7, "coordinator lease architecture does not match the expected architecture")
