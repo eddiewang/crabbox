@@ -1760,6 +1760,7 @@ retrySync:
 			recorder.Event("sync.finished", "synced", fmt.Sprintf("duration=%s mode=archive", timings.sync.Round(time.Millisecond)))
 			goto afterSync
 		}
+		runtimeOverlayFallback := false
 		if overlayDecision.Enabled {
 			stepStart = time.Now()
 			out, overlayErr := runIdempotentSSHCombinedOutput(ctx, target, remotePrepareGitOverlay(workdir, coherence), idempotentSSHRetryDelay)
@@ -1768,18 +1769,26 @@ retrySync:
 				if reason, fallback := gitOverlayFallbackResult(out, overlayErr); fallback {
 					overlayDecision.Enabled = false
 					overlayDecision.Reason = reason
+					runtimeOverlayFallback = true
 					fmt.Fprintf(a.Stderr, "git overlay fallback reason=%s; using full manifest sync\n", reason)
 				} else {
 					return recordFailure(exit(6, "remote git overlay seed failed: %v", overlayErr))
 				}
 			}
 		}
-		if !overlayDecision.Enabled && coherence.seedEnabled() {
+		if !overlayDecision.Enabled && !runtimeOverlayFallback && coherence.seedEnabled() {
 			stepStart = time.Now()
 			if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
 				fmt.Fprintf(a.Stderr, "warning: remote git seed failed: %v\n", err)
 			}
 			timings.syncSteps.gitSeed += time.Since(stepStart)
+		}
+		if runtimeOverlayFallback {
+			stepStart = time.Now()
+			if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteMkdir(workdir), idempotentSSHRetryDelay); err != nil {
+				return recordFailure(exit(7, "create remote workdir after git overlay fallback: %v", err))
+			}
+			timings.syncSteps.mkdir = time.Since(stepStart)
 		}
 		manifestData := manifest.NUL()
 		deletedData := manifest.DeletedNUL()
@@ -1853,6 +1862,11 @@ retrySync:
 			}
 		}
 		stepStart = time.Now()
+		finalizeCoherence := coherence
+		if runtimeOverlayFallback {
+			finalizeCoherence = gitCoherencePlan{}
+			hydrateGit = false
+		}
 		finalizeCommand := remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{
 			AllowMassDeletions: allowRemoteSyncMassDeletions(cfg, hydratedByActions),
 			HydrateGit:         hydrateGit,
@@ -1860,7 +1874,7 @@ retrySync:
 			BaseSHA:            baseSHA,
 			Fingerprint:        fingerprint,
 			Token:              finalizeToken,
-			Coherence:          coherence,
+			Coherence:          finalizeCoherence,
 		})
 		if out, err := runIdempotentSSHCombinedOutput(ctx, target, finalizeCommand, idempotentSSHRetryDelay); err != nil {
 			if out != "" {

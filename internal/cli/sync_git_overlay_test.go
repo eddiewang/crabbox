@@ -362,6 +362,44 @@ func TestGitOverlayDecisionRejectsCheckoutTransforms(t *testing.T) {
 	}
 }
 
+func TestRuntimeGitOverlayFallbackUsesPlainIdempotentSync(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX sync command regression")
+	}
+	for _, existing := range []bool{false, true} {
+		root := t.TempDir()
+		workdir := filepath.Join(root, "work")
+		if existing {
+			if err := os.MkdirAll(workdir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for range 2 {
+			if out, err := exec.Command("bash", "-lc", remoteMkdir(workdir)).CombinedOutput(); err != nil {
+				t.Fatalf("existing=%t mkdir: %v\n%s", existing, err, out)
+			}
+		}
+		if info, err := os.Stat(workdir); err != nil || !info.IsDir() {
+			t.Fatalf("existing=%t workdir info=%v err=%v", existing, info, err)
+		}
+	}
+
+	command := remoteFinalizeSync("/tmp/crabbox-overlay-fallback", remoteSyncFinalizeOptions{
+		HydrateGit: false,
+		Coherence:  gitCoherencePlan{},
+		Token:      strings.Repeat("a", 32),
+	})
+	for _, forbidden := range []string{
+		"requested Git tree verification failed",
+		"requested commit is not on advertised branch",
+		"git fetch --quiet --no-tags",
+	} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("plain fallback finalize contains %q:\n%s", forbidden, command)
+		}
+	}
+}
+
 func TestSameSyncManifestIncludesProtectedTrackedExcludes(t *testing.T) {
 	base := SyncManifest{
 		Files:                    []string{"coverage/keep.txt"},
