@@ -14064,9 +14064,8 @@ export class FleetCoordinator {
       );
     }
     const scope = imagePromotionScope(evidence);
-    const currentRecord = await currentPromotedAWSImageForScope(this.state.storage, scope);
-    const before = await imageDefaultState(currentRecord);
-    const beforeBinding = await imagePromotionBoundState(currentRecord);
+    const { capability } = this.protectedImagePromotionProvider(scope);
+    const { state: before, binding: beforeBinding } = await capability.readDefault(scope);
     if (!beforeBinding) {
       return json(
         {
@@ -14173,6 +14172,28 @@ export class FleetCoordinator {
       .toSorted((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
   }
 
+  private protectedImagePromotionProvider(scope: ImageDefaultScope): {
+    provider: CloudProvider;
+    capability: ProtectedImagePromotionCapability;
+    promoteImage: NonNullable<CloudProvider["promoteImage"]>;
+    clearImageDefault: NonNullable<CloudProvider["clearImageDefault"]>;
+  } {
+    const provider = this.provider("aws", scope.region);
+    if (
+      !provider.protectedImagePromotion ||
+      !provider.promoteImage ||
+      !provider.clearImageDefault
+    ) {
+      throw new Error("AWS image promotion unavailable");
+    }
+    return {
+      provider,
+      capability: provider.protectedImagePromotion,
+      promoteImage: provider.promoteImage.bind(provider),
+      clearImageDefault: provider.clearImageDefault.bind(provider),
+    };
+  }
+
   private async claimImagePromotionAttempt(
     idempotencyKey: string,
     expectedPhase: ImagePromotionAttempt["phase"],
@@ -14271,9 +14292,8 @@ export class FleetCoordinator {
     }
     if (attempt.phase === "pending") {
       const scope = imagePromotionScope(attempt.evidence);
-      const current = await imageDefaultState(
-        await currentPromotedAWSImageForScope(this.state.storage, scope),
-      );
+      const { capability } = this.protectedImagePromotionProvider(scope);
+      const { state: current } = await capability.readDefault(scope);
       return sameImageDefaultState(current, attempt.expected)
         ? this.mutateImagePromotionAttempt(attempt)
         : this.finalizeImagePromotionConflict(attempt, current);
@@ -14315,6 +14335,7 @@ export class FleetCoordinator {
   > {
     const key = imagePromotionAttemptKey(attempt.idempotencyKey);
     const scope = imagePromotionScope(attempt.evidence);
+    const { capability } = this.protectedImagePromotionProvider(scope);
     return this.state.storage.transaction(async (transaction) => {
       const currentAttempt = await transaction.get<ImagePromotionAttempt>(key);
       if (!currentAttempt) throw new Error("image promotion attempt disappeared");
@@ -14326,9 +14347,10 @@ export class FleetCoordinator {
       ) {
         return { kind: "lost" as const, attempt: currentAttempt };
       }
-      const currentRecord = await currentPromotedAWSImageForScope(transaction, scope);
-      const current = await imageDefaultState(currentRecord);
-      const currentBinding = await imagePromotionBoundState(currentRecord);
+      const { state: current, binding: currentBinding } = await capability.readAuthoritativeDefault(
+        scope,
+        transaction,
+      );
       if (
         currentAttempt.plannedAfter &&
         sameImagePromotionBoundState(currentBinding, currentAttempt.plannedAfter)
@@ -14460,16 +14482,9 @@ export class FleetCoordinator {
   }
 
   private async mutateImagePromotionAttempt(attempt: ImagePromotionAttempt): Promise<Response> {
-    const plannedAfter: ImagePromotionBoundState =
-      attempt.desired.state === "absent"
-        ? { state: "absent" }
-        : {
-            state: "present",
-            imageId: attempt.desired.imageId,
-            revision: crypto.randomUUID(),
-            accountId: attempt.desired.accountId,
-            snapshotIds: [...attempt.desired.snapshotIds].toSorted(),
-          };
+    const scope = imagePromotionScope(attempt.evidence);
+    const { capability } = this.protectedImagePromotionProvider(scope);
+    const plannedAfter = capability.plannedBinding(attempt.desired);
     const claimed = await this.claimImagePromotionAttempt(
       attempt.idempotencyKey,
       "pending",
@@ -14484,16 +14499,13 @@ export class FleetCoordinator {
     attempt: ImagePromotionAttempt,
   ): Promise<Response> {
     const scope = imagePromotionScope(attempt.evidence);
-    const provider = this.provider("aws", scope.region);
-    if (!provider.promoteImage || !provider.clearImageDefault) {
-      throw new Error("AWS image promotion unavailable");
-    }
+    const { provider, capability, promoteImage, clearImageDefault } =
+      this.protectedImagePromotionProvider(scope);
     if (attempt.desired.state === "absent") {
       let cleared: Awaited<ReturnType<NonNullable<CloudProvider["clearImageDefault"]>>>;
       try {
-        cleared = await provider.clearImageDefault(scope, attempt.expected, {
-          mode: "protected",
-        });
+        const input = capability.clearInput(attempt);
+        cleared = await clearImageDefault(input.scope, input.expected, input.context);
       } catch {
         return this.finalizeImagePromotionUnknown(attempt);
       }
@@ -14528,29 +14540,15 @@ export class FleetCoordinator {
       return this.finalizeImagePromotionUnknown(attempt);
     }
     const metadata = await provider.storedImageMetadata(attempt.desired.imageId);
-    const providerRequest = new Request("https://coordinator.invalid/v1/images/promote", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        target: scope.target,
-        os: scope.os,
-        region: scope.region,
-        serverType: scope.serverType,
-        architecture: scope.architecture,
-        expectedCurrent: attempt.expected,
-        expectedOwnerAccountId: attempt.desired.accountId,
-        expectedSnapshotIds: attempt.desired.snapshotIds,
-        promotionRevision: attempt.plannedAfter.revision,
-      }),
-    });
+    const input = capability.promotionInput(attempt, metadata);
     let result: Awaited<ReturnType<NonNullable<CloudProvider["promoteImage"]>>>;
     try {
-      result = await provider.promoteImage(
-        attempt.desired.imageId,
-        metadata,
-        providerRequest,
-        new URL(providerRequest.url),
-        { mode: "protected" },
+      result = await promoteImage(
+        input.imageID,
+        input.metadata,
+        input.request,
+        input.url,
+        input.context,
       );
     } catch {
       return this.finalizeImagePromotionUnknown(attempt);
@@ -14568,9 +14566,7 @@ export class FleetCoordinator {
         if ((attempt.claimVersion ?? 0) > 1) {
           return this.reconcileReclaimedImagePromotionConflict(attempt);
         }
-        const current = await imageDefaultState(
-          await currentPromotedAWSImageForScope(this.state.storage, scope),
-        );
+        const { state: current } = await capability.readDefault(scope);
         return this.finalizeImagePromotionConflict(attempt, current);
       }
       const rejected: ImagePromotionAttempt = {
@@ -14585,7 +14581,7 @@ export class FleetCoordinator {
     }
     const promoted = result.image as PromotedImageRecord;
     const after = await imageDefaultState(promoted);
-    const promotedBinding = await imagePromotionBoundState(promoted);
+    const promotedBinding = await capability.boundState(promoted);
     if (!sameImagePromotionBoundState(promotedBinding, attempt.plannedAfter)) {
       return this.finalizeImagePromotionUnknown(attempt, after);
     }
@@ -14621,9 +14617,8 @@ export class FleetCoordinator {
     observedAfter?: ImageDefaultState,
   ): Promise<Response> {
     const scope = imagePromotionScope(attempt.evidence);
-    const after =
-      observedAfter ??
-      (await imageDefaultState(await currentPromotedAWSImageForScope(this.state.storage, scope)));
+    const { capability } = this.protectedImagePromotionProvider(scope);
+    const after = observedAfter ?? (await capability.readDefault(scope)).state;
     const stored = await this.persistClaimedImagePromotionAttempt({
       ...attempt,
       phase: "completed",
@@ -18695,6 +18690,36 @@ interface ImagePromotionMutationContext {
   mode: "protected" | "versioned";
 }
 
+interface ProtectedImagePromotionState {
+  state: ImageDefaultState;
+  binding: ImagePromotionBoundState | undefined;
+}
+
+interface ProtectedImagePromotionCapability {
+  readDefault(scope: ImageDefaultScope): Promise<ProtectedImagePromotionState>;
+  readAuthoritativeDefault(
+    scope: ImageDefaultScope,
+    storage: ProviderStateStorageView,
+  ): Promise<ProtectedImagePromotionState>;
+  boundState(image: PromotedImageRecord | undefined): Promise<ImagePromotionBoundState | undefined>;
+  plannedBinding(desired: ImagePromotionTarget): ImagePromotionBoundState;
+  clearInput(attempt: ImagePromotionAttempt): {
+    scope: ImageDefaultScope;
+    expected: ImageDefaultState;
+    context: ImagePromotionMutationContext;
+  };
+  promotionInput(
+    attempt: ImagePromotionAttempt,
+    metadata: ProviderImage | undefined,
+  ): {
+    imageID: string;
+    metadata: ProviderImage | undefined;
+    request: Request;
+    url: URL;
+    context: ImagePromotionMutationContext;
+  };
+}
+
 const imagePromotionClaimTTLMS = 30_000;
 
 function newImagePromotionClaim(version: number, now = new Date()): ImagePromotionClaim {
@@ -18708,30 +18733,6 @@ function newImagePromotionClaim(version: number, now = new Date()): ImagePromoti
 
 function imagePromotionClaimActive(attempt: ImagePromotionAttempt, now = Date.now()): boolean {
   return !!attempt.claim && Date.parse(attempt.claim.expiresAt) > now;
-}
-
-async function imagePromotionBoundState(
-  image: PromotedImageRecord | undefined,
-): Promise<ImagePromotionBoundState | undefined> {
-  if (!image) return { state: "absent" };
-  const state = await imageDefaultState(image);
-  const accountId = image.ownerId?.trim() ?? "";
-  const snapshotIds = [...(image.snapshots ?? [])].toSorted();
-  if (
-    state.state !== "present" ||
-    !/^\d{12}$/.test(accountId) ||
-    snapshotIds.length === 0 ||
-    snapshotIds.some((snapshot) => !/^snap-[0-9a-z]+$/.test(snapshot))
-  ) {
-    return undefined;
-  }
-  return {
-    state: "present",
-    imageId: state.imageId,
-    revision: state.revision,
-    accountId,
-    snapshotIds,
-  };
 }
 
 function sameImagePromotionBoundState(
@@ -24607,6 +24608,7 @@ interface CloudProvider {
     expected: ImageDefaultState,
     context: ImagePromotionMutationContext,
   ): Promise<Response | { state: ImageDefaultState }>;
+  protectedImagePromotion?: ProtectedImagePromotionCapability;
   protectedImageDefaultForImage?(imageID: string): Promise<boolean>;
   fastSnapshotRestoreForImage?(
     imageID: string,
@@ -25899,6 +25901,19 @@ export class DaytonaProvider implements CloudProvider {
 export class AWSProvider implements CloudProvider {
   private clientValue?: EC2SpotClient;
   private readonly region: string;
+  readonly protectedImagePromotion: ProtectedImagePromotionCapability = {
+    readDefault: async (scope) => await this.protectedImagePromotionState(scope, this.storage),
+    readAuthoritativeDefault: async (scope, storage) =>
+      await this.protectedImagePromotionState(scope, storage),
+    boundState: async (image) => await this.protectedImagePromotionBoundState(image),
+    plannedBinding: (desired) => this.plannedImagePromotionBinding(desired),
+    clearInput: (attempt) => ({
+      scope: imagePromotionScope(attempt.evidence),
+      expected: attempt.expected,
+      context: { mode: "protected" },
+    }),
+    promotionInput: (attempt, metadata) => this.protectedImagePromotionInput(attempt, metadata),
+  };
 
   constructor(
     private readonly env: Env,
@@ -25911,6 +25926,91 @@ export class AWSProvider implements CloudProvider {
   private get client(): EC2SpotClient {
     this.clientValue ??= new EC2SpotClient(this.env, this.region);
     return this.clientValue;
+  }
+
+  private async protectedImagePromotionState(
+    scope: ImageDefaultScope,
+    storage: ProviderStateStorageView,
+  ): Promise<ProtectedImagePromotionState> {
+    const image = await currentPromotedAWSImageForScope(storage, scope);
+    return {
+      state: await imageDefaultState(image),
+      binding: await this.protectedImagePromotionBoundState(image),
+    };
+  }
+
+  private async protectedImagePromotionBoundState(
+    image: PromotedImageRecord | undefined,
+  ): Promise<ImagePromotionBoundState | undefined> {
+    if (!image) return { state: "absent" };
+    const state = await imageDefaultState(image);
+    const accountId = image.ownerId?.trim() ?? "";
+    const snapshotIds = [...(image.snapshots ?? [])].toSorted();
+    if (
+      state.state !== "present" ||
+      !/^\d{12}$/.test(accountId) ||
+      snapshotIds.length === 0 ||
+      snapshotIds.some((snapshot) => !/^snap-[0-9a-z]+$/.test(snapshot))
+    ) {
+      return undefined;
+    }
+    return {
+      state: "present",
+      imageId: state.imageId,
+      revision: state.revision,
+      accountId,
+      snapshotIds,
+    };
+  }
+
+  private plannedImagePromotionBinding(desired: ImagePromotionTarget): ImagePromotionBoundState {
+    return desired.state === "absent"
+      ? { state: "absent" }
+      : {
+          state: "present",
+          imageId: desired.imageId,
+          revision: crypto.randomUUID(),
+          accountId: desired.accountId,
+          snapshotIds: [...desired.snapshotIds].toSorted(),
+        };
+  }
+
+  private protectedImagePromotionInput(
+    attempt: ImagePromotionAttempt,
+    metadata: ProviderImage | undefined,
+  ): {
+    imageID: string;
+    metadata: ProviderImage | undefined;
+    request: Request;
+    url: URL;
+    context: ImagePromotionMutationContext;
+  } {
+    if (attempt.desired.state !== "present" || attempt.plannedAfter?.state !== "present") {
+      throw new Error("protected AWS promotion input requires a planned image binding");
+    }
+    const scope = imagePromotionScope(attempt.evidence);
+    const request = new Request("https://coordinator.invalid/v1/images/promote", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        target: scope.target,
+        os: scope.os,
+        region: scope.region,
+        serverType: scope.serverType,
+        architecture: scope.architecture,
+        expectedCurrent: attempt.expected,
+        expectedOwnerAccountId: attempt.desired.accountId,
+        expectedSnapshotIds: attempt.desired.snapshotIds,
+        promotionRevision: attempt.plannedAfter.revision,
+      }),
+    });
+    return {
+      imageID: attempt.desired.imageId,
+      metadata,
+      request,
+      url: new URL(request.url),
+      context: { mode: "protected" },
+    };
   }
 
   workspaceCapability(

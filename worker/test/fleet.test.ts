@@ -32759,6 +32759,52 @@ describe("image promotion CAS", () => {
 });
 
 describe("protected image promotion attempts", () => {
+  it("routes AWS promotion state and mutation inputs through the provider capability", async () => {
+    const storage = new MemoryStorage();
+    const env = { CRABBOX_AWS_EXPECTED_ACCOUNT_ID: "123456789012" };
+    const provider = new AWSProvider(env as Env, "eu-west-1", storage);
+    vi.spyOn(provider, "getImage").mockImplementation(async (imageID) =>
+      imagePromotionAWSImage(imageID),
+    );
+    const readDefault = vi.spyOn(provider.protectedImagePromotion, "readDefault");
+    const readAuthoritativeDefault = vi.spyOn(
+      provider.protectedImagePromotion,
+      "readAuthoritativeDefault",
+    );
+    const plannedBinding = vi.spyOn(provider.protectedImagePromotion, "plannedBinding");
+    const promotionInput = vi.spyOn(provider.protectedImagePromotion, "promotionInput");
+    const fleet = testFleet(storage, { aws: provider }, env);
+
+    const promoted = await fleet.fetch(
+      protectedPromotionRequest("provider-capability", { state: "absent" }),
+    );
+    const body = (await promoted.json()) as {
+      image: PromotedImageRecord;
+      attempt: Record<string, unknown>;
+    };
+    expect(promoted.status).toBe(200);
+    expect(readDefault).toHaveBeenCalled();
+    expect(plannedBinding).toHaveBeenCalledOnce();
+    expect(promotionInput).toHaveBeenCalledOnce();
+
+    storage.seed(
+      "image-promotion-attempt:provider-capability",
+      claimedPromotionAttempt(body.attempt, "mutating", {
+        plannedAfter: {
+          state: "present",
+          imageId: "ami-b",
+          revision: body.image.revision,
+          accountId: "123456789012",
+          snapshotIds: ["snap-b"],
+        },
+      }),
+    );
+    const recovered = await fleet.fetch(promotionRecoveryRequest("provider-capability"));
+
+    expect(recovered.status).toBe(200);
+    expect(readAuthoritativeDefault).toHaveBeenCalledOnce();
+  });
+
   it("rejects extra request and evidence fields before reserving an attempt", async () => {
     const storage = new MemoryStorage();
     const fleet = testFleet(storage);
@@ -33336,6 +33382,7 @@ describe("protected image promotion attempts", () => {
     vi.spyOn(provider, "getImage").mockImplementation(async (imageID) =>
       imagePromotionAWSImage(imageID),
     );
+    const clearInput = vi.spyOn(provider.protectedImagePromotion, "clearInput");
     const fleet = testFleet(storage, { aws: provider }, env);
     const promoted = await fleet.fetch(
       protectedPromotionRequest("first-promotion", { state: "absent" }),
@@ -33377,6 +33424,7 @@ describe("protected image promotion attempts", () => {
       ),
     );
     expect(rollback.status).toBe(200);
+    expect(clearInput).toHaveBeenCalledOnce();
     await expect(rollback.json()).resolves.toMatchObject({
       attempt: {
         outcome: "rolled_back",
