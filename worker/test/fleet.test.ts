@@ -35596,14 +35596,16 @@ describe("image candidate authorization", () => {
     const fleet = testFleet(storage);
 
     expect(
-      (await fleet.fetch(request("GET", `/v1/leases/${candidate.id}`, {
-        headers: candidateHeaders,
-      }))).status,
+      (
+        await fleet.fetch(
+          request("GET", `/v1/leases/${candidate.id}`, {
+            headers: candidateHeaders,
+          }),
+        )
+      ).status,
     ).toBe(200);
     const deniedLeaseOperations = await Promise.all([
-      fleet.fetch(
-        request("GET", `/v1/leases/${ordinary.id}`, { headers: candidateHeaders }),
-      ),
+      fleet.fetch(request("GET", `/v1/leases/${ordinary.id}`, { headers: candidateHeaders })),
       fleet.fetch(
         request("POST", `/v1/leases/${ordinary.id}/heartbeat`, {
           headers: candidateHeaders,
@@ -35659,18 +35661,12 @@ describe("image candidate authorization", () => {
     expect(ordinaryRunResponse.status).toBe(201);
     const ordinaryRun = ((await ordinaryRunResponse.json()) as { run: RunRecord }).run;
 
-    const listed = await fleet.fetch(
-      request("GET", "/v1/runs", { headers: candidateHeaders }),
-    );
+    const listed = await fleet.fetch(request("GET", "/v1/runs", { headers: candidateHeaders }));
     await expect(listed.json()).resolves.toMatchObject({ runs: [{ id: run.id }] });
 
     const deniedRunOperations = await Promise.all([
-      fleet.fetch(
-        request("GET", `/v1/runs/${ordinaryRun.id}`, { headers: candidateHeaders }),
-      ),
-      fleet.fetch(
-        request("GET", `/v1/runs/${ordinaryRun.id}/logs`, { headers: candidateHeaders }),
-      ),
+      fleet.fetch(request("GET", `/v1/runs/${ordinaryRun.id}`, { headers: candidateHeaders })),
+      fleet.fetch(request("GET", `/v1/runs/${ordinaryRun.id}/logs`, { headers: candidateHeaders })),
       fleet.fetch(
         request("GET", `/v1/runs/${ordinaryRun.id}/events`, { headers: candidateHeaders }),
       ),
