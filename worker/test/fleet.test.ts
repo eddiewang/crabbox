@@ -35437,6 +35437,43 @@ describe("image candidate authorization", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { field: "cacheVolumeProtocol", value: 0 },
+    { field: "cacheVolumes", value: [] },
+    { field: "purgeOnRelease", value: false },
+    { field: "repoScope", value: "" },
+    { field: "awsRootGB", value: 0 },
+  ] as const)(
+    "rejects candidate $field by presence before provider or storage mutation",
+    async ({ field, value }) => {
+      const storage = new MemoryStorage();
+      const create = vi.fn();
+      const prepare = vi.fn((config: LeaseConfig) => config);
+      const fleet = testFleet(storage, {
+        aws: fakeProvider(create, {
+          provider: "aws",
+          onPrepareLeaseConfig: prepare,
+        }),
+      });
+
+      const response = await fleet.fetch(
+        request("POST", "/v1/leases", {
+          headers: candidateHeaders,
+          body: { ...candidateLeaseInput, [field]: value },
+        }),
+      );
+
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        error: "image_candidate_lease_forbidden",
+        fields: expect.arrayContaining([field]),
+      });
+      expect(prepare).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect((await storage.list()).size).toBe(0);
+    },
+  );
+
   it("binds candidate images to their candidate lease and fixed owner identity", async () => {
     const storage = new MemoryStorage();
     const deleted: string[] = [];

@@ -20506,6 +20506,17 @@ function imageCandidateLeaseRequestError(
   ) {
     fields.push("idleTimeoutSeconds");
   }
+  for (const field of [
+    "cacheVolumeProtocol",
+    "cacheVolumes",
+    "purgeOnRelease",
+    "repoScope",
+    "awsRootGB",
+  ] as const) {
+    if (Object.prototype.hasOwnProperty.call(input, field)) {
+      fields.push(field);
+    }
+  }
   const restricted = [
     input.hostId ? "hostId" : "",
     input.hostID ? "hostID" : "",
