@@ -152,15 +152,6 @@ func TestGitOverlayDecisionAllowsSupportedOriginTransports(t *testing.T) {
 		})
 	}
 
-	githubRepo := repo
-	githubRepo.RemoteURL = "git@github.com:example-org/repo.git"
-	githubPlan, blocked := syncGitCoherencePlan(cfg, githubRepo)
-	if blocked || githubPlan.RemoteURL != "https://github.com/example-org/repo.git" {
-		t.Fatalf("GitHub scp normalization plan=%#v blocked=%t", githubPlan, blocked)
-	}
-	if decision := decideGitOverlay(cfg, githubRepo, SSHTarget{TargetOS: targetLinux}, manifest, githubPlan, false, false, false); !decision.Enabled || decision.Reason != "" {
-		t.Fatalf("normalized GitHub scp decision=%#v", decision)
-	}
 }
 
 func TestGitOverlayDecisionRejectsUnsupportedOriginTransports(t *testing.T) {
@@ -185,86 +176,39 @@ func TestGitOverlayDecisionRejectsUnsupportedOriginTransports(t *testing.T) {
 			}
 		})
 	}
+
+	githubRepo := repo
+	githubRepo.RemoteURL = "git@github.com:example-org/repo.git"
+	githubPlan, blocked := syncGitCoherencePlan(cfg, githubRepo)
+	if blocked || githubPlan.RemoteURL != "https://github.com/example-org/repo.git" {
+		t.Fatalf("GitHub scp normalization plan=%#v blocked=%t", githubPlan, blocked)
+	}
+	decision := decideGitOverlay(cfg, githubRepo, SSHTarget{TargetOS: targetLinux}, manifest, githubPlan, false, false, false)
+	if !decision.Requested || decision.Enabled || decision.Reason != "unsupported_origin_transport" {
+		t.Fatalf("normalized GitHub scp decision=%#v", decision)
+	}
 }
 
-func TestRunGitOverlayUnsupportedOriginFallsBackToFullManifest(t *testing.T) {
+func TestRunGitOverlayPrivateSCPOriginCompletesPlainManifestSync(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX sync command regression")
 	}
-	clearConfigEnv(t)
-	root := t.TempDir()
-	isolateRunTestUserDirs(t, root)
-	t.Chdir(root)
-	runGit(t, root, "init")
-	runGit(t, root, "config", "user.email", "test@example.com")
-	runGit(t, root, "config", "user.name", "Test")
-	runGit(t, root, "branch", "-M", "main")
-	writeFile(t, filepath.Join(root, "tracked.txt"), "tracked\n")
-	runGit(t, root, "add", ".")
-	runGit(t, root, "commit", "-m", "base")
-	runGit(t, root, "remote", "add", "origin", "ssh://git@example.test/repo.git")
-	runGit(t, root, "update-ref", "refs/remotes/origin/main", "HEAD")
-	runGit(t, root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-	runGit(t, root, "branch", "--set-upstream-to=origin/main", "main")
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%t", existing), func(t *testing.T) {
+			result := runPrivateOriginGitOverlayFallbackSync(t, "cbx_private_origin", existing)
+			assertPrivateOriginGitOverlayFallbackSync(t, result)
+		})
+	}
+}
 
-	configPath := filepath.Join(root, ".crabbox.yaml")
-	writeFile(t, configPath, "sync:\n  gitOverlay: true\n  fingerprint: false\n")
-	binDir := filepath.Join(root, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatal(err)
+func TestRunGitOverlayPrivateSCPOriginReclassifiesReplacementLease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX sync command regression")
 	}
-	sshLog := filepath.Join(root, "ssh.log")
-	sshPath := filepath.Join(binDir, "ssh")
-	installWorkspaceOwnerAwareSSH(t, sshPath, `#!/bin/sh
-cmd="$1"
-printf '%s\n---\n' "$cmd" >> "$CRABBOX_FAKE_SSH_LOG"
-case "$cmd" in
-  *".seed.XXXXXX"*) exit 42 ;;
-esac
-/bin/cat >/dev/null || true
-exit 0
-`)
-	rsyncLog := filepath.Join(root, "rsync.log")
-	rsyncPath := filepath.Join(binDir, "rsync")
-	if err := os.WriteFile(rsyncPath, []byte("#!/bin/sh\n/bin/cat > \"$CRABBOX_FAKE_RSYNC_LOG\"\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
-	t.Setenv("CRABBOX_FAKE_SSH_LOG", sshLog)
-	t.Setenv("CRABBOX_FAKE_RSYNC_LOG", rsyncLog)
-	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
-	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
-
-	var stdout, stderr bytes.Buffer
-	runErr := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
-		"--provider", runEnvProfileTestProvider{}.Name(),
-		"--sync-only",
-	})
-	if runErr != nil {
-		t.Fatalf("unsupported overlay transport became fatal: %v\nstdout=%s\nstderr=%s", runErr, stdout.String(), stderr.String())
-	}
-	for _, want := range []string{
-		"git overlay fallback reason=unsupported_origin_transport; using full manifest sync",
-		"warning: remote git seed failed:",
-	} {
-		if !strings.Contains(stderr.String(), want) {
-			t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
-		}
-	}
-	manifest, err := os.ReadFile(rsyncLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(manifest, []byte("tracked.txt\x00")) {
-		t.Fatalf("full manifest did not reach rsync: %q", manifest)
-	}
-	commands, err := os.ReadFile(sshLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(commands, []byte(gitOverlayFallbackMarker)) || bytes.Contains(commands, []byte(".overlay-git.")) {
-		t.Fatalf("hermetic overlay command ran for unsupported transport:\n%s", commands)
+	result := runPrivateOriginGitOverlayFallbackReplacementSync(t, "cbx_private_first", "cbx_private_replacement")
+	assertPrivateOriginGitOverlayFallbackSync(t, result)
+	if got := strings.Count(result.stderr, "git overlay fallback reason=unsupported_origin_transport; using full manifest sync"); got != 2 {
+		t.Fatalf("private-origin classifications=%d want 2:\n%s", got, result.stderr)
 	}
 }
 
@@ -411,18 +355,31 @@ type runtimeGitOverlayFallbackResult struct {
 
 func runRuntimeGitOverlayFallbackSync(t *testing.T, leaseID string, existing bool) runtimeGitOverlayFallbackResult {
 	t.Helper()
-	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{leaseID}, existing, false)
+	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{leaseID}, existing, false, "")
 }
 
 func runRuntimeGitOverlayFallbackReplacementSync(t *testing.T, firstLeaseID, replacementLeaseID string) runtimeGitOverlayFallbackResult {
 	t.Helper()
-	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{firstLeaseID, replacementLeaseID}, false, true)
+	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{firstLeaseID, replacementLeaseID}, false, true, "")
 }
 
-func runRuntimeGitOverlayFallbackSyncWithLeases(t *testing.T, leaseIDs []string, existing, replace bool) runtimeGitOverlayFallbackResult {
+func runPrivateOriginGitOverlayFallbackSync(t *testing.T, leaseID string, existing bool) runtimeGitOverlayFallbackResult {
+	t.Helper()
+	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{leaseID}, existing, false, "git@github.com:example-org/repo.git")
+}
+
+func runPrivateOriginGitOverlayFallbackReplacementSync(t *testing.T, firstLeaseID, replacementLeaseID string) runtimeGitOverlayFallbackResult {
+	t.Helper()
+	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{firstLeaseID, replacementLeaseID}, false, true, "git@github.com:example-org/repo.git")
+}
+
+func runRuntimeGitOverlayFallbackSyncWithLeases(t *testing.T, leaseIDs []string, existing, replace bool, remoteURL string) runtimeGitOverlayFallbackResult {
 	t.Helper()
 	clearConfigEnv(t)
 	root, _, _, _ := newGitOverlayTestRepo(t)
+	if remoteURL != "" {
+		runGit(t, root, "remote", "set-url", "origin", remoteURL)
+	}
 	t.Chdir(root)
 	isolateRunTestUserDirs(t, root)
 	repo, err := findRepo()
@@ -652,6 +609,48 @@ func assertRuntimeGitOverlayFallbackSync(t *testing.T, result runtimeGitOverlayF
 		}
 		if !strings.Contains(afterFallback, remoteMkdir(workdirs[attempt])) {
 			t.Fatalf("fallback attempt %d did not create workdir idempotently:\n%s", attempt+1, afterFallback)
+		}
+	}
+}
+
+func assertPrivateOriginGitOverlayFallbackSync(t *testing.T, result runtimeGitOverlayFallbackResult) {
+	t.Helper()
+	if !strings.Contains(result.stderr, "git overlay fallback reason=unsupported_origin_transport; using full manifest sync") {
+		t.Fatalf("private-origin fallback missing:\n%s", result.stderr)
+	}
+	if !bytes.Contains(result.rsyncData, []byte("clean.txt\x00")) {
+		t.Fatalf("full manifest did not reach rsync: %q", result.rsyncData)
+	}
+	if got, err := os.ReadFile(filepath.Join(result.workdir, "clean.txt")); err != nil || string(got) != "clean.txt\n" {
+		t.Fatalf("uploaded clean file=%q err=%v", got, err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(result.workdir, ".crabbox", "sync-manifest"))
+	if err != nil {
+		t.Fatalf("finalized manifest missing: %v\nstderr:\n%s\nssh:\n%s", err, result.stderr, result.sshLog)
+	}
+	if !bytes.Contains(manifest, []byte("clean.txt\x00")) {
+		t.Fatalf("finalized manifest=%q", manifest)
+	}
+	for _, forbidden := range []string{
+		".overlay-git.",
+		".seed.XXXXXX",
+		"git remote set-url origin",
+		"git fetch --quiet --no-tags",
+		"base_tmp=",
+		"requested Git tree verification failed",
+		"requested commit is not on advertised branch",
+	} {
+		if bytes.Contains(result.sshLog, []byte(forbidden)) {
+			t.Fatalf("private-origin fallback ran forbidden Git operation %q:\n%s", forbidden, result.sshLog)
+		}
+	}
+	workdirs := []string{result.initialWorkdir}
+	if result.workdir != result.initialWorkdir {
+		workdirs = append(workdirs, result.workdir)
+	}
+	for _, workdir := range workdirs {
+		if !bytes.Contains(result.sshLog, []byte(remoteMkdir(workdir))) {
+			t.Fatalf("private-origin fallback did not create workdir %q idempotently:\n%s", workdir, result.sshLog)
 		}
 	}
 }

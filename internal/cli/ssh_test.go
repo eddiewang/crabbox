@@ -2004,6 +2004,72 @@ func TestRemoteFinalizeSyncCommitsMetadataInOneCommand(t *testing.T) {
 	}
 }
 
+func TestRemoteFinalizeSyncPlainManifestKeepsDeletionGuardWithoutGitCoherence(t *testing.T) {
+	const finalizeToken = "0123456789abcdef0123456789abcdef"
+	workdir := t.TempDir()
+	runGit(t, workdir, "init")
+	runGit(t, workdir, "config", "user.email", "test@example.com")
+	runGit(t, workdir, "config", "user.name", "Test")
+	for i := range 200 {
+		writeFile(t, filepath.Join(workdir, fmt.Sprintf("tracked-%03d.txt", i)), "tracked\n")
+	}
+	runGit(t, workdir, "add", ".")
+	runGit(t, workdir, "commit", "-m", "base")
+	for i := range 200 {
+		if err := os.Remove(filepath.Join(workdir, fmt.Sprintf("tracked-%03d.txt", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(coherenceMetaDir(t, workdir), remoteSyncPendingManifestName(finalizeToken)), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	command := remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{
+		PlainManifest: true,
+		BaseRef:       "main",
+		BaseSHA:       "abc123",
+		Token:         finalizeToken,
+	})
+	for _, forbidden := range []string{"repair_origin", "git fetch", "base_tmp="} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("plain manifest finalize contains %q:\n%s", forbidden, command)
+		}
+	}
+	out, err := exec.Command("bash", "-lc", command).CombinedOutput()
+	if err == nil || exitCode(err) != 66 {
+		t.Fatalf("plain manifest deletion guard err=%v output=%q", err, out)
+	}
+}
+
+func TestRemoteFinalizeSyncPlainManifestClearsHydrationMarker(t *testing.T) {
+	const finalizeToken = "0123456789abcdef0123456789abcdef"
+	workdir := t.TempDir()
+	metaDir := filepath.Join(workdir, ".crabbox")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, remoteSyncPendingManifestName(finalizeToken)), []byte("tracked.txt\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(metaDir, "git-hydrate-base")
+	if err := os.WriteFile(marker, []byte("main stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	command := remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{
+		PlainManifest: true,
+		BaseRef:       "main",
+		BaseSHA:       "abc123",
+		Token:         finalizeToken,
+	})
+	if out, err := exec.Command("bash", "-lc", command).CombinedOutput(); err != nil {
+		t.Fatalf("plain manifest finalize: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("stale hydration marker survived plain manifest finalize: %v", err)
+	}
+}
+
 func TestRemoteFinalizeSyncHydratesForRepositoryDepth(t *testing.T) {
 	fixture := newGitCoherenceFixture(t)
 	// Exceed the fallback depth so accidentally deepening a complete clone is observable.

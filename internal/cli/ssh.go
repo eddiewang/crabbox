@@ -1972,6 +1972,7 @@ rm -f "$meta_dir/sync-fingerprint"`
 type remoteSyncFinalizeOptions struct {
 	AllowMassDeletions bool
 	HydrateGit         bool
+	PlainManifest      bool
 	BaseRef            string
 	BaseSHA            string
 	Fingerprint        string
@@ -2228,9 +2229,13 @@ func remoteFinalizeSync(workdir string, opts remoteSyncFinalizeOptions) string {
 	}
 	manifestName := remoteSyncPendingManifestName(opts.Token)
 	deletedName := remoteSyncPendingDeletedName(opts.Token)
+	gitWorkspaceFunctions := remoteGitWorkspaceFunctions()
+	if opts.PlainManifest {
+		gitWorkspaceFunctions = ""
+	}
 	script := `set -e
 cd ` + shellQuote(workdir) + `
-` + remoteGitWorkspaceFunctions() + `
+` + gitWorkspaceFunctions + `
 ` + remoteSyncMetaDirScript() + `
 mkdir -p "$meta_dir"
 new="$meta_dir/` + manifestName + `"
@@ -2263,7 +2268,23 @@ elif [ ! -f "$manifest" ] || [ ! -f "$committed_token" ] || [ "$(cat "$committed
   exit 67
 fi
 `
-	if opts.Coherence.enabled() {
+	if opts.PlainManifest {
+		script += `publish_fingerprint=
+git_root=
+if git_root="$(git rev-parse --show-toplevel 2>/dev/null)" &&
+   git_root="$(cd -P -- "$git_root" 2>/dev/null && pwd -P)" &&
+   [ "$git_root" = "$(pwd -P)" ] &&
+   git status --short >"$git_status" 2>/dev/null; then
+  deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' "$git_status")
+  if [ ` + shellQuote(allowValue) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
+    echo "remote sync sanity failed: $deletions tracked deletions" >&2
+    awk '/^ D|^D / { print "  " substr($0,4) }' "$git_status" | head -20 >&2
+    exit 66
+  fi
+fi
+rm -f "$meta_dir/git-hydrate-base"
+`
+	} else if opts.Coherence.enabled() {
 		script += remoteGitCoherenceFinalizeScript(opts.Coherence, allowValue)
 	} else {
 		script += `publish_fingerprint=
@@ -2288,7 +2309,7 @@ fi
 fi
 `
 	}
-	if opts.BaseRef != "" && opts.BaseSHA != "" {
+	if !opts.PlainManifest && opts.BaseRef != "" && opts.BaseSHA != "" {
 		script += `base_tmp="$meta_dir/git-hydrate-base.tmp.$$"
 printf %s ` + shellQuote(opts.BaseRef+" "+opts.BaseSHA+"\n") + ` > "$base_tmp"
 mv "$base_tmp" "$meta_dir/git-hydrate-base"

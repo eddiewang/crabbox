@@ -53,6 +53,8 @@ func decideGitOverlay(cfg Config, repo Repo, target SSHTarget, manifest SyncMani
 		decision.Reason = "include_whitelist"
 	case credentialBlocked || gitRemoteURLHasCredentials(repo.RemoteURL):
 		decision.Reason = "credential_origin"
+	case repo.RemoteURL != "" && !gitOverlayOriginTransportSupported(repo.RemoteURL):
+		decision.Reason = "unsupported_origin_transport"
 	case coherence.RemoteURL != "" && !gitOverlayOriginTransportSupported(coherence.RemoteURL):
 		decision.Reason = "unsupported_origin_transport"
 	default:
