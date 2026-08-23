@@ -6506,7 +6506,39 @@ describe("fleet lease identity and idle", () => {
     );
   });
 
-  it("uses the persisted AWS lease region for every release side effect", async () => {
+  it.each([
+    ["without a persisted region", undefined],
+    ["with the provider region", "eu-west-1"],
+  ])(
+    "uses provider release overrides %s without loading AWS credentials",
+    async (_case, leaseRegion) => {
+      const provider = new AWSProvider({} as Env, "eu-west-1", new MemoryStorage());
+      const findServer = vi
+        .spyOn(provider, "findServer")
+        .mockResolvedValue(ownedTestMachine("aws", "i-abcdef123456"));
+      const deleteServer = vi.spyOn(provider, "deleteServer").mockResolvedValue();
+      const deleteSSHKey = vi.spyOn(provider, "deleteSSHKey").mockResolvedValue();
+
+      await expect(
+        provider.releaseLease(
+          testLease({
+            id: "cbx_abcdef123456",
+            provider: "aws",
+            cloudID: "i-abcdef123456",
+            ...(leaseRegion ? { region: leaseRegion } : {}),
+            providerKey: "crabbox-cbx-abcdef123456",
+            providerKeyCleanupOwned: true,
+          }),
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(findServer).toHaveBeenCalledWith("i-abcdef123456");
+      expect(deleteServer).toHaveBeenCalledWith("i-abcdef123456");
+      expect(deleteSSHKey).toHaveBeenCalledWith("crabbox-cbx-abcdef123456", "cbx_abcdef123456");
+    },
+  );
+
+  it("uses only the persisted fallback AWS region for every release side effect", async () => {
     const storage = new MemoryStorage();
     const leaseID = "cbx_abcdef123456";
     const cloudID = "i-abcdef123456";
@@ -6541,6 +6573,15 @@ describe("fleet lease identity and idle", () => {
       "eu-west-1",
       storage,
     );
+    const defaultFindServer = vi
+      .spyOn(provider, "findServer")
+      .mockRejectedValue(new Error("default-region ownership lookup must not run"));
+    const defaultDeleteServer = vi
+      .spyOn(provider, "deleteServer")
+      .mockRejectedValue(new Error("default-region instance deletion must not run"));
+    const defaultDeleteSSHKey = vi
+      .spyOn(provider, "deleteSSHKey")
+      .mockRejectedValue(new Error("default-region SSH key deletion must not run"));
     const calls: Array<{ action: string; region: string }> = [];
     let detached = false;
     const findServer = vi
@@ -6630,6 +6671,9 @@ describe("fleet lease identity and idle", () => {
     expect(new Set(calls.map(({ region: callRegion }) => callRegion))).toEqual(
       new Set(["us-east-1"]),
     );
+    expect(defaultFindServer).not.toHaveBeenCalled();
+    expect(defaultDeleteServer).not.toHaveBeenCalled();
+    expect(defaultDeleteSSHKey).not.toHaveBeenCalled();
   });
 
   it("reads and verifies cloud ownership before AWS, Azure, or GCP release", async () => {
