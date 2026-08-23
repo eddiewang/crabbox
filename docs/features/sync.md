@@ -207,15 +207,20 @@ worktrees send no tracked file payload. Reset removes stale tracked, untracked,
 and ignored workload state while preserving ignored `node_modules`,
 `.pnpm-store`, `.yarn/cache`, and `.yarn/unplugged` directories that pass the
 same real-directory and workspace-containment checks as ready-pool scrub.
-Clone and fetch retain credential and SSH transport configuration while
-overriding hooks with an inert path. Checkout/reset additionally disable info
-attributes, filter configuration, and ambient global/system Git configuration.
+Clone and fetch use an anonymous, hermetic transport: prompts are disabled,
+credential helpers are cleared, `GIT_SSH_COMMAND=/bin/false`, and hooks use an
+inert path. Credential-dependent SCP and SSH origins are classified as
+unsupported and use the normal full-manifest sync instead; overlay sync never
+forwards their credentials or enables SSH transport. Checkout/reset additionally
+disable info attributes, filter configuration, and ambient global/system Git
+configuration.
 Unsupported local state, including
 sparse checkouts, submodules, filtered trees, include whitelists, or a changed
 manifest, checkout-transforming Git configuration or attributes, falls back to
 the normal full-manifest sync in the same run. Missing advertised branches or
-planned commits also fall back. SSH, Git clone/fetch/auth, manifest upload, and
-rsync failures remain errors instead of being hidden by fallback.
+planned commits also fall back. For eligible anonymous HTTP(S) and file origins,
+Git clone/fetch transport failures, manifest upload failures, and rsync failures
+remain errors instead of being hidden by fallback.
 
 The overlay path is disabled by default and currently applies only to Linux SSH
 targets with `sync.delete` and `sync.gitSeed` enabled. `--full-resync` and
