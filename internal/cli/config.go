@@ -58,7 +58,9 @@ type Config struct {
 	macOSPortalCoordinator        string
 	CoordToken                    string
 	CoordTokenCommand             []string
+	CoordCandidateToken           string
 	CoordAdminToken               string
+	coordImageCandidate           bool
 	credentialProvenance          credentialDestinationProvenance
 	HostID                        string
 	Access                        AccessConfig
@@ -8351,6 +8353,10 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.CoordTokenCommand = append([]string(nil), command...)
 		cfg.credentialProvenance.coordTokenCommand = credentialSourceEnvironment
+	}
+	if value := os.Getenv("CRABBOX_COORDINATOR_CANDIDATE_TOKEN"); value != "" {
+		cfg.CoordCandidateToken = value
+		cfg.credentialProvenance.coordCandidateToken = credentialSourceEnvironment
 	}
 	if value, ok := firstNonEmptyEnv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "CRABBOX_ADMIN_TOKEN"); ok {
 		cfg.CoordAdminToken = value

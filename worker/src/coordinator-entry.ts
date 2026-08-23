@@ -135,6 +135,17 @@ export async function prepareCoordinatorRequest(
       env,
     );
   }
+  const candidateAuth = imageCandidateServiceAuth(request, env, route);
+  if (candidateAuth instanceof Response) {
+    return { response: candidateAuth, authenticated: false };
+  }
+  if (candidateAuth) {
+    return await authenticatedCoordinatorRequest(
+      requestWithoutTrustedHeaders(request),
+      candidateAuth,
+      env,
+    );
+  }
   const runtimeAdapterPath = runtimeAdapterProxyPath(route);
   if (
     env.CRABBOX_WORKSPACE_AWS_PRIVATE?.trim() === "1" &&
@@ -287,6 +298,7 @@ function requestWithoutCoordinatorAuthContext(request: Request): Request {
     "x-crabbox-org",
     "x-crabbox-github-login",
     "x-crabbox-token-expires-at",
+    "x-crabbox-image-candidate",
   ]) {
     headers.delete(name);
   }
@@ -353,7 +365,147 @@ function runtimeAdapterServiceAuth(
   };
 }
 
-function configuredCoordinatorBearer(
+function imageCandidateServiceAuth(
+  request: Request,
+  env: Pick<
+    Env,
+    | "CRABBOX_IMAGE_CANDIDATE_TOKEN"
+    | "CRABBOX_IMAGE_CANDIDATE_OWNER"
+    | "CRABBOX_IMAGE_CANDIDATE_ORG"
+    | "CRABBOX_ADMIN_TOKEN"
+    | "CRABBOX_SHARED_TOKEN"
+    | "CRABBOX_RUNTIME_ADAPTER_TOKEN"
+  >,
+  route: string[],
+): AuthContext | Response | undefined {
+  const supplied = bearerToken(request);
+  const configured = env.CRABBOX_IMAGE_CANDIDATE_TOKEN;
+  const matchesConfigured = Boolean(
+    supplied && configured && timingSafeEqual(supplied, configured),
+  );
+  const candidateIntent = request.headers.get("x-crabbox-image-candidate") === "true";
+  const candidateRoute = imageCandidateRouteAllowed(request.method, route);
+  const configError = imageCandidateConfigurationError(env);
+  if (matchesConfigured && configError) {
+    return json(
+      { error: "image_candidate_auth_unavailable", message: configError },
+      { status: 503 },
+    );
+  }
+  if (candidateIntent && configError && !configuredNonCandidateBearer(request, env)) {
+    return json(
+      { error: "image_candidate_auth_unavailable", message: configError },
+      { status: 503 },
+    );
+  }
+  if (!matchesConfigured || configError) {
+    return undefined;
+  }
+  if (!candidateRoute) {
+    return json(
+      {
+        error: "image_candidate_scope_forbidden",
+        message: "image candidate token is not authorized for this route",
+      },
+      { status: 403 },
+    );
+  }
+  return {
+    authorized: true,
+    admin: false,
+    imageCandidate: true,
+    auth: "bearer",
+    owner: env.CRABBOX_IMAGE_CANDIDATE_OWNER!.trim(),
+    org: env.CRABBOX_IMAGE_CANDIDATE_ORG!.trim(),
+  };
+}
+
+function imageCandidateConfigurationError(
+  env: Pick<
+    Env,
+    | "CRABBOX_IMAGE_CANDIDATE_TOKEN"
+    | "CRABBOX_IMAGE_CANDIDATE_OWNER"
+    | "CRABBOX_IMAGE_CANDIDATE_ORG"
+    | "CRABBOX_ADMIN_TOKEN"
+    | "CRABBOX_SHARED_TOKEN"
+    | "CRABBOX_RUNTIME_ADAPTER_TOKEN"
+  >,
+): string | undefined {
+  const raw = env.CRABBOX_IMAGE_CANDIDATE_TOKEN ?? "";
+  const token = raw.trim();
+  if (!token) {
+    return "CRABBOX_IMAGE_CANDIDATE_TOKEN is not configured";
+  }
+  if (
+    token !== raw ||
+    token.length < 32 ||
+    token.length > 4096 ||
+    Array.from(token).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x20 || codePoint === 0x7f;
+    })
+  ) {
+    return "CRABBOX_IMAGE_CANDIDATE_TOKEN is invalid";
+  }
+  for (const [name, value] of [
+    ["CRABBOX_ADMIN_TOKEN", env.CRABBOX_ADMIN_TOKEN],
+    ["CRABBOX_SHARED_TOKEN", env.CRABBOX_SHARED_TOKEN],
+    ["CRABBOX_RUNTIME_ADAPTER_TOKEN", env.CRABBOX_RUNTIME_ADAPTER_TOKEN],
+  ] as const) {
+    if (value && timingSafeEqual(token, value)) {
+      return `CRABBOX_IMAGE_CANDIDATE_TOKEN must differ from ${name}`;
+    }
+  }
+  if (!env.CRABBOX_IMAGE_CANDIDATE_OWNER?.trim()) {
+    return "CRABBOX_IMAGE_CANDIDATE_OWNER is not configured";
+  }
+  if (!env.CRABBOX_IMAGE_CANDIDATE_ORG?.trim()) {
+    return "CRABBOX_IMAGE_CANDIDATE_ORG is not configured";
+  }
+  return undefined;
+}
+
+function imageCandidateRouteAllowed(methodValue: string, route: string[]): boolean {
+  const method = methodValue.toUpperCase();
+  const path = route.join("/");
+  if (method === "POST" && path === "v1/leases") return true;
+  if (method === "GET" && path === "v1/control") return true;
+  if (
+    route[0] === "v1" &&
+    route[1] === "leases" &&
+    route[2] &&
+    ((method === "GET" && route.length === 3) ||
+      (method === "POST" &&
+        route.length === 4 &&
+        (route[3] === "heartbeat" || route[3] === "release" || route[3] === "cancel-create")))
+  ) {
+    return true;
+  }
+  if (method === "GET" && path === "v1/runs") return true;
+  if (method === "POST" && path === "v1/runs") return true;
+  if (route[0] === "v1" && route[1] === "runs" && route[2]) {
+    if (method === "GET" && (route.length === 3 || route[3] === "logs" || route[3] === "events")) {
+      return route.length <= 4;
+    }
+    if (
+      method === "POST" &&
+      route.length === 4 &&
+      (route[3] === "events" || route[3] === "telemetry" || route[3] === "finish")
+    ) {
+      return true;
+    }
+  }
+  if (method === "POST" && path === "v1/images") return true;
+  return (
+    route[0] === "v1" &&
+    route[1] === "images" &&
+    Boolean(route[2]) &&
+    route.length === 3 &&
+    (method === "GET" || method === "DELETE")
+  );
+}
+
+function configuredNonCandidateBearer(
   request: Request,
   env: Pick<Env, "CRABBOX_ADMIN_TOKEN" | "CRABBOX_SHARED_TOKEN" | "CRABBOX_RUNTIME_ADAPTER_TOKEN">,
 ): boolean {
@@ -363,6 +515,28 @@ function configuredCoordinatorBearer(
     [env.CRABBOX_ADMIN_TOKEN, env.CRABBOX_SHARED_TOKEN, env.CRABBOX_RUNTIME_ADAPTER_TOKEN].some(
       (configured) => configured && timingSafeEqual(token, configured),
     ),
+  );
+}
+
+function configuredCoordinatorBearer(
+  request: Request,
+  env: Pick<
+    Env,
+    | "CRABBOX_ADMIN_TOKEN"
+    | "CRABBOX_SHARED_TOKEN"
+    | "CRABBOX_RUNTIME_ADAPTER_TOKEN"
+    | "CRABBOX_IMAGE_CANDIDATE_TOKEN"
+  >,
+): boolean {
+  const token = bearerToken(request);
+  return Boolean(
+    token &&
+    [
+      env.CRABBOX_ADMIN_TOKEN,
+      env.CRABBOX_SHARED_TOKEN,
+      env.CRABBOX_RUNTIME_ADAPTER_TOKEN,
+      env.CRABBOX_IMAGE_CANDIDATE_TOKEN,
+    ].some((configured) => configured && timingSafeEqual(token, configured)),
   );
 }
 

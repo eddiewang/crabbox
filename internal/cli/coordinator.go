@@ -21,9 +21,43 @@ type CoordinatorClient struct {
 	BaseURL          string
 	Token            string
 	TokenCommand     []string
+	ImageCandidate   bool
 	Access           AccessConfig
 	Client           *http.Client
 	ChildEnvDenylist []string
+}
+
+type coordinatorImageCandidateCapacityRequest struct {
+	Market string `json:"market"`
+}
+
+type coordinatorImageCandidateLeaseRequest struct {
+	LeaseID            string                                   `json:"leaseID"`
+	Slug               string                                   `json:"slug"`
+	CreateAttemptID    string                                   `json:"createAttemptID,omitempty"`
+	Profile            string                                   `json:"profile,omitempty"`
+	Provider           string                                   `json:"provider"`
+	Target             string                                   `json:"target"`
+	Architecture       string                                   `json:"architecture"`
+	OS                 string                                   `json:"os,omitempty"`
+	WindowsMode        string                                   `json:"windowsMode,omitempty"`
+	Desktop            bool                                     `json:"desktop,omitempty"`
+	DesktopEnv         string                                   `json:"desktopEnv,omitempty"`
+	Browser            bool                                     `json:"browser,omitempty"`
+	Code               bool                                     `json:"code,omitempty"`
+	Class              string                                   `json:"class"`
+	ServerType         string                                   `json:"serverType"`
+	ServerTypeExplicit bool                                     `json:"serverTypeExplicit"`
+	AWSRegion          string                                   `json:"awsRegion"`
+	AWSAMI             string                                   `json:"awsAMI"`
+	Capacity           coordinatorImageCandidateCapacityRequest `json:"capacity"`
+	SSHUser            string                                   `json:"sshUser,omitempty"`
+	SSHPort            string                                   `json:"sshPort,omitempty"`
+	SSHFallbackPorts   []string                                 `json:"sshFallbackPorts,omitempty"`
+	WorkRoot           string                                   `json:"workRoot,omitempty"`
+	TTLSeconds         int                                      `json:"ttlSeconds"`
+	IdleTimeoutSeconds int                                      `json:"idleTimeoutSeconds"`
+	SSHPublicKey       string                                   `json:"sshPublicKey"`
 }
 
 func (c *CoordinatorClient) hasConfiguredAuth() bool {
@@ -931,10 +965,17 @@ func newCoordinatorClient(cfg Config) (*CoordinatorClient, bool, error) {
 		return nil, true, exit(2, "CRABBOX_COORDINATOR must be an absolute URL")
 	}
 	base.Path = strings.TrimRight(base.Path, "/")
+	token := cfg.CoordToken
+	imageCandidate := cfg.coordImageCandidate
+	if token == "" {
+		token = cfg.CoordCandidateToken
+		imageCandidate = token != ""
+	}
 	return &CoordinatorClient{
 		BaseURL:          strings.TrimRight(base.String(), "/"),
-		Token:            cfg.CoordToken,
+		Token:            token,
 		TokenCommand:     append([]string(nil), cfg.CoordTokenCommand...),
+		ImageCandidate:   imageCandidate,
 		Access:           cfg.Access,
 		ChildEnvDenylist: externalDesktopChildEnvDenylist(cfg, cfg.TargetOS),
 		Client: &http.Client{
@@ -963,6 +1004,51 @@ func (c *CoordinatorClient) CreateLeaseWithAttempt(ctx context.Context, cfg Conf
 
 func (c *CoordinatorClient) EnsureLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug string) (CoordinatorLease, error) {
 	return c.createLease(ctx, cfg, publicKey, keep, leaseID, slug, "", true)
+}
+
+func imageCandidateLeaseRequest(cfg Config, publicKey, leaseID, slug, createAttemptID string) coordinatorImageCandidateLeaseRequest {
+	osImage := ""
+	if cfg.osImageExplicit {
+		osImage = cfg.OSImage
+	}
+	windowsMode := ""
+	if cfg.TargetOS == targetWindows {
+		windowsMode = cfg.WindowsMode
+	}
+	desktopEnv := ""
+	if cfg.Desktop {
+		desktopEnv = normalizedDesktopEnv(cfg.DesktopEnv)
+	}
+	return coordinatorImageCandidateLeaseRequest{
+		LeaseID:            leaseID,
+		Slug:               slug,
+		CreateAttemptID:    createAttemptID,
+		Profile:            cfg.Profile,
+		Provider:           cfg.Provider,
+		Target:             cfg.TargetOS,
+		Architecture:       effectiveArchitectureForConfig(cfg),
+		OS:                 osImage,
+		WindowsMode:        windowsMode,
+		Desktop:            cfg.Desktop,
+		DesktopEnv:         desktopEnv,
+		Browser:            cfg.Browser,
+		Code:               cfg.Code,
+		Class:              cfg.Class,
+		ServerType:         cfg.ServerType,
+		ServerTypeExplicit: cfg.ServerTypeExplicit,
+		AWSRegion:          cfg.AWSRegion,
+		AWSAMI:             cfg.AWSAMI,
+		Capacity: coordinatorImageCandidateCapacityRequest{
+			Market: cfg.Capacity.Market,
+		},
+		SSHUser:            cfg.SSHUser,
+		SSHPort:            cfg.SSHPort,
+		SSHFallbackPorts:   cfg.SSHFallbackPorts,
+		WorkRoot:           cfg.WorkRoot,
+		TTLSeconds:         int(cfg.TTL.Seconds()),
+		IdleTimeoutSeconds: int(cfg.IdleTimeout.Seconds()),
+		SSHPublicKey:       publicKey,
+	}
 }
 
 func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug, createAttemptID string, fixed bool) (CoordinatorLease, error) {
@@ -1065,6 +1151,10 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 		req["azureOSDisk"] = cfg.AzureOSDisk
 	}
 	addCoordinatorGCPFields(req, cfg)
+	var requestBody any = req
+	if c.ImageCandidate {
+		requestBody = imageCandidateLeaseRequest(cfg, publicKey, leaseID, slug, createAttemptID)
+	}
 	method := http.MethodPost
 	path := "/v1/leases"
 	if fixed {
@@ -1074,7 +1164,7 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 		// Older coordinators do not have this route, so mixed-version use fails closed.
 		path = "/v1/leases/capability-aware"
 	}
-	err = c.do(ctx, method, path, req, &res)
+	err = c.do(ctx, method, path, requestBody, &res)
 	return res.Lease, err
 }
 
@@ -2232,6 +2322,9 @@ func (c *CoordinatorClient) addRequestHeaders(ctx context.Context, headers http.
 	if token != "" {
 		headers.Set("Authorization", "Bearer "+token)
 	}
+	if c.ImageCandidate {
+		headers.Set("X-Crabbox-Image-Candidate", "true")
+	}
 	c.addAccessHeaders(headers)
 	if owner := c.localCoordinatorOwner(); owner != "" {
 		headers.Set("X-Crabbox-Owner", owner)
@@ -2363,6 +2456,9 @@ func (c *CoordinatorClient) curlConfig(ctx context.Context, method, path string,
 	}
 	if token != "" {
 		curlConfigValue(&cfg, "header", "Authorization: Bearer "+token)
+	}
+	if c.ImageCandidate {
+		curlConfigValue(&cfg, "header", "X-Crabbox-Image-Candidate: true")
 	}
 	c.addCurlAccessHeaders(&cfg)
 	if owner := c.localCoordinatorOwner(); owner != "" {

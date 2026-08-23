@@ -29,6 +29,7 @@ type credentialDestinationProvenance struct {
 	coordinator           credentialValueSource
 	coordToken            credentialValueSource
 	coordTokenCommand     credentialValueSource
+	coordCandidateToken   credentialValueSource
 	coordAdminToken       credentialValueSource
 	accessClientID        credentialValueSource
 	accessClientSecret    credentialValueSource
@@ -292,12 +293,17 @@ func validateCoordinatorCredentialDestination(cfg Config) error {
 	}
 	provenance := cfg.credentialProvenance
 	coordTokenSource := provenance.coordToken
+	candidateTokenSource := provenance.coordCandidateToken
 	if coordTokenSource == credentialSourceUnknown && cfg.CoordToken != "" && cfg.CoordToken == cfg.CoordAdminToken {
 		coordTokenSource = provenance.coordAdminToken
+	}
+	if coordTokenSource == credentialSourceUnknown && cfg.CoordToken != "" && cfg.CoordToken == cfg.CoordCandidateToken {
+		coordTokenSource = candidateTokenSource
 	}
 	credentials := []sourcedCredential{
 		{cfg.CoordToken, coordTokenSource},
 		{strings.Join(cfg.CoordTokenCommand, "\x00"), provenance.coordTokenCommand},
+		{cfg.CoordCandidateToken, candidateTokenSource},
 		{cfg.CoordAdminToken, provenance.coordAdminToken},
 		{cfg.Access.ClientSecret, provenance.accessClientSecret},
 		{cfg.Access.Token, provenance.accessToken},

@@ -27,6 +27,7 @@ const accessKeySetLoads = new Map<string, Promise<AccessKeySetCacheEntry>>();
 export interface AuthContext {
   authorized: boolean;
   admin: boolean;
+  imageCandidate?: boolean;
   auth: "bearer" | "device" | "github" | "proxy";
   owner: string;
   org: string;
@@ -238,10 +239,14 @@ export function requestWithAuthContext(request: Request, auth: AuthContext): Req
   headers.delete("cf-access-jwt-assertion");
   headers.delete("x-crabbox-internal");
   headers.delete("x-crabbox-proxy-secret");
+  headers.delete("x-crabbox-image-candidate");
   headers.set("x-crabbox-auth", auth.auth);
   headers.set("x-crabbox-admin", auth.admin ? "true" : "false");
   headers.set("x-crabbox-owner", auth.owner);
   headers.set("x-crabbox-org", auth.org);
+  if (auth.imageCandidate) {
+    headers.set("x-crabbox-image-candidate", "true");
+  }
   if (auth.login) {
     headers.set("x-crabbox-github-login", auth.login);
   } else {

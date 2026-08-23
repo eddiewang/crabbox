@@ -33,6 +33,7 @@ export function publicRunRecord(record: RunRecord): RunRecord {
     ...record,
     org: orgLabelForDisplay(record.org),
   };
+  delete publicRecord.imageCandidate;
   if (!record.leaseOwners) {
     return publicRecord;
   }
