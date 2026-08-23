@@ -552,6 +552,59 @@ func TestAWSCreateRollbackPreservesMatchingUnmanagedKey(t *testing.T) {
 	}
 }
 
+func TestAWSCreateValidatesAllCacheVolumeLaunchCandidatesBeforeMutation(t *testing.T) {
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		action := params.Get("Action")
+		actions = append(actions, action)
+		if action != "DescribeInstanceTypes" {
+			t.Fatalf("unexpected AWS mutation before cache compatibility validation: %s", action)
+		}
+		instanceType := params.Get("InstanceType.1")
+		hypervisor := "nitro"
+		if instanceType == "m3.large" {
+			hypervisor = "xen"
+		}
+		writeEC2XML(w, `<DescribeInstanceTypesResponse><instanceTypeSet><item><instanceType>`+instanceType+`</instanceType><hypervisor>`+hypervisor+`</hypervisor></item></instanceTypeSet></DescribeInstanceTypesResponse>`)
+	}))
+	defer server.Close()
+
+	lifecycle := &countingAWSCacheVolumeLifecycle{}
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.Class = "m3.large"
+	cfg.ServerType = "m7a.large"
+	cfg.AWSAMI = "ami-test"
+	cfg.AWSSGID = "sg-test"
+	cfg.Capacity.Market = "on-demand"
+	cfg.AWSCacheVolumeLifecycle = lifecycle
+	cfg.Cache.Volumes = []CacheVolumeConfig{{Name: "build", Key: "build", Path: "/var/cache/build"}}
+	if got, want := awsLaunchCandidates(cfg), []string{"m7a.large", "m3.large", "t3.small"}; !slices.Equal(got, want) {
+		t.Fatalf("launch candidates=%v, want %v", got, want)
+	}
+
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(
+		context.Background(), cfg, "", "cbx_123", "cache-validation", false, nil, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "AWS cache volumes require a Nitro/NVMe instance type: m3.large") {
+		t.Fatalf("err=%v, want non-Nitro cache compatibility rejection", err)
+	}
+	if lifecycle.prepareCalls != 0 {
+		t.Fatalf("cache Prepare calls=%d, want 0", lifecycle.prepareCalls)
+	}
+	if want := []string{"DescribeInstanceTypes", "DescribeInstanceTypes"}; !slices.Equal(actions, want) {
+		t.Fatalf("actions=%v, want %v", actions, want)
+	}
+}
+
 func TestAWSEnsureSSHKeyRejectsMismatchedExistingFingerprint(t *testing.T) {
 	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 1))
 	var actions []string
@@ -1340,6 +1393,23 @@ func testAWSClient(endpoint string) *AWSClient {
 		sts:    sts.NewFromConfig(cfg),
 		region: "eu-west-1",
 	}
+}
+
+type countingAWSCacheVolumeLifecycle struct {
+	prepareCalls int
+}
+
+func (l *countingAWSCacheVolumeLifecycle) Prepare(context.Context, AWSCacheVolumeCloud, AWSCacheVolumePrepareRequest) (AWSCacheVolumePlan, error) {
+	l.prepareCalls++
+	return AWSCacheVolumePlan{}, nil
+}
+
+func (*countingAWSCacheVolumeLifecycle) Attach(context.Context, AWSCacheVolumeCloud, AWSCacheVolumePlan, string) error {
+	return nil
+}
+
+func (*countingAWSCacheVolumeLifecycle) Release(context.Context, AWSCacheVolumeCloud, string, bool) error {
+	return nil
 }
 
 func writeEC2XML(w http.ResponseWriter, body string) {

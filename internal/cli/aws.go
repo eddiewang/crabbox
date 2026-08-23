@@ -546,6 +546,14 @@ func shouldRetryAWSRegionAfterCreateError(err error, control *AWSFixedCreateCont
 }
 
 func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any), control *AWSFixedCreateControl) (result Server, resolved Config, resultErr error) {
+	candidates := awsLaunchCandidates(cfg)
+	if cfg.AWSCacheVolumeLifecycle != nil && len(cfg.Cache.Volumes) > 0 {
+		for _, instanceType := range candidates {
+			if err := c.ValidateCacheVolumeInstanceType(ctx, instanceType); err != nil {
+				return Server{}, cfg, err
+			}
+		}
+	}
 	if cfg.ProviderKey == "" {
 		cfg.ProviderKey = "crabbox-steipete"
 	}
@@ -600,7 +608,6 @@ func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Co
 	if err != nil {
 		return Server{}, cfg, err
 	}
-	candidates := awsLaunchCandidates(cfg)
 	useSpot := cfg.Capacity.Market != "on-demand"
 	var marketFallbackCandidates []string
 	var errs []error

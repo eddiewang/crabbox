@@ -6506,6 +6506,132 @@ describe("fleet lease identity and idle", () => {
     );
   });
 
+  it("uses the persisted AWS lease region for every release side effect", async () => {
+    const storage = new MemoryStorage();
+    const leaseID = "cbx_abcdef123456";
+    const cloudID = "i-abcdef123456";
+    storage.seed("aws-cache-volume:v1:vol-lease-region", {
+      version: 1,
+      cacheSetID: "cache-set",
+      memberID: "cache-member",
+      accountDigest: "account-digest",
+      tenantDigest: "tenant-digest",
+      repoScopeDigest: "repo-digest",
+      keyDigest: "key-digest",
+      abiDigest: "abi-digest",
+      name: "build",
+      path: "/var/cache/build",
+      sizeGB: 20,
+      region: "us-east-1",
+      availabilityZone: "us-east-1a",
+      volumeID: "vol-lease-region",
+      generation: 1,
+      state: "attached",
+      leaseID,
+      instanceID: cloudID,
+      purgeOnRelease: true,
+      createdAt: "2026-08-23T00:00:00.000Z",
+      updatedAt: "2026-08-23T00:00:00.000Z",
+    });
+    const provider = new AWSProvider(
+      {
+        AWS_ACCESS_KEY_ID: "test-access-key",
+        AWS_SECRET_ACCESS_KEY: "test-secret-key",
+      } as Env,
+      "eu-west-1",
+      storage,
+    );
+    const calls: Array<{ action: string; region: string }> = [];
+    let detached = false;
+    const findServer = vi
+      .spyOn(EC2SpotClient.prototype, "findServer")
+      .mockImplementation(async function (this: EC2SpotClient) {
+        calls.push({ action: "findServer", region: awsClientRegionForTest(this) });
+        return ownedTestMachine("aws", cloudID);
+      });
+    const terminateServer = vi
+      .spyOn(EC2SpotClient.prototype, "terminateServerAndWait")
+      .mockImplementation(async function (this: EC2SpotClient) {
+        calls.push({ action: "terminateServerAndWait", region: awsClientRegionForTest(this) });
+      });
+    const describeVolume = vi
+      .spyOn(EC2SpotClient.prototype, "describeCacheVolume")
+      .mockImplementation(async function (this: EC2SpotClient) {
+        calls.push({ action: "describeCacheVolume", region: awsClientRegionForTest(this) });
+        return {
+          id: "vol-lease-region",
+          state: detached ? "available" : "in-use",
+          availabilityZone: "us-east-1a",
+          encrypted: true,
+          volumeType: "gp3",
+          sizeGB: 20,
+          multiAttachEnabled: false,
+          attachments: detached ? [] : [cloudID],
+          tags: {
+            crabbox: "true",
+            created_by: "crabbox",
+            crabbox_cache_set: "cache-set",
+            crabbox_cache_member: "cache-member",
+            crabbox_cache_generation: "1",
+            crabbox_cache_abi: "abi-digest",
+          },
+        };
+      });
+    const detachVolume = vi
+      .spyOn(EC2SpotClient.prototype, "detachCacheVolume")
+      .mockImplementation(async function (this: EC2SpotClient) {
+        calls.push({ action: "detachCacheVolume", region: awsClientRegionForTest(this) });
+        detached = true;
+      });
+    const deleteVolume = vi
+      .spyOn(EC2SpotClient.prototype, "deleteCacheVolume")
+      .mockImplementation(async function (this: EC2SpotClient) {
+        calls.push({ action: "deleteCacheVolume", region: awsClientRegionForTest(this) });
+      });
+    const deleteSSHKey = vi
+      .spyOn(EC2SpotClient.prototype, "deleteSSHKey")
+      .mockImplementation(async function (this: EC2SpotClient) {
+        calls.push({ action: "deleteSSHKey", region: awsClientRegionForTest(this) });
+      });
+
+    try {
+      await provider.releaseLease(
+        testLease({
+          id: leaseID,
+          provider: "aws",
+          cloudID,
+          region: "us-east-1",
+          providerKey: "crabbox-cbx-abcdef123456",
+          providerKeyCleanupOwned: true,
+          cacheVolumeProtocol: 1,
+          purgeOnRelease: true,
+          network: { awsPrivate: true },
+        }),
+      );
+    } finally {
+      findServer.mockRestore();
+      terminateServer.mockRestore();
+      describeVolume.mockRestore();
+      detachVolume.mockRestore();
+      deleteVolume.mockRestore();
+      deleteSSHKey.mockRestore();
+    }
+
+    expect(calls.map(({ action }) => action)).toEqual([
+      "findServer",
+      "terminateServerAndWait",
+      "describeCacheVolume",
+      "detachCacheVolume",
+      "describeCacheVolume",
+      "describeCacheVolume",
+      "deleteCacheVolume",
+      "deleteSSHKey",
+    ]);
+    expect(new Set(calls.map(({ region: callRegion }) => callRegion))).toEqual(
+      new Set(["us-east-1"]),
+    );
+  });
+
   it("reads and verifies cloud ownership before AWS, Azure, or GCP release", async () => {
     await Promise.all(
       workerCloudReleaseCases()
@@ -36461,6 +36587,10 @@ function testMachine(overrides: Partial<ProviderMachine>): ProviderMachine {
     labels: { crabbox: "true" },
     ...overrides,
   };
+}
+
+function awsClientRegionForTest(client: EC2SpotClient): string {
+  return (client as unknown as { region: string }).region;
 }
 
 function seedProviderReconciliationEligible(

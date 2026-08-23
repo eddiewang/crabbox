@@ -24797,15 +24797,17 @@ export class AWSProvider implements CloudProvider {
   }
 
   async releaseLease(lease: LeaseRecord): Promise<void> {
+    const region = lease.region || this.region;
+    const client = region === this.region ? this.client : new EC2SpotClient(this.env, region);
     const server = lease.cloudID
-      ? await ownedProviderMachineForRelease("aws", lease, (id) => this.findServer(id))
+      ? await ownedProviderMachineForRelease("aws", lease, (id) => client.findServer(id))
       : undefined;
     try {
       if (server) {
         if (lease.network?.awsPrivate) {
-          await this.client.terminateServerAndWait(lease.cloudID);
+          await client.terminateServerAndWait(lease.cloudID);
         } else {
-          await this.deleteServer(lease.cloudID);
+          await client.deleteServer(lease.cloudID);
         }
       }
     } catch (error) {
@@ -24826,13 +24828,13 @@ export class AWSProvider implements CloudProvider {
     }
     if (lease.cacheVolumeProtocol === 1) {
       await new AWSCacheVolumeLifecycle(this.storage).release(
-        this.client,
+        client,
         lease.id,
         lease.purgeOnRelease ?? false,
       );
     }
     if (leaseUsesCanonicalProviderKey(lease)) {
-      await this.deleteSSHKey(lease.providerKey, lease.id);
+      await client.deleteSSHKey(lease.providerKey, lease.id);
     }
   }
 
