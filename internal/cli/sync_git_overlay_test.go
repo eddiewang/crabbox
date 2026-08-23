@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -362,40 +363,295 @@ func TestGitOverlayDecisionRejectsCheckoutTransforms(t *testing.T) {
 	}
 }
 
-func TestRuntimeGitOverlayFallbackUsesPlainIdempotentSync(t *testing.T) {
+func TestRuntimeGitOverlayFallbackCompletesPlainManifestSync(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX sync command regression")
 	}
 	for _, existing := range []bool{false, true} {
-		root := t.TempDir()
-		workdir := filepath.Join(root, "work")
-		if existing {
-			if err := os.MkdirAll(workdir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for range 2 {
-			if out, err := exec.Command("bash", "-lc", remoteMkdir(workdir)).CombinedOutput(); err != nil {
-				t.Fatalf("existing=%t mkdir: %v\n%s", existing, err, out)
-			}
-		}
-		if info, err := os.Stat(workdir); err != nil || !info.IsDir() {
-			t.Fatalf("existing=%t workdir info=%v err=%v", existing, info, err)
+		t.Run(fmt.Sprintf("existing=%t", existing), func(t *testing.T) {
+			result := runRuntimeGitOverlayFallbackSync(t, "cbx_overlay_primary", existing)
+			assertRuntimeGitOverlayFallbackSync(t, result)
+		})
+	}
+}
+
+func TestRuntimeGitOverlayFallbackRecomputesReplacementLeaseState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX sync command regression")
+	}
+	result := runRuntimeGitOverlayFallbackReplacementSync(t, "cbx_overlay_first", "cbx_overlay_replacement")
+	assertRuntimeGitOverlayFallbackSync(t, result)
+	if result.initialWorkdir == result.workdir {
+		t.Fatalf("replacement retry reused workdir %q", result.workdir)
+	}
+	for _, want := range []string{
+		"warning: SSH became unavailable after sync on lease=cbx_overlay_first",
+		"retrying sync on replacement lease=cbx_overlay_replacement",
+	} {
+		if !strings.Contains(result.stderr, want) && !strings.Contains(result.stdout, want) {
+			t.Fatalf("replacement retry missing %q:\nstdout:\n%s\nstderr:\n%s", want, result.stdout, result.stderr)
 		}
 	}
+	if !strings.Contains(result.stderr, result.workdir) {
+		t.Fatalf("replacement retry did not report recomputed workdir %q:\n%s", result.workdir, result.stderr)
+	}
+	if got := strings.Count(result.stderr, "git overlay fallback reason=checkout_failed; using full manifest sync"); got != 2 {
+		t.Fatalf("classified fallback attempts=%d want 2:\n%s", got, result.stderr)
+	}
+}
 
-	command := remoteFinalizeSync("/tmp/crabbox-overlay-fallback", remoteSyncFinalizeOptions{
-		HydrateGit: false,
-		Coherence:  gitCoherencePlan{},
-		Token:      strings.Repeat("a", 32),
-	})
-	for _, forbidden := range []string{
-		"requested Git tree verification failed",
-		"requested commit is not on advertised branch",
-		"git fetch --quiet --no-tags",
-	} {
-		if strings.Contains(command, forbidden) {
-			t.Fatalf("plain fallback finalize contains %q:\n%s", forbidden, command)
+type runtimeGitOverlayFallbackResult struct {
+	initialWorkdir string
+	workdir        string
+	stdout         string
+	stderr         string
+	sshLog         []byte
+	rsyncData      []byte
+}
+
+func runRuntimeGitOverlayFallbackSync(t *testing.T, leaseID string, existing bool) runtimeGitOverlayFallbackResult {
+	t.Helper()
+	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{leaseID}, existing, false)
+}
+
+func runRuntimeGitOverlayFallbackReplacementSync(t *testing.T, firstLeaseID, replacementLeaseID string) runtimeGitOverlayFallbackResult {
+	t.Helper()
+	return runRuntimeGitOverlayFallbackSyncWithLeases(t, []string{firstLeaseID, replacementLeaseID}, false, true)
+}
+
+func runRuntimeGitOverlayFallbackSyncWithLeases(t *testing.T, leaseIDs []string, existing, replace bool) runtimeGitOverlayFallbackResult {
+	t.Helper()
+	clearConfigEnv(t)
+	root, _, _, _ := newGitOverlayTestRepo(t)
+	t.Chdir(root)
+	isolateRunTestUserDirs(t, root)
+	repo, err := findRepo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteRoot := filepath.Join(t.TempDir(), "remote")
+	initialWorkdir := filepath.Join(remoteRoot, leaseIDs[0], repo.Name)
+	workdir := filepath.Join(remoteRoot, leaseIDs[len(leaseIDs)-1], repo.Name)
+	replacementAcquired := filepath.Join(root, "replacement-acquired")
+	if existing {
+		if err := os.MkdirAll(initialWorkdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(initialWorkdir, "clean.txt"), "stale\n")
+		writeFile(t, filepath.Join(initialWorkdir, ".git"), "not a repository\n")
+	}
+	providerName := runEnvProfileTestProvider{}.Name()
+	configExtra := ""
+	var acquireCount atomic.Int32
+	if replace {
+		providerName = runReadyPoolPreflightTestProvider{}.Name()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/leases":
+				index := int(acquireCount.Add(1)) - 1
+				if index >= len(leaseIDs) {
+					http.Error(w, "unexpected acquisition", http.StatusInternalServerError)
+					return
+				}
+				leaseID := leaseIDs[index]
+				if index > 0 {
+					if err := os.WriteFile(replacementAcquired, nil, 0o600); err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
+					ID: leaseID, Provider: providerName, TargetOS: targetLinux, State: "active",
+					Host: "127.0.0.1", SSHUser: "crabbox", SSHPort: "22", WorkRoot: remoteRoot,
+				}})
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/leases/"):
+				leaseID := strings.TrimPrefix(r.URL.Path, "/v1/leases/")
+				_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
+					ID: leaseID, Provider: providerName, TargetOS: targetLinux, State: "active",
+					Host: "127.0.0.1", SSHUser: "crabbox", SSHPort: "22", WorkRoot: remoteRoot,
+				}})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/heartbeat"):
+				leaseID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/leases/"), "/heartbeat")
+				_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
+					ID: leaseID, Provider: providerName, TargetOS: targetLinux, State: "active",
+					Host: "127.0.0.1", SSHUser: "crabbox", SSHPort: "22", WorkRoot: remoteRoot,
+				}})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/release"):
+				leaseID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/leases/"), "/release")
+				_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
+					ID: leaseID, Provider: providerName, State: "released",
+				}})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(server.Close)
+		configExtra = fmt.Sprintf("coordinator: %q\ncoordinatorToken: test-token\n", server.URL)
+	}
+	configPath := filepath.Join(root, ".crabbox.yaml")
+	writeFile(t, configPath, fmt.Sprintf(
+		"workRoot: %q\n%ssync:\n  gitOverlay: true\n  gitSeed: true\n  delete: true\n  fingerprint: false\n",
+		remoteRoot,
+		configExtra,
+	))
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sshLog := filepath.Join(root, "ssh.log")
+	syncTransferred := filepath.Join(root, "sync-transferred")
+	sshPath := filepath.Join(binDir, "ssh")
+	installWorkspaceOwnerAwareSSH(t, sshPath, fmt.Sprintf(`#!/bin/sh
+cmd="$1"
+printf '%%s\n---\n' "$cmd" >> "$CRABBOX_FAKE_SSH_LOG"
+case "$cmd" in
+  *crabbox-ready*)
+    if [ -e "$CRABBOX_FAKE_SYNC_TRANSFERRED" ] && [ ! -e "$CRABBOX_FAKE_REPLACEMENT_ACQUIRED" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  *".overlay-git."*)
+    printf '%%scheckout_failed\n' %s >&2
+    exit %d
+    ;;
+esac
+exec /bin/bash --noprofile --norc -c "$cmd"
+`, shellQuote(gitOverlayFallbackMarker), gitOverlayFallbackExitCode))
+	rsyncLog := filepath.Join(root, "rsync-manifest")
+	rsyncPath := filepath.Join(binDir, "rsync")
+	if err := os.WriteFile(rsyncPath, []byte(`#!/bin/bash
+set -euo pipefail
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+cat >"$tmp"
+cp "$tmp" "$CRABBOX_FAKE_RSYNC_LOG"
+destination="${!#}"
+workdir="${destination#*:}"
+workdir="${workdir%%/}"
+[[ -d "$workdir" ]]
+while IFS= read -r -d '' rel; do
+  mkdir -p "$workdir/$(dirname "$rel")"
+  cp -a "$CRABBOX_FAKE_REPO_ROOT/$rel" "$workdir/$rel"
+done <"$tmp"
+: > "$CRABBOX_FAKE_SYNC_TRANSFERRED"
+	`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !replace {
+		runEnvProfileTestAcquireLease = func(AcquireRequest) (LeaseTarget, error) {
+			acquireCount.Add(1)
+			return LeaseTarget{
+				Server: Server{Provider: providerName},
+				SSH: SSHTarget{
+					User:           "crabbox",
+					Host:           "127.0.0.1",
+					Port:           "22",
+					TargetOS:       targetLinux,
+					SSHConfigProxy: true,
+				},
+				LeaseID: leaseIDs[0],
+			}, nil
+		}
+		t.Cleanup(func() { runEnvProfileTestAcquireLease = nil })
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("CRABBOX_FAKE_SSH_LOG", sshLog)
+	t.Setenv("CRABBOX_FAKE_RSYNC_LOG", rsyncLog)
+	t.Setenv("CRABBOX_FAKE_REPO_ROOT", root)
+	t.Setenv("CRABBOX_FAKE_SYNC_TRANSFERRED", syncTransferred)
+	t.Setenv("CRABBOX_FAKE_REPLACEMENT_ACQUIRED", replacementAcquired)
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+
+	var stdout, stderr bytes.Buffer
+	args := []string{
+		"--provider", providerName,
+		"--no-hydrate",
+	}
+	if replace {
+		args = append(args, "--", "true")
+	} else {
+		args = append(args, "--sync-only")
+	}
+	if err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), args); err != nil {
+		t.Fatalf("runtime overlay fallback failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if got := int(acquireCount.Load()); got != len(leaseIDs) {
+		t.Fatalf("acquisitions=%d want %d\nstdout=%s\nstderr=%s", got, len(leaseIDs), stdout.String(), stderr.String())
+	}
+	commands, err := os.ReadFile(sshLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.ReadFile(rsyncLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtimeGitOverlayFallbackResult{
+		initialWorkdir: initialWorkdir,
+		workdir:        workdir,
+		stdout:         stdout.String(),
+		stderr:         stderr.String(),
+		sshLog:         commands,
+		rsyncData:      manifest,
+	}
+}
+
+func assertRuntimeGitOverlayFallbackSync(t *testing.T, result runtimeGitOverlayFallbackResult) {
+	t.Helper()
+	if !strings.Contains(result.stderr, "git overlay fallback reason=checkout_failed; using full manifest sync") {
+		t.Fatalf("classified fallback missing:\n%s", result.stderr)
+	}
+	if !bytes.Contains(result.rsyncData, []byte("clean.txt\x00")) {
+		t.Fatalf("full manifest did not reach rsync: %q", result.rsyncData)
+	}
+	if got, err := os.ReadFile(filepath.Join(result.workdir, "clean.txt")); err != nil || string(got) != "clean.txt\n" {
+		t.Fatalf("uploaded clean file=%q err=%v", got, err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(result.workdir, ".crabbox", "sync-manifest"))
+	if err != nil {
+		t.Fatalf("finalized manifest missing: %v\nstderr:\n%s\nssh:\n%s", err, result.stderr, result.sshLog)
+	}
+	if !bytes.Contains(manifest, []byte("clean.txt\x00")) {
+		t.Fatalf("finalized manifest=%q", manifest)
+	}
+	commands := strings.Split(string(result.sshLog), "\n---\n")
+	var overlayIndexes []int
+	for i, command := range commands {
+		if strings.Contains(command, ".overlay-git.") {
+			overlayIndexes = append(overlayIndexes, i)
+		}
+	}
+	if len(overlayIndexes) == 0 {
+		t.Fatalf("overlay preparation not attempted:\n%s", result.sshLog)
+	}
+	workdirs := []string{result.initialWorkdir}
+	if result.workdir != result.initialWorkdir {
+		workdirs = append(workdirs, result.workdir)
+	}
+	if len(overlayIndexes) != len(workdirs) {
+		t.Fatalf("overlay attempts=%d workdirs=%d:\n%s", len(overlayIndexes), len(workdirs), result.sshLog)
+	}
+	for attempt, overlayIndex := range overlayIndexes {
+		end := len(commands)
+		if attempt+1 < len(overlayIndexes) {
+			end = overlayIndexes[attempt+1]
+		}
+		afterFallback := strings.Join(commands[overlayIndex+1:end], "\n---\n")
+		for _, forbidden := range []string{
+			".seed.XXXXXX",
+			"requested Git tree verification failed",
+			"requested commit is not on advertised branch",
+			"git fetch --quiet --no-tags",
+		} {
+			if strings.Contains(afterFallback, forbidden) {
+				t.Fatalf("fallback attempt %d ran forbidden Git finalization %q:\n%s", attempt+1, forbidden, afterFallback)
+			}
+		}
+		if !strings.Contains(afterFallback, remoteMkdir(workdirs[attempt])) {
+			t.Fatalf("fallback attempt %d did not create workdir idempotently:\n%s", attempt+1, afterFallback)
 		}
 	}
 }
