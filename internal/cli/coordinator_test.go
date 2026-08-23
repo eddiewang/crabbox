@@ -1554,6 +1554,138 @@ func TestCoordinatorCreateLeaseSendsAWSSSHCIDRs(t *testing.T) {
 	}
 }
 
+func TestCoordinatorImageCandidateLeaseUsesDedicatedWireRequest(t *testing.T) {
+	var body map[string]json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"lease":{"id":"cbx_123","provider":"aws","state":"active","host":"192.0.2.10"}}`))
+	}))
+	defer server.Close()
+
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetLinux
+	cfg.Class = "standard"
+	cfg.ServerType = "m7i.large"
+	cfg.ServerTypeExplicit = true
+	cfg.AWSRegion = "eu-west-1"
+	cfg.AWSAMI = "ami-0123456789abcdef0"
+	cfg.AWSRootGB = 400
+	cfg.Capacity = CapacityConfig{
+		Market:            "on-demand",
+		Strategy:          "capacity-optimized",
+		Fallback:          "none",
+		Regions:           []string{"us-east-1"},
+		AvailabilityZones: []string{"eu-west-1a"},
+		Hints:             false,
+	}
+	cfg.TTL = 2 * time.Hour
+	cfg.IdleTimeout = 30 * time.Minute
+	cfg.Desktop = true
+	cfg.Browser = true
+	cfg.Code = true
+	cfg.Tailscale = TailscaleConfig{
+		Enabled:                true,
+		Tags:                   []string{},
+		Hostname:               "candidate-host",
+		ExitNode:               "100.64.0.1",
+		ExitNodeAllowLANAccess: true,
+	}
+	cfg.HostID = "host-123"
+	cfg.AWSSnapshot = "snap-123"
+	cfg.AWSSGID = "sg-123"
+	cfg.AWSSubnetID = "subnet-123"
+	cfg.AWSProfile = "publisher"
+	cfg.AWSSSHCIDRs = []string{"192.0.2.1/32"}
+	cfg.AWSSSHCIDRsPinned = true
+	cfg.AWSMacHostID = "h-123"
+	cfg.ProviderKey = "candidate-provider-key"
+	cfg.Pond = "candidate-pond"
+	cfg.ExposedPorts = []string{"8080"}
+	cfg.AzureLocation = "eastus"
+	cfg.AzureImage = "azure-image"
+	cfg.AzureSnapshot = "azure-snapshot"
+	cfg.AzureOSDisk = "managed"
+	cfg.GCPProject = "candidate-project"
+	cfg.GCPZone = "us-central1-a"
+	cfg.GCPImage = "candidate-image"
+	cfg.GCPMachineImage = "candidate-machine-image"
+	cfg.GCPSnapshot = "candidate-snapshot"
+	cfg.GCPNetwork = "candidate-network"
+	cfg.GCPSubnet = "candidate-subnet"
+	cfg.GCPTags = []string{"candidate"}
+	cfg.GCPSSHCIDRs = []string{"192.0.2.2/32"}
+	cfg.GCPRootGB = 400
+	cfg.GCPServiceAccount = "candidate@example.test"
+
+	client := CoordinatorClient{
+		BaseURL:        server.URL,
+		ImageCandidate: true,
+		Client:         server.Client(),
+	}
+	_, err := client.CreateLeaseWithAttempt(
+		context.Background(),
+		cfg,
+		"ssh-ed25519 candidate",
+		true,
+		"cbx_123",
+		"candidate-box",
+		"cat_00000000000000000000000000000001",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, key := range []string{
+		"leaseID", "slug", "createAttemptID", "profile", "provider", "target",
+		"architecture", "desktop", "desktopEnv", "browser", "code", "class",
+		"serverType", "serverTypeExplicit", "awsRegion", "awsAMI", "capacity",
+		"sshUser", "sshPort", "sshFallbackPorts", "workRoot", "ttlSeconds",
+		"idleTimeoutSeconds", "sshPublicKey",
+	} {
+		if _, ok := body[key]; !ok {
+			t.Errorf("candidate request missing required allowed field %q: %v", key, body)
+		}
+	}
+	for _, key := range []string{
+		"cacheVolumeProtocol", "cacheVolumes", "purgeOnRelease", "repoScope", "awsRootGB",
+		"hostId", "hostID", "awsSnapshot", "awsSGID", "awsSubnetID", "awsProfile",
+		"awsInstanceTypes", "awsPrivate", "awsRequireSSM", "awsSSMBootstrapCommand",
+		"awsSSMLogGroup", "awsSSHCIDRs", "awsSSHCIDRsPinned", "awsMacHostID",
+		"imageRequirements", "tailscale", "tailscaleTags", "tailscaleHostname",
+		"tailscaleExitNode", "tailscaleExitNodeAllowLanAccess", "providerKey", "pond",
+		"exposedPorts", "keep", "azureLocation", "azureImage", "azureSnapshot",
+		"azureOSDisk", "gcpProject", "gcpZone", "gcpImage", "gcpMachineImage",
+		"gcpSnapshot", "gcpNetwork", "gcpSubnet", "gcpTags", "gcpSSHCIDRs",
+		"gcpRootGB", "gcpServiceAccount",
+	} {
+		if _, ok := body[key]; ok {
+			t.Errorf("candidate request included forbidden field %q: %s", key, body[key])
+		}
+	}
+	var capacity map[string]json.RawMessage
+	if err := json.Unmarshal(body["capacity"], &capacity); err != nil {
+		t.Fatal(err)
+	}
+	if len(capacity) != 1 || string(capacity["market"]) != `"on-demand"` {
+		t.Fatalf("candidate capacity=%s", body["capacity"])
+	}
+	if string(body["provider"]) != `"aws"` ||
+		string(body["target"]) != `"linux"` ||
+		string(body["awsAMI"]) != `"ami-0123456789abcdef0"` ||
+		string(body["awsRegion"]) != `"eu-west-1"` ||
+		string(body["ttlSeconds"]) != "7200" ||
+		string(body["idleTimeoutSeconds"]) != "1800" {
+		t.Fatalf("candidate required fields=%v", body)
+	}
+}
+
 func TestCoordinatorEnsureLeaseUsesFailClosedFixedIDRoute(t *testing.T) {
 	var method, path, bodyLeaseID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
