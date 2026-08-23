@@ -20,6 +20,7 @@ import { canonicalJSON, digestJSON } from "./aws-image-candidate.mjs";
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const consumer = path.join(repoRoot, "scripts", "consume-aws-image-candidate.sh");
+const publisher = path.join(repoRoot, "scripts", "publish-aws-image-candidate.sh");
 const candidateScript = path.join(repoRoot, "scripts", "aws-image-candidate.mjs");
 const registryScript = path.join(repoRoot, "scripts", "test-oci-registry.mjs");
 const materialSource = path.join(
@@ -230,7 +231,15 @@ let args = process.argv.slice(2).map((arg) =>
 if (process.env.CRABBOX_TEST_COSIGN_LOG) {
   fs.appendFileSync(process.env.CRABBOX_TEST_COSIGN_LOG, args.join("\\t") + "\\n");
 }
+if ((args[0] === "sign" || args[0] === "verify") && process.env.COSIGN_EXPERIMENTAL !== "1") {
+  console.error("production publisher did not enable COSIGN_EXPERIMENTAL=1");
+  process.exit(91);
+}
 if (args[0] === "sign") {
+  if (!args.includes("--new-bundle-format") || !args.includes("--registry-referrers-mode=oci-1-1")) {
+    console.error("production publisher omitted OCI 1.1 signing flags");
+    process.exit(92);
+  }
   args = [
     "sign",
     "--allow-http-registry",
@@ -241,6 +250,13 @@ if (args[0] === "sign") {
     ...args.slice(1),
   ];
 } else if (args[0] === "verify" || args[0] === "verify-blob") {
+  if (
+    args[0] === "verify" &&
+    (!args.includes("--new-bundle-format") || !args.includes("--experimental-oci11"))
+  ) {
+    console.error("production publisher omitted OCI 1.1 verification flags");
+    process.exit(93);
+  }
   args = [
     args[0],
     ...(args[0] === "verify" ? ["--allow-http-registry"] : []),
@@ -486,44 +502,37 @@ function toolEnv(root, bin, registry, material, extra = {}) {
 
 async function publish(root, bin, registry, repository, material) {
   const candidate = await createBundle(root, repository);
-  const taggedRef = `${repository}:${candidate.summary.immutableTag}`;
-  const env = toolEnv(root, bin, registry, material);
-  const files = [
-    ["bundle.json", "application/vnd.crabbox.aws-image-evidence-manifest.v1+json"],
-    ["candidate.json", "application/vnd.crabbox.aws-image-candidate.v1+json"],
-    ["recipe.json", "application/json"],
-    ["sbom.spdx.json", "application/spdx+json"],
-    ["provenance.intoto.jsonl", "application/vnd.in-toto+json"],
-    ["scrub-report.json", "application/json"],
-  ];
-  const pushed = await run(
-    path.join(bin, "oras"),
+  const cosignLog = path.join(root, `publisher-cosign-${Math.random()}.log`);
+  const env = toolEnv(root, bin, registry, material, {
+    CRABBOX_TEST_COSIGN_LOG: cosignLog,
+  });
+  const published = await run(
+    "bash",
     [
-      "push",
-      taggedRef,
-      "--artifact-type",
-      "application/vnd.crabbox.aws-image-evidence.v1",
-      ...files.map(([name, mediaType]) => `${name}:${mediaType}`),
-    ],
-    { env, cwd: candidate.bundle },
-  );
-  assert.equal(pushed.code, 0, `${pushed.stderr}\nregistry:\n${registry.diagnostics()}`);
-  const resolved = await run(path.join(bin, "oras"), ["resolve", taggedRef], { env });
-  assert.equal(resolved.code, 0, resolved.stderr);
-  const candidateRef = `${repository}@${resolved.stdout.trim()}`;
-  const signed = await run(
-    path.join(bin, "cosign"),
-    [
-      "sign",
-      "--new-bundle-format",
-      "--registry-referrers-mode",
-      "oci-1-1",
-      "--yes",
-      candidateRef,
+      publisher,
+      "--bundle",
+      candidate.bundle,
+      "--repository",
+      repository,
+      "--certificate-identity",
+      workflowIdentity,
     ],
     { env },
   );
-  assert.equal(signed.code, 0, signed.stderr);
+  assert.equal(
+    published.code,
+    0,
+    `${published.stderr}\nregistry:\n${registry.diagnostics()}`,
+  );
+  const publication = JSON.parse(published.stdout);
+  const candidateRef = publication.immutableRef;
+  assert.match(candidateRef, new RegExp(`^${repository.replaceAll("/", "\\/")}@sha256:`));
+  const cosignCommands = await readFile(cosignLog, "utf8");
+  assert.match(
+    cosignCommands,
+    /^sign\t--yes\t--new-bundle-format\t--registry-referrers-mode=oci-1-1\t/m,
+  );
+  assert.match(cosignCommands, /^verify\t--new-bundle-format\t--experimental-oci11\t/m);
   return { ...candidate, candidateRef, env };
 }
 

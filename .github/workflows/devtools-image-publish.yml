@@ -19,7 +19,7 @@ on:
         type: string
       base_image:
         description: Exact source AMI id
-        required: true
+        required: false
         type: string
       previous_default:
         description: Previous default AMI id recorded for rollback evidence
@@ -59,8 +59,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
 
 concurrency:
   group: devtools-image-candidate-${{ inputs.target }}-${{ inputs.region }}
@@ -115,12 +113,17 @@ jobs:
           [[ "$MACOS_TYPE" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$MACOS_HOST" =~ ^(use-existing|allocate)$ ]]
 
-  publish:
+  publish-candidate:
     name: Build, smoke, and publish candidate evidence
     needs: guard
+    if: inputs.target != 'macos'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     environment: image-publisher
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     env:
       CRABBOX_COORDINATOR: ${{ vars.CRABBOX_COORDINATOR }}
       CRABBOX_COORDINATOR_TOKEN: ${{ secrets.CRABBOX_COORDINATOR_ADMIN_TOKEN }}
@@ -179,7 +182,6 @@ jobs:
         run: go build -trimpath -o bin/crabbox ./cmd/crabbox
 
       - name: Build trusted OCI tools
-        if: inputs.target != 'macos'
         shell: bash
         run: |
           set -euo pipefail
@@ -188,7 +190,6 @@ jobs:
           echo "$RUNNER_TEMP/image-tools" >>"$GITHUB_PATH"
 
       - name: Authenticate to GHCR
-        if: inputs.target != 'macos'
         shell: bash
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -200,7 +201,6 @@ jobs:
               --password-stdin
 
       - name: Build and prove candidate
-        if: inputs.target != 'macos'
         shell: bash
         env:
           CRABBOX_IMAGE_LOG_DIR: ${{ runner.temp }}/devtools-image-proof/aws
@@ -250,7 +250,6 @@ jobs:
             tee "$proof_dir/verification.json"
 
       - name: Publish and sign immutable OCI evidence
-        if: inputs.target != 'macos'
         shell: bash
         run: |
           set -euo pipefail
@@ -262,8 +261,99 @@ jobs:
             --certificate-identity "https://github.com/$GITHUB_WORKFLOW_REF" |
             tee "$proof_dir/publication.json"
 
+      - name: Summarize publication
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Developer image publication"
+            echo
+            echo "- Target: \`$TARGET\`"
+            echo "- Region: \`$REGION\`"
+            echo "- Source commit: \`$GITHUB_SHA\`"
+            if [[ -f "$RUNNER_TEMP/devtools-image-proof/publication.json" ]]; then
+              # JavaScript template expressions are evaluated by Node.
+              # shellcheck disable=SC2016
+              node -e '
+                const fs = require("fs");
+                const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+                console.log(`- OCI evidence: \`${value.immutableRef}\``);
+                console.log(`- Candidate digest: \`${value.candidateDigest}\``);
+              ' "$RUNNER_TEMP/devtools-image-proof/publication.json"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload publication proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: devtools-image-${{ inputs.target }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/devtools-image-proof
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-macos:
+    name: Build, smoke, and promote macOS image
+    needs: guard
+    if: inputs.target == 'macos'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: image-publisher
+    permissions:
+      contents: read
+    env:
+      CRABBOX_COORDINATOR: ${{ vars.CRABBOX_COORDINATOR }}
+      CRABBOX_COORDINATOR_TOKEN: ${{ secrets.CRABBOX_COORDINATOR_ADMIN_TOKEN }}
+      CRABBOX_COORDINATOR_ADMIN_TOKEN: ${{ secrets.CRABBOX_COORDINATOR_ADMIN_TOKEN }}
+      CRABBOX_OWNER: ${{ vars.CRABBOX_IMAGE_PUBLISHER_OWNER }}
+      CRABBOX_ORG: ${{ vars.CRABBOX_IMAGE_PUBLISHER_ORG }}
+      CRABBOX_ACCESS_CLIENT_ID: ${{ secrets.CRABBOX_ACCESS_CLIENT_ID }}
+      CRABBOX_ACCESS_CLIENT_SECRET: ${{ secrets.CRABBOX_ACCESS_CLIENT_SECRET }}
+      TARGET: ${{ inputs.target }}
+      REGION: ${{ inputs.region }}
+      MACOS_TYPE: ${{ inputs.macos_type }}
+      MACOS_HOST: ${{ inputs.macos_host }}
+    steps:
+      - name: Verify publisher configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$CRABBOX_COORDINATOR" ]]; then
+            echo "::error::Set the CRABBOX_COORDINATOR variable on the image-publisher environment."
+            exit 1
+          fi
+          if [[ -z "$CRABBOX_COORDINATOR_ADMIN_TOKEN" ]]; then
+            echo "::error::Set the CRABBOX_COORDINATOR_ADMIN_TOKEN secret on the image-publisher environment."
+            exit 1
+          fi
+          if (( ${#CRABBOX_OWNER} > 254 )) ||
+            [[ ! "$CRABBOX_OWNER" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]+$ ]] ||
+            [[ "$CRABBOX_OWNER" =~ [.](invalid|example|test|localhost)$ ]]; then
+            echo "::error::Set CRABBOX_IMAGE_PUBLISHER_OWNER to a valid email on the image-publisher environment."
+            exit 1
+          fi
+          if (( ${#CRABBOX_ORG} > 63 )) ||
+            [[ ! "$CRABBOX_ORG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Set CRABBOX_IMAGE_PUBLISHER_ORG to a valid tenant on the image-publisher environment."
+            exit 1
+          fi
+
+      - name: Check out protected source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build trusted Crabbox CLI
+        run: go build -trimpath -o bin/crabbox ./cmd/crabbox
+
       - name: Build, smoke, and promote macOS image
-        if: inputs.target == 'macos'
         shell: bash
         env:
           CRABBOX_MACOS_ARTIFACT_DIR: ${{ runner.temp }}/devtools-image-proof/macos
@@ -293,16 +383,6 @@ jobs:
             echo "- Target: \`$TARGET\`"
             echo "- Region: \`$REGION\`"
             echo "- Source commit: \`$GITHUB_SHA\`"
-            if [[ -f "$RUNNER_TEMP/devtools-image-proof/publication.json" ]]; then
-              # JavaScript template expressions are evaluated by Node.
-              # shellcheck disable=SC2016
-              node -e '
-                const fs = require("fs");
-                const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-                console.log(`- OCI evidence: \`${value.immutableRef}\``);
-                console.log(`- Candidate digest: \`${value.candidateDigest}\``);
-              ' "$RUNNER_TEMP/devtools-image-proof/publication.json"
-            fi
             if [[ -f "$RUNNER_TEMP/devtools-image-proof/publish.log" ]]; then
               grep -E 'promoted macOS image lifecycle passed' \
                 "$RUNNER_TEMP/devtools-image-proof/publish.log" || true

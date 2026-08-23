@@ -95,6 +95,7 @@ esac
     path.join(bin, "cosign"),
     `#!/usr/bin/env bash
 set -euo pipefail
+[[ "\${COSIGN_EXPERIMENTAL:-}" == 1 ]]
 printf 'cosign %s\\n' "$*" >>"\${CRABBOX_FAKE_LOG:?}"
 `,
   );

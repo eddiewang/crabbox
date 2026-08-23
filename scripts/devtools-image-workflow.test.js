@@ -8,6 +8,11 @@ const workflow = fs.readFileSync(
   path.join(repoRoot, ".github", "workflows", "devtools-image-publish.yml"),
   "utf8",
 );
+const candidateJob = workflow.slice(
+  workflow.indexOf("  publish-candidate:"),
+  workflow.indexOf("  publish-macos:"),
+);
+const macosJob = workflow.slice(workflow.indexOf("  publish-macos:"));
 
 test("developer image publication is protected and manual", () => {
   assert.match(workflow, /^  workflow_dispatch:$/m);
@@ -28,29 +33,33 @@ test("developer image publication is protected and manual", () => {
 
 test("candidate workflow has OCI and keyless-signing permissions and tools", () => {
   assert.match(workflow, /^  contents: read$/m);
-  assert.match(workflow, /^  packages: write$/m);
-  assert.match(workflow, /^  id-token: write$/m);
-  assert.match(workflow, /oras\.land\/oras\/cmd\/oras@v1\.3\.3/);
-  assert.match(workflow, /github\.com\/sigstore\/cosign\/v2\/cmd\/cosign@v2\.6\.5/);
-  assert.match(workflow, /oras" login ghcr\.io[\s\S]*--password-stdin/);
-  assert.match(workflow, /scripts\/publish-aws-image-candidate\.sh/);
+  assert.match(candidateJob, /^      packages: write$/m);
+  assert.match(candidateJob, /^      id-token: write$/m);
+  assert.match(candidateJob, /if: inputs\.target != 'macos'/);
+  assert.match(candidateJob, /oras\.land\/oras\/cmd\/oras@v1\.3\.3/);
+  assert.match(candidateJob, /github\.com\/sigstore\/cosign\/v2\/cmd\/cosign@v2\.6\.5/);
+  assert.match(candidateJob, /oras" login ghcr\.io[\s\S]*--password-stdin/);
+  assert.match(candidateJob, /scripts\/publish-aws-image-candidate\.sh/);
   assert.match(
-    workflow,
+    candidateJob,
     /repository="ghcr\.io\/\$\{GITHUB_REPOSITORY,,\}-aws-image-candidates"/,
   );
   assert.match(
-    workflow,
+    candidateJob,
     /--certificate-identity "https:\/\/github\.com\/\$GITHUB_WORKFLOW_REF"/,
   );
-  assert.match(workflow, /name: Build trusted OCI tools[\s\S]*if: inputs\.target != 'macos'/);
-  assert.match(workflow, /name: Authenticate to GHCR[\s\S]*if: inputs\.target != 'macos'/);
 });
 
 test("macOS keeps the protected publication path", () => {
-  assert.match(workflow, /name: Build, smoke, and promote macOS image/);
-  assert.match(workflow, /if: inputs\.target == 'macos'/);
-  assert.match(workflow, /scripts\/mint-macos-devtools-image\.sh/);
-  assert.match(workflow, /"--\$MACOS_HOST"/);
+  assert.match(workflow, /base_image:[\s\S]*?required: false/);
+  assert.match(macosJob, /name: Build, smoke, and promote macOS image/);
+  assert.match(macosJob, /if: inputs\.target == 'macos'/);
+  assert.match(macosJob, /^    permissions:\n      contents: read$/m);
+  assert.doesNotMatch(macosJob, /packages: write|id-token: write/);
+  assert.match(macosJob, /environment: image-publisher/);
+  assert.match(macosJob, /scripts\/mint-macos-devtools-image\.sh/);
+  assert.match(macosJob, /"--\$MACOS_HOST"/);
+  assert.doesNotMatch(macosJob, /BASE_IMAGE|--base-image/);
 });
 
 test("workflow explicitly disables promotion, FSR, and promoted warmup", () => {
@@ -69,7 +78,7 @@ test("workflow keeps cloud credentials environment-scoped and retains proof", ()
   assert.match(workflow, /CRABBOX_COORDINATOR: \$\{\{ vars\.CRABBOX_COORDINATOR \}\}/);
   assert.equal(
     (workflow.match(/secrets\.CRABBOX_COORDINATOR_ADMIN_TOKEN/g) ?? []).length,
-    2,
+    4,
   );
   assert.doesNotMatch(workflow, /AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY/);
   assert.doesNotMatch(workflow, /openclaw/i);

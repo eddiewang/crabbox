@@ -100,13 +100,13 @@ oci_digest="$(oras resolve "$tagged_ref")"
   exit 1
 }
 immutable_ref="$repository@$oci_digest"
-cosign sign \
+COSIGN_EXPERIMENTAL=1 cosign sign \
   --yes \
   --new-bundle-format \
   --registry-referrers-mode=oci-1-1 \
   "$immutable_ref" >/dev/null
 
-cosign verify \
+COSIGN_EXPERIMENTAL=1 cosign verify \
   --new-bundle-format \
   --experimental-oci11 \
   --certificate-identity "$certificate_identity" \
