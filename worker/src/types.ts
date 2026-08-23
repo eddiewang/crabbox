@@ -764,6 +764,7 @@ export interface RunRecord {
   id: string;
   leaseID: string;
   leaseIDs?: string[];
+  imageCandidate?: boolean;
   slug?: string;
   owner: string;
   org: string;

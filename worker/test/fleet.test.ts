@@ -35526,7 +35526,7 @@ describe("image candidate authorization", () => {
     expect(afterDelete.status).toBe(404);
   });
 
-  it("allows owned candidate runs only for candidate-created leases", async () => {
+  it("isolates candidate lease, run, and control access from ordinary same-tenant records", async () => {
     const storage = new MemoryStorage();
     const candidate = testLease({
       id: "cbx_c0ffee000002",
@@ -35534,16 +35534,63 @@ describe("image candidate authorization", () => {
       owner: "publisher@example.com",
       org: "image-publisher",
       imageCandidate: true,
+      expiresAt: "2027-05-01T01:30:00.000Z",
     });
     const ordinary = testLease({
       id: "cbx_c0ffee000003",
       provider: "aws",
       owner: "publisher@example.com",
       org: "image-publisher",
+      expiresAt: "2027-05-01T01:30:00.000Z",
     });
     storage.seed(`lease:${candidate.id}`, candidate);
     storage.seed(`lease:${ordinary.id}`, ordinary);
+    const ordinaryAttemptID = "cat_00000000000000000000000000000003";
+    storage.seed(`create-attempt:${ordinary.id}`, {
+      version: 1,
+      requestedLeaseID: ordinary.id,
+      token: ordinaryAttemptID,
+      owner: ordinary.owner,
+      org: ordinary.org,
+      state: "pending",
+      createdAt: "2026-05-01T00:00:00.000Z",
+      updatedAt: "2026-05-01T00:00:00.000Z",
+    });
     const fleet = testFleet(storage);
+
+    expect(
+      (await fleet.fetch(request("GET", `/v1/leases/${candidate.id}`, {
+        headers: candidateHeaders,
+      }))).status,
+    ).toBe(200);
+    const deniedLeaseOperations = await Promise.all([
+      fleet.fetch(
+        request("GET", `/v1/leases/${ordinary.id}`, { headers: candidateHeaders }),
+      ),
+      fleet.fetch(
+        request("POST", `/v1/leases/${ordinary.id}/heartbeat`, {
+          headers: candidateHeaders,
+          body: {},
+        }),
+      ),
+      fleet.fetch(
+        request("POST", `/v1/leases/${ordinary.id}/release`, {
+          headers: candidateHeaders,
+          body: {},
+        }),
+      ),
+      fleet.fetch(
+        request("POST", `/v1/leases/${ordinary.id}/cancel-create`, {
+          headers: candidateHeaders,
+          body: { createAttemptID: ordinaryAttemptID },
+        }),
+      ),
+    ]);
+    expect(deniedLeaseOperations.map((response) => response.status)).toEqual([404, 404, 404, 404]);
+    expect(storage.value<LeaseRecord>(`lease:${ordinary.id}`)?.state).toBe("active");
+    expect(storage.value<{ state: string }>(`create-attempt:${ordinary.id}`)?.state).toBe(
+      "pending",
+    );
 
     const denied = await fleet.fetch(
       request("POST", "/v1/runs", {
@@ -35560,6 +35607,65 @@ describe("image candidate authorization", () => {
     );
     expect(created.status).toBe(201);
     const run = ((await created.json()) as { run: RunRecord }).run;
+    expect(run).not.toHaveProperty("imageCandidate");
+    expect(storage.value<RunRecord>(`run:${run.id}`)?.imageCandidate).toBe(true);
+
+    const ordinaryRunResponse = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        headers: {
+          "x-crabbox-owner": "publisher@example.com",
+          "x-crabbox-org": "image-publisher",
+        },
+        body: { leaseID: ordinary.id, command: ["true"] },
+      }),
+    );
+    expect(ordinaryRunResponse.status).toBe(201);
+    const ordinaryRun = ((await ordinaryRunResponse.json()) as { run: RunRecord }).run;
+
+    const listed = await fleet.fetch(
+      request("GET", "/v1/runs", { headers: candidateHeaders }),
+    );
+    await expect(listed.json()).resolves.toMatchObject({ runs: [{ id: run.id }] });
+
+    const deniedRunOperations = await Promise.all([
+      fleet.fetch(
+        request("GET", `/v1/runs/${ordinaryRun.id}`, { headers: candidateHeaders }),
+      ),
+      fleet.fetch(
+        request("GET", `/v1/runs/${ordinaryRun.id}/logs`, { headers: candidateHeaders }),
+      ),
+      fleet.fetch(
+        request("GET", `/v1/runs/${ordinaryRun.id}/events`, { headers: candidateHeaders }),
+      ),
+      fleet.fetch(
+        request("POST", `/v1/runs/${ordinaryRun.id}/events`, {
+          headers: candidateHeaders,
+          body: { type: "stdout", stream: "stdout", data: "forged\n" },
+        }),
+      ),
+      fleet.fetch(
+        request("POST", `/v1/runs/${ordinaryRun.id}/telemetry`, {
+          headers: candidateHeaders,
+          body: {
+            telemetry: {
+              capturedAt: "2026-05-01T00:00:10Z",
+              source: "ssh-linux",
+              load1: 1,
+            },
+          },
+        }),
+      ),
+      fleet.fetch(
+        request("POST", `/v1/runs/${ordinaryRun.id}/finish`, {
+          headers: candidateHeaders,
+          body: { exitCode: 0, log: "forged\n" },
+        }),
+      ),
+    ]);
+    expect(deniedRunOperations.map((response) => response.status)).toEqual([
+      404, 404, 404, 404, 404, 404,
+    ]);
+
     const owned = await fleet.fetch(
       request("GET", `/v1/runs/${run.id}`, { headers: candidateHeaders }),
     );
@@ -35570,6 +35676,37 @@ describe("image candidate authorization", () => {
       }),
     );
     expect(foreign.status).toBe(404);
+
+    const socket = new FakeWebSocket({
+      kind: "control",
+      clientID: "candidate-control",
+      owner: candidate.owner,
+      org: candidate.org,
+      imageCandidate: true,
+      subscriptions: {},
+    });
+    (
+      fleet as unknown as {
+        controlSockets: Map<string, WebSocket>;
+      }
+    ).controlSockets.set("candidate-control", socket as unknown as WebSocket);
+    await fleet.webSocketMessage(
+      socket as unknown as WebSocket,
+      JSON.stringify({ type: "subscribe_run", runID: ordinaryRun.id }),
+    );
+    await fleet.webSocketMessage(
+      socket as unknown as WebSocket,
+      JSON.stringify({ type: "heartbeat", leaseID: ordinary.id }),
+    );
+    await fleet.webSocketMessage(
+      socket as unknown as WebSocket,
+      JSON.stringify({ type: "subscribe_run", runID: run.id }),
+    );
+    expect(socket.sentJSON()).toEqual([
+      { type: "error", code: "not_found", message: "run not found" },
+      { type: "heartbeat", leaseID: ordinary.id, ok: false, error: "not_found" },
+      expect.objectContaining({ type: "run_events", runID: run.id }),
+    ]);
   });
 });
 

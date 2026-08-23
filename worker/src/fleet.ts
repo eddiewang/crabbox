@@ -993,6 +993,7 @@ type BridgeAttachment =
       owner: string;
       org: string;
       admin?: boolean;
+      imageCandidate?: boolean;
       auth?: AuthContext["auth"];
       login?: string;
       adminTokenHash?: string;
@@ -2533,6 +2534,7 @@ export class FleetCoordinator {
       owner: requestOwner(request),
       org: requestOrg(request, this.env),
       admin,
+      ...(isImageCandidateRequest(request) ? { imageCandidate: true } : {}),
       ...(await adminGrantForRequest(request, admin)),
       subscriptions: {},
     };
@@ -3029,16 +3031,22 @@ export class FleetCoordinator {
     token: string,
     owner: string,
     org: string,
+    imageCandidate: boolean,
   ): Promise<{ attempt: CreateAttemptRecord; replayLease?: LeaseRecord } | Response> {
     return await this.state.runExclusive(async () => {
       const canceled = await this.getArchivedCanceledCreateAttempt(requestedLeaseID, token);
       if (canceled) {
-        return canceled.owner === owner && canceled.org === org
+        return canceled.owner === owner &&
+          canceled.org === org &&
+          Boolean(canceled.imageCandidate) === imageCandidate
           ? createCanceledResponse()
           : createAttemptConflictResponse();
       }
       const existing = await this.getCreateAttempt(requestedLeaseID);
       if (existing) {
+        if (Boolean(existing.imageCandidate) !== imageCandidate) {
+          return createAttemptConflictResponse();
+        }
         if (existing.token !== token) {
           if (unboundCanceledCreateAttempt(existing, requestedLeaseID)) {
             const [exactLease, workspaceReservation] = await Promise.all([
@@ -3059,6 +3067,7 @@ export class FleetCoordinator {
               token,
               owner,
               org,
+              ...(imageCandidate ? { imageCandidate: true } : {}),
               state: "pending",
               createdAt: now,
               updatedAt: now,
@@ -3096,6 +3105,7 @@ export class FleetCoordinator {
         token,
         owner,
         org,
+        ...(imageCandidate ? { imageCandidate: true } : {}),
         state: "pending",
         createdAt: now,
         updatedAt: now,
@@ -3110,17 +3120,23 @@ export class FleetCoordinator {
     token: string,
     owner: string,
     org: string,
+    imageCandidate: boolean,
   ): Promise<Response | undefined> {
     return await this.state.runExclusive(async () => {
       const canceled = await this.getArchivedCanceledCreateAttempt(requestedLeaseID, token);
       if (canceled) {
-        return canceled.owner === owner && canceled.org === org
+        return canceled.owner === owner &&
+          canceled.org === org &&
+          Boolean(canceled.imageCandidate) === imageCandidate
           ? createCanceledResponse()
           : createAttemptConflictResponse();
       }
       const existing = await this.getCreateAttempt(requestedLeaseID);
       if (!existing) {
         return undefined;
+      }
+      if (Boolean(existing.imageCandidate) !== imageCandidate) {
+        return createAttemptConflictResponse();
       }
       if (existing.token !== token) {
         return unboundCanceledCreateAttempt(existing, requestedLeaseID)
@@ -3173,15 +3189,22 @@ export class FleetCoordinator {
     const owner = requestOwner(request);
     const org = requestOrg(request, this.env);
     const admin = isAdminRequest(request);
+    const imageCandidate = isImageCandidateRequest(request);
     const cancellation = await this.state.runExclusive(async () => {
       const archived = await this.getArchivedCanceledCreateAttempt(requestedLeaseID, token);
       if (archived) {
+        if (imageCandidate && !archived.imageCandidate) {
+          return notFound();
+        }
         if (!admin && (archived.owner !== owner || archived.org !== org)) {
           return notFound();
         }
         return { attempt: archived };
       }
       let existing = await this.getCreateAttempt(requestedLeaseID);
+      if (imageCandidate && existing && !existing.imageCandidate) {
+        return notFound();
+      }
       if (existing?.token !== undefined && existing.token !== token) {
         if (!unboundCanceledCreateAttempt(existing, requestedLeaseID)) {
           return createAttemptConflictResponse();
@@ -3219,6 +3242,7 @@ export class FleetCoordinator {
             token,
             owner,
             org,
+            ...(imageCandidate ? { imageCandidate: true } : {}),
             state: "canceled",
             createdAt: now,
             updatedAt: now,
@@ -3330,6 +3354,7 @@ export class FleetCoordinator {
   ): Promise<Response> {
     const owner = requestOwner(request);
     const org = requestOrg(request, this.env);
+    const imageCandidate = isImageCandidateRequest(request);
     const input = await readJson<LeaseRequest>(request);
     const candidateError = imageCandidateLeaseRequestError(request, input);
     if (candidateError) {
@@ -3362,7 +3387,13 @@ export class FleetCoordinator {
     }
     const leaseID = fixedLeaseID ?? (validLeaseID(input.leaseID) ? input.leaseID : newLeaseID());
     if (ordinaryCreate && input.createAttemptID !== undefined) {
-      const replay = await this.replayCreateAttempt(leaseID, input.createAttemptID, owner, org);
+      const replay = await this.replayCreateAttempt(
+        leaseID,
+        input.createAttemptID,
+        owner,
+        org,
+        imageCandidate,
+      );
       if (replay) {
         return replay;
       }
@@ -3586,7 +3617,13 @@ export class FleetCoordinator {
     }
     let createAttempt: CreateAttemptRecord | undefined;
     if (ordinaryCreate && input.createAttemptID !== undefined) {
-      const reserved = await this.reserveCreateAttempt(leaseID, input.createAttemptID, owner, org);
+      const reserved = await this.reserveCreateAttempt(
+        leaseID,
+        input.createAttemptID,
+        owner,
+        org,
+        imageCandidate,
+      );
       if (reserved instanceof Response) {
         return reserved;
       }
@@ -3959,7 +3996,7 @@ export class FleetCoordinator {
         keep: config.keep,
         ttlSeconds: config.ttlSeconds,
         idleTimeoutSeconds: config.idleTimeoutSeconds,
-        ...(isImageCandidateRequest(request) ? { imageCandidate: true } : {}),
+        ...(imageCandidate ? { imageCandidate: true } : {}),
         estimatedHourlyUSD: cost.hourlyUSD,
         maxEstimatedUSD: cost.maxUSD,
         state: "provisioning",
@@ -13433,6 +13470,7 @@ export class FleetCoordinator {
       id: newRunID(),
       leaseID,
       leaseIDs: [],
+      ...(isImageCandidateRequest(request) ? { imageCandidate: true } : {}),
       owner,
       org,
       leaseOwners: [],
@@ -15993,6 +16031,9 @@ export class FleetCoordinator {
     request: Request,
     admin: boolean,
   ): "owner" | LeaseShareRole | "device" | undefined {
+    if (isImageCandidateRequest(request) && !lease.imageCandidate) {
+      return undefined;
+    }
     const role = this.leaseAccessRoleForPrincipal(lease, {
       owner: requestOwner(request),
       org: requestOrg(request, this.env),
@@ -16028,6 +16069,9 @@ export class FleetCoordinator {
   }
 
   private runWritableByRequest(run: RunRecord, request: Request): boolean {
+    if (isImageCandidateRequest(request) && !run.imageCandidate) {
+      return false;
+    }
     return (
       isAdminRequest(request) ||
       (run.owner === requestOwner(request) && run.org === requestOrg(request, this.env))
@@ -16035,6 +16079,9 @@ export class FleetCoordinator {
   }
 
   private runReadableToRequest(run: RunRecord, request: Request, lease?: LeaseRecord): boolean {
+    if (isImageCandidateRequest(request) && !run.imageCandidate) {
+      return false;
+    }
     if (this.runWritableByRequest(run, request)) {
       return true;
     }
@@ -16053,6 +16100,9 @@ export class FleetCoordinator {
     attachment: Extract<BridgeAttachment, { kind: "control" }>,
     lease?: LeaseRecord,
   ): boolean {
+    if (attachment.imageCandidate && !run.imageCandidate) {
+      return false;
+    }
     if (!attachment.admin && !isCurrentOrgKey(attachment.org)) {
       return false;
     }
@@ -16130,6 +16180,9 @@ export class FleetCoordinator {
     lease: LeaseRecord,
     attachment: Extract<BridgeAttachment, { kind: "control" }>,
   ): boolean {
+    if (attachment.imageCandidate && !lease.imageCandidate) {
+      return false;
+    }
     return Boolean(
       attachment.admin ||
       (lease.owner === attachment.owner && sameOrgIdentityKey(lease.org, attachment.org)),
@@ -16759,6 +16812,7 @@ interface CreateAttemptRecord {
   token: string;
   owner: string;
   org: string;
+  imageCandidate?: boolean;
   state: "pending" | "canceled";
   canonicalLeaseID?: string;
   cloudID?: string;
@@ -18218,6 +18272,7 @@ function sameCreateAttempt(left: CreateAttemptRecord, right: CreateAttemptRecord
     left.token === right.token &&
     left.owner === right.owner &&
     left.org === right.org &&
+    Boolean(left.imageCandidate) === Boolean(right.imageCandidate) &&
     left.state === right.state &&
     left.canonicalLeaseID === right.canonicalLeaseID &&
     left.cloudID === right.cloudID &&
@@ -18252,6 +18307,7 @@ function createAttemptMatchesLease(attempt: CreateAttemptRecord, lease: LeaseRec
     attempt.canonicalLeaseID === lease.id &&
     attempt.owner === lease.owner &&
     attempt.org === lease.org &&
+    Boolean(attempt.imageCandidate) === Boolean(lease.imageCandidate) &&
     attempt.token === lease.createAttemptID &&
     Boolean(attempt.generation) &&
     attempt.generation === lease.createAttemptGeneration &&
