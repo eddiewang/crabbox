@@ -29,6 +29,177 @@ const allowGitHubMembership = {
 };
 
 describe("coordinator auth", () => {
+  const imageCandidateToken = "candidate-token-0123456789abcdef0123456789abcdef";
+
+  it("authenticates image candidates with fixed non-admin identity and strips spoofed headers", async () => {
+    const prepared = await prepareCoordinatorRequest(
+      new Request("https://example.test/v1/leases", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${imageCandidateToken}`,
+          "x-crabbox-auth": "github",
+          "x-crabbox-admin": "true",
+          "x-crabbox-image-candidate": "false",
+          "x-crabbox-github-login": "spoof-login",
+          "x-crabbox-owner": "spoof@example.com",
+          "x-crabbox-org": "spoof-org",
+        },
+      }),
+      {
+        CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+        CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+        CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+      } as Env,
+    );
+
+    expect(prepared).toMatchObject({ authenticated: true });
+    if ("response" in prepared) throw new Error("candidate request was rejected");
+    expect(prepared.request.headers.get("x-crabbox-auth")).toBe("bearer");
+    expect(prepared.request.headers.get("x-crabbox-admin")).toBe("false");
+    expect(prepared.request.headers.get("x-crabbox-image-candidate")).toBe("true");
+    expect(prepared.request.headers.get("x-crabbox-github-login")).toBeNull();
+    expect(prepared.request.headers.get("x-crabbox-owner")).toBe("publisher@example.com");
+    expect(prepared.request.headers.get("x-crabbox-org")).toBe("image-publisher");
+  });
+
+  it("fails closed for unavailable or aliased image candidate credentials", async () => {
+    const request = (token: string) =>
+      new Request("https://example.test/v1/leases", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "x-crabbox-image-candidate": "true",
+        },
+      });
+    const cases: Array<{ token: string; env: Partial<Env>; message: string }> = [
+      {
+        token: "missing-candidate-token",
+        env: {},
+        message: "CRABBOX_IMAGE_CANDIDATE_TOKEN is not configured",
+      },
+      {
+        token: "short",
+        env: {
+          CRABBOX_IMAGE_CANDIDATE_TOKEN: "short",
+          CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+          CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+        },
+        message: "CRABBOX_IMAGE_CANDIDATE_TOKEN is invalid",
+      },
+      {
+        token: imageCandidateToken,
+        env: {
+          CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+          CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+          CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+          CRABBOX_ADMIN_TOKEN: imageCandidateToken,
+        },
+        message: "CRABBOX_IMAGE_CANDIDATE_TOKEN must differ from CRABBOX_ADMIN_TOKEN",
+      },
+      {
+        token: imageCandidateToken,
+        env: {
+          CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+          CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+          CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+          CRABBOX_SHARED_TOKEN: imageCandidateToken,
+        },
+        message: "CRABBOX_IMAGE_CANDIDATE_TOKEN must differ from CRABBOX_SHARED_TOKEN",
+      },
+      {
+        token: imageCandidateToken,
+        env: {
+          CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+          CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+          CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+          CRABBOX_RUNTIME_ADAPTER_TOKEN: imageCandidateToken,
+        },
+        message: "CRABBOX_IMAGE_CANDIDATE_TOKEN must differ from CRABBOX_RUNTIME_ADAPTER_TOKEN",
+      },
+      {
+        token: imageCandidateToken,
+        env: {
+          CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+          CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+        },
+        message: "CRABBOX_IMAGE_CANDIDATE_OWNER is not configured",
+      },
+      {
+        token: imageCandidateToken,
+        env: {
+          CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+          CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+        },
+        message: "CRABBOX_IMAGE_CANDIDATE_ORG is not configured",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const prepared = await prepareCoordinatorRequest(
+        request(testCase.token),
+        testCase.env as Env,
+      );
+      expect(prepared).toMatchObject({ authenticated: false, response: { status: 503 } });
+      if (!("response" in prepared)) throw new Error("invalid candidate auth was accepted");
+      await expect(prepared.response.json()).resolves.toMatchObject({
+        error: "image_candidate_auth_unavailable",
+        message: testCase.message,
+      });
+    }
+  });
+
+  it("limits image candidate credentials to lease, owned run, and exact image routes", async () => {
+    const env = {
+      CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+      CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+      CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+    } as Env;
+    const denied = await Promise.all(
+      (
+        [
+          ["GET", "/v1/pool"],
+          ["GET", "/v1/admin/leases"],
+          ["GET", "/v1/ready-pools"],
+          ["POST", "/v1/images/ami-123/promote"],
+          ["GET", "/v1/images/ami-123/fsr-status"],
+          ["DELETE", "/v1/images/ami-123/promote-catalog"],
+          ["POST", "/v1/workspaces"],
+        ] as const
+      ).map(([method, path]) =>
+        prepareCoordinatorRequest(
+          new Request(`https://example.test${path}`, {
+            method,
+            headers: { authorization: `Bearer ${imageCandidateToken}` },
+          }),
+          env,
+        ),
+      ),
+    );
+
+    expect(
+      denied.map((prepared) => ("response" in prepared ? prepared.response.status : 0)),
+    ).toEqual([403, 403, 403, 403, 403, 403, 403]);
+  });
+
+  it("removes forged image candidate markers from ordinary bearer requests", async () => {
+    const prepared = await prepareCoordinatorRequest(
+      new Request("https://example.test/v1/whoami", {
+        headers: {
+          authorization: "Bearer shared",
+          "x-crabbox-image-candidate": "true",
+        },
+      }),
+      {
+        CRABBOX_SHARED_TOKEN: "shared",
+        CRABBOX_SHARED_OWNER: "automation@example.com",
+        CRABBOX_DEFAULT_ORG: "example-org",
+      } as Env,
+    );
+
+    if ("response" in prepared) throw new Error("shared request was rejected");
+    expect(prepared.request.headers.get("x-crabbox-image-candidate")).toBeNull();
+  });
+
   it("keeps colliding org labels distinct after coordinator authentication", async () => {
     const sharedEnv = {
       CRABBOX_SHARED_TOKEN: "shared",

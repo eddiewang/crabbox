@@ -21,11 +21,14 @@ crabbox image delete 123456789 --provider hetzner --region fsn1
 ```
 
 Every `image` subcommand except direct Hetzner snapshot deletion requires a
-configured coordinator (broker) **and** admin-token auth. Set `broker.adminToken` or `CRABBOX_COORDINATOR_ADMIN_TOKEN`
-locally; the Worker validates it against `CRABBOX_ADMIN_TOKEN`. Without an admin
-token the command exits early with `admin command requires broker.adminToken or
-CRABBOX_COORDINATOR_ADMIN_TOKEN`. These commands are intentionally unavailable
-to normal GitHub browser-login users.
+configured coordinator. `image create`, exact image inspection during polling,
+and ordinary `image delete` prefer the environment-only
+`CRABBOX_COORDINATOR_CANDIDATE_TOKEN`, falling back to the admin token for
+operator compatibility. Promotion, Fast Snapshot Restore, catalog retirement,
+and other image actions still require `broker.adminToken` or
+`CRABBOX_COORDINATOR_ADMIN_TOKEN`. The Worker validates the candidate token
+against `CRABBOX_IMAGE_CANDIDATE_TOKEN` and binds its fixed owner/org identity;
+normal GitHub browser-login users cannot use these routes.
 
 Image bytes live in the provider account, never in git or coordinator durable
 state. AWS images are AMIs backed by EBS snapshots; Azure promotion uses
@@ -50,6 +53,11 @@ Crabbox-owned. AWS uses the `CreateImage` API; the same flow applies to other
 brokered providers that support image capture. Note that Azure managed-image
 capture requires a stopped, generalized source VM, so for active Azure leases
 prefer [`crabbox checkpoint`](checkpoint.md) disk snapshots instead.
+
+The protected publication workflow uses candidate auth and therefore limits
+this command to an explicit AWS Linux or Windows on-demand source lease created
+by the same fixed candidate identity. Candidate credentials cannot inspect or
+delete images without the coordinator's separate ownership record.
 
 Flags:
 

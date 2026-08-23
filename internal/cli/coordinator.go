@@ -21,6 +21,7 @@ type CoordinatorClient struct {
 	BaseURL          string
 	Token            string
 	TokenCommand     []string
+	ImageCandidate   bool
 	Access           AccessConfig
 	Client           *http.Client
 	ChildEnvDenylist []string
@@ -931,10 +932,17 @@ func newCoordinatorClient(cfg Config) (*CoordinatorClient, bool, error) {
 		return nil, true, exit(2, "CRABBOX_COORDINATOR must be an absolute URL")
 	}
 	base.Path = strings.TrimRight(base.Path, "/")
+	token := cfg.CoordToken
+	imageCandidate := cfg.coordImageCandidate
+	if token == "" {
+		token = cfg.CoordCandidateToken
+		imageCandidate = token != ""
+	}
 	return &CoordinatorClient{
 		BaseURL:          strings.TrimRight(base.String(), "/"),
-		Token:            cfg.CoordToken,
+		Token:            token,
 		TokenCommand:     append([]string(nil), cfg.CoordTokenCommand...),
+		ImageCandidate:   imageCandidate,
 		Access:           cfg.Access,
 		ChildEnvDenylist: externalDesktopChildEnvDenylist(cfg, cfg.TargetOS),
 		Client: &http.Client{
@@ -2232,6 +2240,9 @@ func (c *CoordinatorClient) addRequestHeaders(ctx context.Context, headers http.
 	if token != "" {
 		headers.Set("Authorization", "Bearer "+token)
 	}
+	if c.ImageCandidate {
+		headers.Set("X-Crabbox-Image-Candidate", "true")
+	}
 	c.addAccessHeaders(headers)
 	if owner := c.localCoordinatorOwner(); owner != "" {
 		headers.Set("X-Crabbox-Owner", owner)
@@ -2363,6 +2374,9 @@ func (c *CoordinatorClient) curlConfig(ctx context.Context, method, path string,
 	}
 	if token != "" {
 		curlConfigValue(&cfg, "header", "Authorization: Bearer "+token)
+	}
+	if c.ImageCandidate {
+		curlConfigValue(&cfg, "header", "X-Crabbox-Image-Candidate: true")
 	}
 	c.addCurlAccessHeaders(&cfg)
 	if owner := c.localCoordinatorOwner(); owner != "" {

@@ -1306,7 +1306,7 @@ func deleteCheckpoint(ctx context.Context, store checkpointStore, id string, loc
 			}
 			return store.Delete(id)
 		}
-		coord, err := configuredAdminCoordinator()
+		coord, err := configuredImageCoordinator()
 		if err != nil {
 			return err
 		}
@@ -1529,7 +1529,7 @@ func (a App) verifyCheckpointRecord(ctx context.Context, store checkpointStore, 
 			audit.NextAction = "delete_local"
 			return audit, nil
 		}
-		coord, err := configuredAdminCoordinator()
+		coord, err := configuredImageCoordinator()
 		if err != nil {
 			audit.ProviderState = "unknown"
 			audit.NextAction = "configure_admin_auth"

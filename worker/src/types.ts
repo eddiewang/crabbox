@@ -93,6 +93,9 @@ export interface Env {
   CRABBOX_DAYTONA_SSH_GATEWAY_HOST?: string;
   CRABBOX_DAYTONA_SSH_ACCESS_MINUTES?: string;
   CRABBOX_RUNTIME_ADAPTER_TOKEN?: string;
+  CRABBOX_IMAGE_CANDIDATE_TOKEN?: string;
+  CRABBOX_IMAGE_CANDIDATE_OWNER?: string;
+  CRABBOX_IMAGE_CANDIDATE_ORG?: string;
   CRABBOX_SHARED_TOKEN?: string;
   CRABBOX_SHARED_OWNER?: string;
   CRABBOX_ADMIN_TOKEN?: string;
@@ -462,6 +465,7 @@ export interface LeaseRecord {
   keep: boolean;
   ttlSeconds: number;
   idleTimeoutSeconds?: number;
+  imageCandidate?: boolean;
   estimatedHourlyUSD: number;
   maxEstimatedUSD: number;
   state: "provisioning" | "active" | "released" | "expired" | "failed";

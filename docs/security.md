@@ -450,6 +450,10 @@ Inject these as Cloudflare Worker secrets or Node service secrets, never in the
 repo:
 
 - `CRABBOX_ADMIN_TOKEN` — admin and image-lifecycle routes.
+- `CRABBOX_IMAGE_CANDIDATE_TOKEN` — non-admin image-candidate workflow access
+  restricted to explicit AWS Linux or Windows on-demand leases, their runs,
+  image creation, and exact candidate-owned image reads or deletion. It must be
+  distinct from admin, shared, and runtime-adapter tokens.
 - `CRABBOX_RUNTIME_ADAPTER_TOKEN` — route-scoped service access to workspace
   lifecycle and desktop-connection APIs only; it cannot attach terminals.
 - `CRABBOX_SHARED_TOKEN` — trusted operator automation only.
@@ -479,6 +483,10 @@ Set the non-secret `CRABBOX_RUNTIME_ADAPTER_OWNER` and
 `CRABBOX_RUNTIME_ADAPTER_ORG` to stable deployment identities when the
 route-scoped token is enabled. Callers cannot override that identity with
 request headers.
+
+Set `CRABBOX_IMAGE_CANDIDATE_OWNER` and `CRABBOX_IMAGE_CANDIDATE_ORG` to the
+fixed publication identity when candidate auth is enabled. Candidate requests
+cannot override these values or acquire admin scope.
 
 Deployments that previously relied on `CRABBOX_SHARED_TOKEN` as the implicit
 user-token signing key must configure a new `CRABBOX_SESSION_SECRET`. Existing

@@ -738,3 +738,28 @@ func configuredAdminCoordinator() (*CoordinatorClient, error) {
 	}
 	return coord, nil
 }
+
+func configuredImageCoordinator() (*CoordinatorClient, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case cfg.CoordCandidateToken != "":
+		cfg.CoordToken = cfg.CoordCandidateToken
+		cfg.coordImageCandidate = true
+	case cfg.CoordAdminToken != "":
+		cfg.CoordToken = cfg.CoordAdminToken
+	default:
+		return nil, exit(2, "image command requires CRABBOX_COORDINATOR_CANDIDATE_TOKEN or broker.adminToken")
+	}
+	cfg.CoordTokenCommand = nil
+	coord, ok, err := newCoordinatorClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, exit(2, "image command requires a configured coordinator")
+	}
+	return coord, nil
+}

@@ -269,11 +269,17 @@ third lease.
 Configure the `image-publisher` GitHub environment with:
 
 - the `CRABBOX_COORDINATOR` environment variable;
-- `CRABBOX_IMAGE_PUBLISHER_OWNER` and `CRABBOX_IMAGE_PUBLISHER_ORG`
-  environment variables matching the coordinator tenant;
-- the `CRABBOX_COORDINATOR_ADMIN_TOKEN` environment secret;
+- the `CRABBOX_COORDINATOR_CANDIDATE_TOKEN` environment secret;
 - `CRABBOX_ACCESS_CLIENT_ID` and `CRABBOX_ACCESS_CLIENT_SECRET` environment
   secrets when the coordinator is behind Cloudflare Access.
+
+Configure the coordinator with an independent `CRABBOX_IMAGE_CANDIDATE_TOKEN`
+secret matching the workflow token, plus fixed
+`CRABBOX_IMAGE_CANDIDATE_OWNER` and `CRABBOX_IMAGE_CANDIDATE_ORG` settings.
+The candidate credential is non-admin and is limited to explicit AWS
+Linux or Windows on-demand lease, its runs, image creation, and exact owned
+image inspection or deletion. It cannot access pools, defaults, promotion, or
+other image actions.
 
 Add required reviewers to that environment so paid image creation and
 evidence publication need explicit administrator approval. Dispatch one

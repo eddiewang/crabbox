@@ -23,7 +23,7 @@ func (a App) imageCreate(ctx context.Context, args []string) error {
 	if *id == "" || *name == "" {
 		return exit(2, "usage: crabbox image create --id <cbx_id> --name <image-name> [--wait]")
 	}
-	coord, err := configuredAdminCoordinator()
+	coord, err := configuredImageCoordinator()
 	if err != nil {
 		return err
 	}
@@ -258,7 +258,13 @@ func (a App) imageDelete(ctx context.Context, args []string) error {
 		fmt.Fprintf(a.Stdout, "deleted image=%s provider=hetzner region=%s project=- checkpoint=%s\n", fs.Arg(0), blank(record.Native.Region, "-"), record.ID)
 		return nil
 	}
-	coord, err := configuredAdminCoordinator()
+	var coord *CoordinatorClient
+	var err error
+	if *catalogOnly {
+		coord, err = configuredAdminCoordinator()
+	} else {
+		coord, err = configuredImageCoordinator()
+	}
 	if err != nil {
 		return err
 	}

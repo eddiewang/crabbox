@@ -384,6 +384,82 @@ func TestCoordinatorTokenCommandRefreshesBearer(t *testing.T) {
 	}
 }
 
+func TestNewCoordinatorClientCandidateTokenPreference(t *testing.T) {
+	base := Config{
+		Coordinator:         "https://coordinator.example.test",
+		CoordCandidateToken: "candidate-secret",
+	}
+	candidate, configured, err := newCoordinatorClient(base)
+	if err != nil || !configured {
+		t.Fatalf("newCoordinatorClient candidate configured=%t err=%v", configured, err)
+	}
+	if candidate.Token != "candidate-secret" || !candidate.ImageCandidate {
+		t.Fatalf("candidate client token=%q imageCandidate=%t", candidate.Token, candidate.ImageCandidate)
+	}
+	headers := http.Header{}
+	if err := candidate.addRequestHeaders(context.Background(), headers); err != nil {
+		t.Fatal(err)
+	}
+	if got := headers.Get("Authorization"); got != "Bearer candidate-secret" {
+		t.Fatalf("candidate authorization header=%q", got)
+	}
+	if got := headers.Get("X-Crabbox-Image-Candidate"); got != "true" {
+		t.Fatalf("candidate marker header=%q", got)
+	}
+
+	explicit, configured, err := newCoordinatorClient(Config{
+		Coordinator:         base.Coordinator,
+		CoordToken:          "user-secret",
+		CoordCandidateToken: base.CoordCandidateToken,
+	})
+	if err != nil || !configured {
+		t.Fatalf("newCoordinatorClient explicit configured=%t err=%v", configured, err)
+	}
+	if explicit.Token != "user-secret" || explicit.ImageCandidate {
+		t.Fatalf("explicit client token=%q imageCandidate=%t", explicit.Token, explicit.ImageCandidate)
+	}
+}
+
+func TestConfiguredImageCoordinatorPrefersCandidateAndPreservesAdmin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CRABBOX_COORDINATOR", "https://coordinator.example.test")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN_COMMAND", "")
+	t.Setenv("CRABBOX_COORDINATOR_CANDIDATE_TOKEN", "candidate-secret")
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-secret")
+	t.Setenv("CRABBOX_ADMIN_TOKEN", "")
+
+	image, err := configuredImageCoordinator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.Token != "candidate-secret" || !image.ImageCandidate {
+		t.Fatalf("image client token=%q imageCandidate=%t", image.Token, image.ImageCandidate)
+	}
+	admin, err := configuredAdminCoordinator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admin.Token != "admin-secret" || admin.ImageCandidate {
+		t.Fatalf("admin client token=%q imageCandidate=%t", admin.Token, admin.ImageCandidate)
+	}
+}
+
+func TestConfiguredImageCoordinatorRequiresDedicatedOrAdminToken(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CRABBOX_COORDINATOR", "https://coordinator.example.test")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN_COMMAND", "")
+	t.Setenv("CRABBOX_COORDINATOR_CANDIDATE_TOKEN", "")
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "")
+	t.Setenv("CRABBOX_ADMIN_TOKEN", "")
+
+	if _, err := configuredImageCoordinator(); err == nil ||
+		!strings.Contains(err.Error(), "CRABBOX_COORDINATOR_CANDIDATE_TOKEN") {
+		t.Fatalf("configuredImageCoordinator error=%v", err)
+	}
+}
+
 func TestCoordinatorChildrenScrubExternalDesktopPassword(t *testing.T) {
 	t.Setenv("CRABBOX_TOKEN_HELPER", "1")
 	t.Setenv("CRABBOX_TOKEN_HELPER_VALUE", "scrubbed-token")

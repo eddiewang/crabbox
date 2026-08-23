@@ -136,7 +136,7 @@ func (coordinatorCheckpointDriver) Create(ctx context.Context, req checkpointNat
 	if name == "" {
 		name = defaultNativeImageName(req.LeaseID, req.RepoName)
 	}
-	coord, err := configuredAdminCoordinator()
+	coord, err := configuredImageCoordinator()
 	if err != nil {
 		return CoordinatorImage{}, err
 	}

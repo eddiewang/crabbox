@@ -372,6 +372,7 @@ const awsOrphanSweepFirstAlarmKey = "aws-orphan-sweep:first-alarm";
 const azureOrphanSweepRecordKey = "azure-orphan-sweep:last";
 const azureOrphanSweepFirstAlarmKey = "azure-orphan-sweep:first-alarm";
 const providerReconciliationCandidatePrefix = "provider-reconciliation:";
+const imageCandidateAuthorizationPrefix = "image-candidate-authorization:";
 const providerReconciliationCircuitPrefix = "provider-reconciliation-circuit:";
 const awsIngressReconcileRecordKey = "aws-ingress-reconcile:pending";
 const azureDeferredCleanupPrefix = "azure-cleanup:";
@@ -425,6 +426,7 @@ function coordinatorDiagnosticSecrets(env: Env): Array<string | undefined> {
     ),
     env.AWS_SESSION_TOKEN,
     env.CRABBOX_RUNTIME_ADAPTER_TOKEN,
+    env.CRABBOX_IMAGE_CANDIDATE_TOKEN,
     env.CRABBOX_SHARED_TOKEN,
     env.CRABBOX_ADMIN_TOKEN,
     env.CRABBOX_SESSION_SECRET,
@@ -812,6 +814,17 @@ interface AzureDeferredCleanupRecord extends AzureDeferredCleanupRequest {
   retryAt: string;
   lastError?: string;
   terminalAt?: string;
+}
+
+interface ImageCandidateAuthorizationRecord {
+  imageID: string;
+  sourceLeaseID: string;
+  owner: string;
+  org: string;
+  target: TargetOS;
+  region: string;
+  provider: Provider;
+  createdAt: string;
 }
 
 class ProviderCleanupManualResolutionError extends Error {
@@ -3318,6 +3331,10 @@ export class FleetCoordinator {
     const owner = requestOwner(request);
     const org = requestOrg(request, this.env);
     const input = await readJson<LeaseRequest>(request);
+    const candidateError = imageCandidateLeaseRequestError(request, input);
+    if (candidateError) {
+      return candidateError;
+    }
     const ordinaryCreate = !fixedLeaseID && !workspaceID;
     if (fixedLeaseID) {
       if (!validLeaseID(fixedLeaseID)) {
@@ -3450,7 +3467,7 @@ export class FleetCoordinator {
       providerRegionForConfig(config),
       providerProjectForConfig(config),
     );
-    if (!workspaceID && !isAdminRequest(request)) {
+    if (!workspaceID && !isAdminRequest(request) && !isImageCandidateRequest(request)) {
       const restrictedFields = configProvider.restrictedLeaseRequestFields?.(input) ?? [];
       if (restrictedFields.length > 0) {
         return json(
@@ -3942,6 +3959,7 @@ export class FleetCoordinator {
         keep: config.keep,
         ttlSeconds: config.ttlSeconds,
         idleTimeoutSeconds: config.idleTimeoutSeconds,
+        ...(isImageCandidateRequest(request) ? { imageCandidate: true } : {}),
         estimatedHourlyUSD: cost.hourlyUSD,
         maxEstimatedUSD: cost.maxUSD,
         state: "provisioning",
@@ -13404,6 +13422,9 @@ export class FleetCoordinator {
       return json({ error: "invalid_lease_id" }, { status: 400 });
     }
     const lease = leaseID ? await this.getLease(leaseID) : undefined;
+    if (isImageCandidateRequest(request) && (!lease || !lease.imageCandidate)) {
+      return notFound();
+    }
     if (lease && !this.leaseVisibleToRequest(lease, request, false)) {
       return json({ error: "not_found" }, { status: 404 });
     }
@@ -13868,6 +13889,9 @@ export class FleetCoordinator {
     if (!lease) {
       return notFound();
     }
+    if (isImageCandidateRequest(request) && !lease.imageCandidate) {
+      return notFound();
+    }
     const managedProvider = managedLeaseProvider(lease);
     if (!managedProvider) {
       return json(
@@ -13909,6 +13933,19 @@ export class FleetCoordinator {
       );
     }
     const image = await provider.createLeaseImage(lease, name, input.noReboot ?? true, strategy);
+    if (isImageCandidateRequest(request)) {
+      const authorization: ImageCandidateAuthorizationRecord = {
+        imageID: image.id,
+        sourceLeaseID: lease.id,
+        owner: lease.owner,
+        org: lease.org,
+        target: lease.target,
+        region: image.region || lease.region || "",
+        provider: managedProvider,
+        createdAt: new Date().toISOString(),
+      };
+      await this.state.storage.put(imageCandidateAuthorizationKey(image.id), authorization);
+    }
     return json({ image }, { status: 201 });
   }
 
@@ -13919,14 +13956,39 @@ export class FleetCoordinator {
       return json({ error: "invalid_image_id" }, { status: 400 });
     }
     const url = new URL(request.url);
-    const provider = providerFromQuery(url.searchParams.get("provider"));
+    const candidateAuthorization = isImageCandidateRequest(request)
+      ? await this.state.storage.get<ImageCandidateAuthorizationRecord>(
+          imageCandidateAuthorizationKey(decodedImageID),
+        )
+      : undefined;
+    if (
+      isImageCandidateRequest(request) &&
+      (!candidateAuthorization ||
+        candidateAuthorization.owner !== requestOwner(request) ||
+        candidateAuthorization.org !== requestOrg(request, this.env))
+    ) {
+      return notFound();
+    }
+    const requestedProvider = url.searchParams.get("provider");
+    const requestedRegion = url.searchParams.get("region");
+    if (
+      candidateAuthorization &&
+      ((requestedProvider &&
+        requestedProvider.trim().toLowerCase() !== candidateAuthorization.provider) ||
+        (requestedRegion && requestedRegion !== candidateAuthorization.region) ||
+        url.searchParams.has("project"))
+    ) {
+      return notFound();
+    }
+    const provider =
+      candidateAuthorization?.provider ?? providerFromQuery(url.searchParams.get("provider"));
     if (!provider) {
       return json(
         { error: "unsupported_provider", message: "image provider must be aws, azure, or gcp" },
         { status: 400 },
       );
     }
-    const region = url.searchParams.get("region") ?? undefined;
+    const region = candidateAuthorization?.region || url.searchParams.get("region") || undefined;
     const project = url.searchParams.get("project") ?? undefined;
     const kind = url.searchParams.get("kind") ?? undefined;
     const imageProvider = this.provider(provider, region, project);
@@ -13986,6 +14048,9 @@ export class FleetCoordinator {
         return json(deleteBlocked.body, { status: deleteBlocked.status });
       }
       await providerForRegion.deleteImage(decodedImageID, kind, metadata);
+      if (candidateAuthorization) {
+        await this.state.storage.delete(imageCandidateAuthorizationKey(decodedImageID));
+      }
       return json({ imageID: decodedImageID, deleted: true });
     }
     if (method === "DELETE" && action === "promote-catalog") {
@@ -20324,10 +20389,129 @@ function notFound(): Response {
 }
 
 function adminRouteError(request: Request, method: string, parts: string[]): Response | undefined {
-  if (!isAdminRoute(method, parts) || isAdminRequest(request)) {
+  if (
+    !isAdminRoute(method, parts) ||
+    isAdminRequest(request) ||
+    (isImageCandidateRequest(request) && imageCandidateFleetRouteAllowed(method, parts))
+  ) {
     return undefined;
   }
   return json({ error: "forbidden", message: "admin token required" }, { status: 403 });
+}
+
+function isImageCandidateRequest(request: Request): boolean {
+  return request.headers.get("x-crabbox-image-candidate") === "true";
+}
+
+function imageCandidateFleetRouteAllowed(methodValue: string, parts: string[]): boolean {
+  const method = methodValue.toUpperCase();
+  if (method === "POST" && parts.join("/") === "v1/images") {
+    return true;
+  }
+  return (
+    parts[0] === "v1" &&
+    parts[1] === "images" &&
+    Boolean(parts[2]) &&
+    parts.length === 3 &&
+    (method === "GET" || method === "DELETE")
+  );
+}
+
+function imageCandidateLeaseRequestError(
+  request: Request,
+  input: LeaseRequest,
+): Response | undefined {
+  if (!isImageCandidateRequest(request)) {
+    return undefined;
+  }
+  const target = input.target ?? input.targetOS;
+  const fields: string[] = [];
+  if (input.provider !== "aws") fields.push("provider");
+  if (target !== "linux" && target !== "windows") fields.push("target");
+  if (!input.awsAMI || !/^ami-[0-9a-z]+$/.test(input.awsAMI)) fields.push("awsAMI");
+  if (!input.awsRegion || !sanitizeAWSRegion(input.awsRegion)) fields.push("awsRegion");
+  if (input.capacity?.market !== "on-demand") fields.push("capacity.market");
+  const ttlSeconds = input.ttlSeconds;
+  const idleTimeoutSeconds = input.idleTimeoutSeconds;
+  if (
+    !Number.isInteger(ttlSeconds) ||
+    ttlSeconds === undefined ||
+    ttlSeconds < 300 ||
+    ttlSeconds > 21_600
+  ) {
+    fields.push("ttlSeconds");
+  }
+  if (
+    !Number.isInteger(idleTimeoutSeconds) ||
+    idleTimeoutSeconds === undefined ||
+    idleTimeoutSeconds < 60 ||
+    idleTimeoutSeconds > 3_600 ||
+    (ttlSeconds !== undefined && idleTimeoutSeconds > ttlSeconds)
+  ) {
+    fields.push("idleTimeoutSeconds");
+  }
+  const restricted = [
+    input.hostId ? "hostId" : "",
+    input.hostID ? "hostID" : "",
+    input.awsSnapshot ? "awsSnapshot" : "",
+    input.awsSGID ? "awsSGID" : "",
+    input.awsSubnetID ? "awsSubnetID" : "",
+    input.awsProfile ? "awsProfile" : "",
+    input.awsInstanceTypes?.length ? "awsInstanceTypes" : "",
+    input.awsPrivate ? "awsPrivate" : "",
+    input.awsRequireSSM ? "awsRequireSSM" : "",
+    input.awsSSMBootstrapCommand ? "awsSSMBootstrapCommand" : "",
+    input.awsSSMLogGroup ? "awsSSMLogGroup" : "",
+    input.awsSSHCIDRs?.length ? "awsSSHCIDRs" : "",
+    input.awsSSHCIDRsPinned ? "awsSSHCIDRsPinned" : "",
+    input.awsMacHostID ? "awsMacHostID" : "",
+    input.imageRequirements ? "imageRequirements" : "",
+    input.tailscale ? "tailscale" : "",
+    input.tailscaleTags?.length ? "tailscaleTags" : "",
+    input.tailscaleHostname ? "tailscaleHostname" : "",
+    input.tailscaleExitNode ? "tailscaleExitNode" : "",
+    input.tailscaleExitNodeAllowLanAccess ? "tailscaleExitNodeAllowLanAccess" : "",
+    input.providerKey ? "providerKey" : "",
+    input.pond ? "pond" : "",
+    input.exposedPorts?.length ? "exposedPorts" : "",
+    input.keep ? "keep" : "",
+    input.azureLocation ? "azureLocation" : "",
+    input.azureImage ? "azureImage" : "",
+    input.azureSnapshot ? "azureSnapshot" : "",
+    input.azureOSDisk ? "azureOSDisk" : "",
+    input.gcpProject ? "gcpProject" : "",
+    input.gcpZone ? "gcpZone" : "",
+    input.gcpImage ? "gcpImage" : "",
+    input.gcpMachineImage ? "gcpMachineImage" : "",
+    input.gcpSnapshot ? "gcpSnapshot" : "",
+    input.gcpNetwork ? "gcpNetwork" : "",
+    input.gcpSubnet ? "gcpSubnet" : "",
+    input.gcpTags?.length ? "gcpTags" : "",
+    input.gcpSSHCIDRs?.length ? "gcpSSHCIDRs" : "",
+    input.gcpRootGB ? "gcpRootGB" : "",
+    input.gcpServiceAccount ? "gcpServiceAccount" : "",
+    input.capacity?.strategy ? "capacity.strategy" : "",
+    input.capacity?.fallback ? "capacity.fallback" : "",
+    input.capacity?.regions?.length ? "capacity.regions" : "",
+    input.capacity?.availabilityZones?.length ? "capacity.availabilityZones" : "",
+    input.capacity?.hints !== undefined ? "capacity.hints" : "",
+  ].filter(Boolean);
+  fields.push(...restricted);
+  if (fields.length === 0) {
+    return undefined;
+  }
+  return json(
+    {
+      error: "image_candidate_lease_forbidden",
+      message: `image candidate lease request rejected: ${fields.join(", ")}`,
+      fields,
+    },
+    { status: 403 },
+  );
+}
+
+function imageCandidateAuthorizationKey(imageID: string): string {
+  return `${imageCandidateAuthorizationPrefix}${encodeURIComponent(imageID)}`;
 }
 
 function isCloudNotFoundError(message: string): boolean {

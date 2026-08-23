@@ -35375,6 +35375,204 @@ describe("authoritative lease provider metadata", () => {
   });
 });
 
+describe("image candidate authorization", () => {
+  const candidateHeaders = {
+    "x-crabbox-image-candidate": "true",
+    "x-crabbox-owner": "publisher@example.com",
+    "x-crabbox-org": "image-publisher",
+  };
+  const candidateLeaseInput = {
+    provider: "aws" as const,
+    target: "linux" as const,
+    architecture: "x86_64",
+    class: "standard",
+    serverType: "m7i.large",
+    serverTypeExplicit: true,
+    awsRegion: "eu-west-1",
+    awsAMI: "ami-0123456789abcdef0",
+    capacity: { market: "on-demand" as const },
+    ttlSeconds: 7_200,
+    idleTimeoutSeconds: 1_800,
+    sshPublicKey: "ssh-ed25519 candidate",
+  };
+
+  it("rejects restricted candidate lease selectors before provider acquisition", async () => {
+    const create = vi.fn();
+    const fleet = testFleet(new MemoryStorage(), {
+      aws: fakeProvider(create, { provider: "aws" }),
+    });
+    const cases: Array<{ field: string; body: Record<string, unknown> }> = [
+      { field: "provider", body: { provider: "azure" } },
+      { field: "target", body: { target: "macos" } },
+      { field: "awsAMI", body: { awsAMI: "" } },
+      { field: "capacity.market", body: { capacity: { market: "spot" } } },
+      { field: "ttlSeconds", body: { ttlSeconds: 21_601 } },
+      { field: "idleTimeoutSeconds", body: { idleTimeoutSeconds: 3_601 } },
+      { field: "hostId", body: { hostId: "h-123" } },
+      { field: "awsPrivate", body: { awsPrivate: true, awsRequireSSM: true } },
+      { field: "awsSSMBootstrapCommand", body: { awsSSMBootstrapCommand: "echo nope" } },
+      { field: "awsSubnetID", body: { awsSubnetID: "subnet-123" } },
+      { field: "awsSSHCIDRs", body: { awsSSHCIDRs: ["192.0.2.1/32"] } },
+      { field: "imageRequirements", body: { imageRequirements: { browser: true } } },
+      {
+        field: "capacity.regions",
+        body: { capacity: { market: "on-demand", regions: ["us-east-1"] } },
+      },
+      { field: "keep", body: { keep: true } },
+    ];
+
+    for (const testCase of cases) {
+      const response = await fleet.fetch(
+        request("POST", "/v1/leases", {
+          headers: candidateHeaders,
+          body: { ...candidateLeaseInput, ...testCase.body },
+        }),
+      );
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        error: "image_candidate_lease_forbidden",
+        fields: expect.arrayContaining([testCase.field]),
+      });
+    }
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("binds candidate images to their candidate lease and fixed owner identity", async () => {
+    const storage = new MemoryStorage();
+    const deleted: string[] = [];
+    const fleet = testFleet(storage, {
+      aws: fakeProvider(undefined, {
+        provider: "aws",
+        cloudID: "i-candidate",
+        imageRegion: "eu-west-1",
+        onDeleteImage(imageID) {
+          deleted.push(imageID);
+        },
+      }),
+    });
+    const createLease = await fleet.fetch(
+      request("POST", "/v1/leases", {
+        headers: candidateHeaders,
+        body: {
+          ...candidateLeaseInput,
+          leaseID: "cbx_c0ffee000001",
+          createAttemptID: "cat_00000000000000000000000000000001",
+        },
+      }),
+    );
+    expect(createLease.status).toBe(201);
+    const lease = ((await createLease.json()) as { lease: LeaseRecord }).lease;
+    expect(storage.value<LeaseRecord>(`lease:${lease.id}`)?.imageCandidate).toBe(true);
+
+    const createImage = await fleet.fetch(
+      request("POST", "/v1/images", {
+        headers: candidateHeaders,
+        body: { leaseID: lease.id, name: "candidate-image", noReboot: false, strategy: "image" },
+      }),
+    );
+    expect(createImage.status).toBe(201);
+    const image = ((await createImage.json()) as { image: ProviderImage }).image;
+
+    const exact = await fleet.fetch(
+      request("GET", `/v1/images/${image.id}?provider=aws&region=eu-west-1`, {
+        headers: candidateHeaders,
+      }),
+    );
+    expect(exact.status).toBe(200);
+    const wrongRegion = await fleet.fetch(
+      request("GET", `/v1/images/${image.id}?provider=aws&region=us-east-1`, {
+        headers: candidateHeaders,
+      }),
+    );
+    expect(wrongRegion.status).toBe(404);
+    const foreign = await fleet.fetch(
+      request("GET", `/v1/images/${image.id}?provider=aws&region=eu-west-1`, {
+        headers: { ...candidateHeaders, "x-crabbox-owner": "other@example.com" },
+      }),
+    );
+    expect(foreign.status).toBe(404);
+    const action = await fleet.fetch(
+      request("POST", `/v1/images/${image.id}/promote`, {
+        headers: candidateHeaders,
+      }),
+    );
+    expect(action.status).toBe(403);
+
+    storage.seed("image:aws:created:ami-admin-created", {
+      id: "ami-admin-created",
+      state: "available",
+      provider: "aws",
+      region: "eu-west-1",
+    });
+    const unrelated = await fleet.fetch(
+      request("GET", "/v1/images/ami-admin-created?provider=aws&region=eu-west-1", {
+        headers: candidateHeaders,
+      }),
+    );
+    expect(unrelated.status).toBe(404);
+
+    const remove = await fleet.fetch(
+      request("DELETE", `/v1/images/${image.id}?provider=aws&region=eu-west-1`, {
+        headers: candidateHeaders,
+      }),
+    );
+    expect(remove.status).toBe(200);
+    expect(deleted).toEqual([image.id]);
+    const afterDelete = await fleet.fetch(
+      request("GET", `/v1/images/${image.id}?provider=aws&region=eu-west-1`, {
+        headers: candidateHeaders,
+      }),
+    );
+    expect(afterDelete.status).toBe(404);
+  });
+
+  it("allows owned candidate runs only for candidate-created leases", async () => {
+    const storage = new MemoryStorage();
+    const candidate = testLease({
+      id: "cbx_c0ffee000002",
+      provider: "aws",
+      owner: "publisher@example.com",
+      org: "image-publisher",
+      imageCandidate: true,
+    });
+    const ordinary = testLease({
+      id: "cbx_c0ffee000003",
+      provider: "aws",
+      owner: "publisher@example.com",
+      org: "image-publisher",
+    });
+    storage.seed(`lease:${candidate.id}`, candidate);
+    storage.seed(`lease:${ordinary.id}`, ordinary);
+    const fleet = testFleet(storage);
+
+    const denied = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        headers: candidateHeaders,
+        body: { leaseID: ordinary.id, command: ["true"] },
+      }),
+    );
+    expect(denied.status).toBe(404);
+    const created = await fleet.fetch(
+      request("POST", "/v1/runs", {
+        headers: candidateHeaders,
+        body: { leaseID: candidate.id, command: ["true"] },
+      }),
+    );
+    expect(created.status).toBe(201);
+    const run = ((await created.json()) as { run: RunRecord }).run;
+    const owned = await fleet.fetch(
+      request("GET", `/v1/runs/${run.id}`, { headers: candidateHeaders }),
+    );
+    expect(owned.status).toBe(200);
+    const foreign = await fleet.fetch(
+      request("GET", `/v1/runs/${run.id}`, {
+        headers: { ...candidateHeaders, "x-crabbox-owner": "other@example.com" },
+      }),
+    );
+    expect(foreign.status).toBe(404);
+  });
+});
+
 async function startGitHubLogin(env: Partial<Env> = {}): Promise<{
   fleet: FleetDurableObject;
   loginID: string;

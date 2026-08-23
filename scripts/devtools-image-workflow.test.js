@@ -76,23 +76,23 @@ test("workflow explicitly disables promotion, FSR, and promoted warmup", () => {
 
 test("workflow keeps cloud credentials environment-scoped and retains proof", () => {
   assert.match(workflow, /CRABBOX_COORDINATOR: \$\{\{ vars\.CRABBOX_COORDINATOR \}\}/);
-  assert.equal(
-    (workflow.match(/secrets\.CRABBOX_COORDINATOR_ADMIN_TOKEN/g) ?? []).length,
-    4,
+  assert.match(
+    candidateJob,
+    /CRABBOX_COORDINATOR_CANDIDATE_TOKEN: \$\{\{ secrets\.CRABBOX_COORDINATOR_CANDIDATE_TOKEN \}\}/,
   );
+  assert.doesNotMatch(candidateJob, /CRABBOX_COORDINATOR_ADMIN_TOKEN|CRABBOX_COORDINATOR_TOKEN/);
+  assert.match(candidateJob, /if \[\[ -z "\$CRABBOX_COORDINATOR_CANDIDATE_TOKEN" \]\]/);
+  assert.ok(
+    candidateJob.indexOf("Verify publisher configuration") <
+      candidateJob.indexOf("Check out protected source"),
+  );
+  assert.match(
+    macosJob,
+    /CRABBOX_COORDINATOR_ADMIN_TOKEN: \$\{\{ secrets\.CRABBOX_COORDINATOR_ADMIN_TOKEN \}\}/,
+  );
+  assert.doesNotMatch(macosJob, /CRABBOX_COORDINATOR_CANDIDATE_TOKEN|CRABBOX_COORDINATOR_TOKEN/);
   assert.doesNotMatch(workflow, /AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY/);
   assert.doesNotMatch(workflow, /openclaw/i);
-  assert.match(
-    workflow,
-    /CRABBOX_OWNER: \$\{\{ vars\.CRABBOX_IMAGE_PUBLISHER_OWNER \}\}/,
-  );
-  assert.match(
-    workflow,
-    /CRABBOX_ORG: \$\{\{ vars\.CRABBOX_IMAGE_PUBLISHER_ORG \}\}/,
-  );
-  assert.match(workflow, /Set CRABBOX_IMAGE_PUBLISHER_OWNER to a valid email/);
-  assert.match(workflow, /Set CRABBOX_IMAGE_PUBLISHER_ORG to a valid tenant/);
-  assert.doesNotMatch(workflow, /image-publisher@example\.invalid|CRABBOX_ORG: example-org/);
   assert.match(workflow, /name: Upload publication proof[\s\S]*if: always\(\)/);
   assert.match(workflow, /if-no-files-found: error/);
   assert.match(workflow, /retention-days: 30/);

@@ -29,6 +29,7 @@ func clearConfigEnv(t *testing.T) {
 		"CRABBOX_COORDINATOR_AUTO_WEBVNC",
 		"CRABBOX_COORDINATOR_TOKEN",
 		"CRABBOX_COORDINATOR_TOKEN_COMMAND",
+		"CRABBOX_COORDINATOR_CANDIDATE_TOKEN",
 		"CRABBOX_WEBVNC_AGENT_BASE_URL",
 		"CRABBOX_COORDINATOR_ADMIN_TOKEN",
 		"CRABBOX_ADMIN_TOKEN",
@@ -6275,6 +6276,7 @@ func TestEnvOverridesConfig(t *testing.T) {
 	t.Setenv("CRABBOX_ACCESS_CLIENT_ID", "env-access-client")
 	t.Setenv("CRABBOX_ACCESS_CLIENT_SECRET", "env-access-secret")
 	t.Setenv("CRABBOX_ACCESS_TOKEN", "env-access-jwt")
+	t.Setenv("CRABBOX_COORDINATOR_CANDIDATE_TOKEN", "env-candidate-secret")
 	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "env-admin-secret")
 	t.Setenv("CRABBOX_HOST_ID", "h-neutral-env")
 	t.Setenv("CRABBOX_NETWORK", "public")
@@ -6598,8 +6600,8 @@ func TestEnvOverridesConfig(t *testing.T) {
 	if cfg.Access.ClientID != "env-access-client" || cfg.Access.ClientSecret != "env-access-secret" || cfg.Access.Token != "env-access-jwt" {
 		t.Fatalf("unexpected access config: %#v", cfg.Access)
 	}
-	if cfg.CoordAdminToken != "env-admin-secret" {
-		t.Fatalf("unexpected admin token state: %q", cfg.CoordAdminToken)
+	if cfg.CoordCandidateToken != "env-candidate-secret" || cfg.CoordAdminToken != "env-admin-secret" {
+		t.Fatalf("unexpected coordinator token state: candidate=%q admin=%q", cfg.CoordCandidateToken, cfg.CoordAdminToken)
 	}
 	if cfg.HostID != "h-neutral-env" {
 		t.Fatalf("unexpected host id: %q", cfg.HostID)

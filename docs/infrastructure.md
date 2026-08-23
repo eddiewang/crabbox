@@ -629,6 +629,10 @@ Pick an auth model:
   `crabbox login --url <your-url> --token-stdin`.
 - **Admin token** — set `CRABBOX_ADMIN_TOKEN` for admin routes and image
   promotion.
+- **Image-candidate token** — set `CRABBOX_IMAGE_CANDIDATE_TOKEN` with fixed
+  `CRABBOX_IMAGE_CANDIDATE_OWNER` and `CRABBOX_IMAGE_CANDIDATE_ORG` for the
+  protected AWS Linux or Windows candidate workflow. Keep it distinct from all
+  admin, shared, and runtime tokens.
 
 Recommended limits for a small installation:
 
@@ -701,6 +705,8 @@ DAYTONA_CRABBOX_KEY / CRABBOX_DAYTONA_* (Daytona)
 # Auth
 CRABBOX_SHARED_TOKEN, CRABBOX_SHARED_OWNER
 CRABBOX_ADMIN_TOKEN                       # admin routes + image promotion
+CRABBOX_IMAGE_CANDIDATE_TOKEN             # restricted AWS image-candidate workflow
+CRABBOX_IMAGE_CANDIDATE_OWNER, CRABBOX_IMAGE_CANDIDATE_ORG
 CRABBOX_GITHUB_CLIENT_ID, CRABBOX_GITHUB_CLIENT_SECRET
 CRABBOX_GITHUB_ALLOWED_ORG[S], CRABBOX_GITHUB_ALLOWED_TEAMS (optional)
 CRABBOX_GITHUB_REVOKED_USERS, CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS (optional)
