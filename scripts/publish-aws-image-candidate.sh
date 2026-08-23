@@ -84,15 +84,18 @@ if oras manifest fetch "$tagged_ref" >/dev/null 2>&1; then
   exit 1
 fi
 
-oras push "$tagged_ref" \
-  --artifact-type application/vnd.crabbox.aws-image-evidence.v1 \
-  "$bundle_dir/bundle.json:application/vnd.crabbox.aws-image-evidence-manifest.v1+json" \
-  "$bundle_dir/candidate.json:application/vnd.crabbox.aws-image-candidate.v1+json" \
-  "$bundle_dir/recipe.json:application/json" \
-  "$bundle_dir/sbom.spdx.json:application/spdx+json" \
-  "$bundle_dir/provenance.intoto.jsonl:application/vnd.in-toto+json" \
-  "$bundle_dir/scrub-report.json:application/json" \
-  >/dev/null
+(
+  cd "$bundle_dir"
+  oras push "$tagged_ref" \
+    --artifact-type application/vnd.crabbox.aws-image-evidence.v1 \
+    "bundle.json:application/vnd.crabbox.aws-image-evidence-manifest.v1+json" \
+    "candidate.json:application/vnd.crabbox.aws-image-candidate.v1+json" \
+    "recipe.json:application/json" \
+    "sbom.spdx.json:application/spdx+json" \
+    "provenance.intoto.jsonl:application/vnd.in-toto+json" \
+    "scrub-report.json:application/json" \
+    >/dev/null
+)
 
 oci_digest="$(oras resolve "$tagged_ref")"
 [[ "$oci_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {

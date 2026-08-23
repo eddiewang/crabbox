@@ -162,6 +162,8 @@ test("publisher pushes once, resolves the digest, then keylessly signs and verif
     commands[1],
     /candidate\.json:application\/vnd\.crabbox\.aws-image-candidate/,
   );
+  assert.equal(commands[1].includes(value.bundle), false);
+  assert.doesNotMatch(commands[1], /--disable-path-validation/);
   assert.match(commands[2], /^oras resolve /);
   assert.match(
     commands[3],

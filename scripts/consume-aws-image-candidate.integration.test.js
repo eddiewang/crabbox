@@ -257,6 +257,21 @@ if (args[0] === "sign") {
     console.error("production publisher omitted OCI 1.1 verification flags");
     process.exit(93);
   }
+  if (args[0] === "verify") {
+    const overrides = [
+      ["--certificate-identity", process.env.CRABBOX_TEST_PUBLISH_VERIFY_IDENTITY],
+      ["--certificate-oidc-issuer", process.env.CRABBOX_TEST_PUBLISH_VERIFY_ISSUER],
+    ];
+    for (const [flag, value] of overrides) {
+      if (!value) continue;
+      const index = args.indexOf(flag);
+      if (index < 0 || index + 1 >= args.length) {
+        console.error("production publisher omitted " + flag);
+        process.exit(94);
+      }
+      args[index + 1] = value;
+    }
+  }
   args = [
     args[0],
     ...(args[0] === "verify" ? ["--allow-http-registry"] : []),
@@ -500,11 +515,12 @@ function toolEnv(root, bin, registry, material, extra = {}) {
   };
 }
 
-async function publish(root, bin, registry, repository, material) {
+async function publish(root, bin, registry, repository, material, extraEnv = {}) {
   const candidate = await createBundle(root, repository);
   const cosignLog = path.join(root, `publisher-cosign-${Math.random()}.log`);
   const env = toolEnv(root, bin, registry, material, {
     CRABBOX_TEST_COSIGN_LOG: cosignLog,
+    ...extraEnv,
   });
   const published = await run(
     "bash",
@@ -674,12 +690,15 @@ test(
       ]) {
         const material = await generateMaterial(root, failure.identity, failure.issuer);
         const repository = `ghcr.io/example-org/q1-wrong-${failure.name}`;
-        const value = await publish(root, bin, registry, repository, material);
+        const value = await publish(root, bin, registry, repository, material, {
+          CRABBOX_TEST_PUBLISH_VERIFY_IDENTITY: failure.identity,
+          CRABBOX_TEST_PUBLISH_VERIFY_ISSUER: failure.issuer,
+        });
         const failureOutput = path.join(root, `wrong-${failure.name}.json`);
         const result = await run(
           "bash",
           consumeArgs(value.candidateRef, repository, failureOutput),
-          { env: value.env },
+          { env: toolEnv(root, bin, registry, material) },
         );
         assert.notEqual(result.code, 0);
         assert.match(result.stderr, /expected identities|certificate|issuer|identity/i);
