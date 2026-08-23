@@ -24,6 +24,16 @@ function proxyIdentityRequest(secret?: string): Request {
   });
 }
 
+function imageCandidateLeaseRequest(token: string): Request {
+  return new Request("https://example.test/v1/leases", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "x-crabbox-image-candidate": "true",
+    },
+  });
+}
+
 const allowGitHubMembership = {
   githubMembership: async (): Promise<void> => {},
 };
@@ -63,14 +73,6 @@ describe("coordinator auth", () => {
   });
 
   it("fails closed for unavailable or aliased image candidate credentials", async () => {
-    const request = (token: string) =>
-      new Request("https://example.test/v1/leases", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "x-crabbox-image-candidate": "true",
-        },
-      });
     const cases: Array<{ token: string; env: Partial<Env>; message: string }> = [
       {
         token: "missing-candidate-token",
@@ -134,18 +136,20 @@ describe("coordinator auth", () => {
       },
     ];
 
-    for (const testCase of cases) {
-      const prepared = await prepareCoordinatorRequest(
-        request(testCase.token),
-        testCase.env as Env,
-      );
-      expect(prepared).toMatchObject({ authenticated: false, response: { status: 503 } });
-      if (!("response" in prepared)) throw new Error("invalid candidate auth was accepted");
-      await expect(prepared.response.json()).resolves.toMatchObject({
-        error: "image_candidate_auth_unavailable",
-        message: testCase.message,
-      });
-    }
+    await Promise.all(
+      cases.map(async (testCase) => {
+        const prepared = await prepareCoordinatorRequest(
+          imageCandidateLeaseRequest(testCase.token),
+          testCase.env as Env,
+        );
+        expect(prepared).toMatchObject({ authenticated: false, response: { status: 503 } });
+        if (!("response" in prepared)) throw new Error("invalid candidate auth was accepted");
+        await expect(prepared.response.json()).resolves.toMatchObject({
+          error: "image_candidate_auth_unavailable",
+          message: testCase.message,
+        });
+      }),
+    );
   });
 
   it("limits image candidate credentials to lease, owned run, and exact image routes", async () => {

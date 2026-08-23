@@ -440,7 +440,10 @@ function imageCandidateConfigurationError(
     token !== raw ||
     token.length < 32 ||
     token.length > 4096 ||
-    /[\u0000-\u0020\u007f]/.test(token)
+    Array.from(token).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x20 || codePoint === 0x7f;
+    })
   ) {
     return "CRABBOX_IMAGE_CANDIDATE_TOKEN is invalid";
   }

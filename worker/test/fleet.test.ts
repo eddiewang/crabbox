@@ -35397,7 +35397,7 @@ describe("image candidate authorization", () => {
   };
 
   it("rejects restricted candidate lease selectors before provider acquisition", async () => {
-    const create = vi.fn();
+    const create = vi.fn<(config: LeaseConfig) => void>();
     const fleet = testFleet(new MemoryStorage(), {
       aws: fakeProvider(create, { provider: "aws" }),
     });
@@ -35421,19 +35421,21 @@ describe("image candidate authorization", () => {
       { field: "keep", body: { keep: true } },
     ];
 
-    for (const testCase of cases) {
-      const response = await fleet.fetch(
-        request("POST", "/v1/leases", {
-          headers: candidateHeaders,
-          body: { ...candidateLeaseInput, ...testCase.body },
-        }),
-      );
-      expect(response.status).toBe(403);
-      await expect(response.json()).resolves.toMatchObject({
-        error: "image_candidate_lease_forbidden",
-        fields: expect.arrayContaining([testCase.field]),
-      });
-    }
+    await Promise.all(
+      cases.map(async (testCase) => {
+        const response = await fleet.fetch(
+          request("POST", "/v1/leases", {
+            headers: candidateHeaders,
+            body: { ...candidateLeaseInput, ...testCase.body },
+          }),
+        );
+        expect(response.status).toBe(403);
+        await expect(response.json()).resolves.toMatchObject({
+          error: "image_candidate_lease_forbidden",
+          fields: expect.arrayContaining([testCase.field]),
+        });
+      }),
+    );
     expect(create).not.toHaveBeenCalled();
   });
 
@@ -35447,8 +35449,8 @@ describe("image candidate authorization", () => {
     "rejects candidate $field by presence before provider or storage mutation",
     async ({ field, value }) => {
       const storage = new MemoryStorage();
-      const create = vi.fn();
-      const prepare = vi.fn((config: LeaseConfig) => config);
+      const create = vi.fn<(config: LeaseConfig) => void>();
+      const prepare = vi.fn<(config: LeaseConfig) => LeaseConfig>((config) => config);
       const fleet = testFleet(storage, {
         aws: fakeProvider(create, {
           provider: "aws",
