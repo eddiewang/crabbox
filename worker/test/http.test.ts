@@ -122,6 +122,16 @@ describe("coordinator auth", () => {
         token: imageCandidateToken,
         env: {
           CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
+          CRABBOX_IMAGE_CANDIDATE_OWNER: "publisher@example.com",
+          CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
+          CRABBOX_IMAGE_PROMOTION_TOKEN: imageCandidateToken,
+        },
+        message: "CRABBOX_IMAGE_CANDIDATE_TOKEN must differ from CRABBOX_IMAGE_PROMOTION_TOKEN",
+      },
+      {
+        token: imageCandidateToken,
+        env: {
+          CRABBOX_IMAGE_CANDIDATE_TOKEN: imageCandidateToken,
           CRABBOX_IMAGE_CANDIDATE_ORG: "image-publisher",
         },
         message: "CRABBOX_IMAGE_CANDIDATE_OWNER is not configured",
@@ -1065,17 +1075,24 @@ describe("coordinator auth", () => {
     expect(accepted.request.headers.get("x-crabbox-admin")).toBe("false");
     expect(accepted.request.headers.get("x-crabbox-owner")).toBe("image-promoter");
 
-    const aliased = await prepareCoordinatorRequest(
-      new Request("https://example.test/v1/image-promotions", {
-        method: "POST",
-        headers: { authorization: "Bearer duplicate" },
-      }),
-      {
-        CRABBOX_IMAGE_PROMOTION_TOKEN: "duplicate",
-        CRABBOX_ADMIN_TOKEN: "duplicate",
-      } as Env,
+    const aliased = await Promise.all(
+      [{ CRABBOX_ADMIN_TOKEN: "duplicate" }, { CRABBOX_IMAGE_CANDIDATE_TOKEN: "duplicate" }].map(
+        (alias) =>
+          prepareCoordinatorRequest(
+            new Request("https://example.test/v1/image-promotions", {
+              method: "POST",
+              headers: { authorization: "Bearer duplicate" },
+            }),
+            {
+              CRABBOX_IMAGE_PROMOTION_TOKEN: "duplicate",
+              ...alias,
+            } as Env,
+          ),
+      ),
     );
-    expect(aliased).toMatchObject({ authenticated: false, response: { status: 503 } });
+    for (const prepared of aliased) {
+      expect(prepared).toMatchObject({ authenticated: false, response: { status: 503 } });
+    }
   });
 
   it("keeps shared bearer token non-admin and ignores caller-supplied identity headers", async () => {

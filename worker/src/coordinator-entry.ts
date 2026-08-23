@@ -255,6 +255,7 @@ async function imagePromotionCoordinatorRequest(
     env.CRABBOX_ADMIN_TOKEN,
     env.CRABBOX_SHARED_TOKEN,
     env.CRABBOX_RUNTIME_ADAPTER_TOKEN,
+    env.CRABBOX_IMAGE_CANDIDATE_TOKEN,
   ]
     .map((value) => value?.trim())
     .filter((value): value is string => Boolean(value));
@@ -414,6 +415,7 @@ function imageCandidateServiceAuth(
     | "CRABBOX_ADMIN_TOKEN"
     | "CRABBOX_SHARED_TOKEN"
     | "CRABBOX_RUNTIME_ADAPTER_TOKEN"
+    | "CRABBOX_IMAGE_PROMOTION_TOKEN"
   >,
   route: string[],
 ): AuthContext | Response | undefined {
@@ -468,6 +470,7 @@ function imageCandidateConfigurationError(
     | "CRABBOX_ADMIN_TOKEN"
     | "CRABBOX_SHARED_TOKEN"
     | "CRABBOX_RUNTIME_ADAPTER_TOKEN"
+    | "CRABBOX_IMAGE_PROMOTION_TOKEN"
   >,
 ): string | undefined {
   const raw = env.CRABBOX_IMAGE_CANDIDATE_TOKEN ?? "";
@@ -490,6 +493,7 @@ function imageCandidateConfigurationError(
     ["CRABBOX_ADMIN_TOKEN", env.CRABBOX_ADMIN_TOKEN],
     ["CRABBOX_SHARED_TOKEN", env.CRABBOX_SHARED_TOKEN],
     ["CRABBOX_RUNTIME_ADAPTER_TOKEN", env.CRABBOX_RUNTIME_ADAPTER_TOKEN],
+    ["CRABBOX_IMAGE_PROMOTION_TOKEN", env.CRABBOX_IMAGE_PROMOTION_TOKEN],
   ] as const) {
     if (value && timingSafeEqual(token, value)) {
       return `CRABBOX_IMAGE_CANDIDATE_TOKEN must differ from ${name}`;

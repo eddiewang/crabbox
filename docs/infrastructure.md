@@ -632,7 +632,7 @@ Pick an auth model:
 - **Image-candidate token** — set `CRABBOX_IMAGE_CANDIDATE_TOKEN` with fixed
   `CRABBOX_IMAGE_CANDIDATE_OWNER` and `CRABBOX_IMAGE_CANDIDATE_ORG` for the
   protected AWS Linux or Windows candidate workflow. Keep it distinct from all
-  admin, shared, and runtime tokens.
+  admin, shared, runtime, and image-promotion tokens.
 
 Recommended limits for a small installation:
 
