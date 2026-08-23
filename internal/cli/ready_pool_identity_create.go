@@ -136,7 +136,11 @@ func (a App) readyPoolIdentityCreate(ctx context.Context, args []string) error {
 func validateReadyPoolIdentityProviderLease(provider any, lease CoordinatorLease, expected ReadyPoolIdentityCreateExpected) error {
 	validator, ok := provider.(ReadyPoolIdentityLeaseValidator)
 	if !ok {
-		return nil
+		name := strings.TrimSpace(lease.Provider)
+		if named, namedOK := provider.(interface{ Name() string }); namedOK {
+			name = strings.TrimSpace(named.Name())
+		}
+		return exit(7, "provider=%s does not support verified ready-pool identity creation", blank(name, "unknown"))
 	}
 	return validator.ValidateReadyPoolIdentityCreateLease(lease, expected)
 }

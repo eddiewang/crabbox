@@ -3,6 +3,8 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,8 +31,56 @@ func TestValidateReadyPoolIdentityProviderLeaseRoutesCapability(t *testing.T) {
 	if !called || !errors.Is(err, want) {
 		t.Fatalf("called=%t error=%v", called, err)
 	}
-	if err := validateReadyPoolIdentityProviderLease(struct{}{}, CoordinatorLease{}, ReadyPoolIdentityCreateExpected{}); err != nil {
-		t.Fatalf("optional capability error=%v", err)
+	if err := validateReadyPoolIdentityProviderLease(struct{}{}, CoordinatorLease{Provider: "example"}, ReadyPoolIdentityCreateExpected{}); err == nil || !strings.Contains(err.Error(), "does not support verified") {
+		t.Fatalf("unsupported capability error=%v", err)
+	}
+}
+
+func TestReadyPoolIdentityCreateRejectsProviderWithoutValidationCapability(t *testing.T) {
+	clearConfigEnv(t)
+	root := t.TempDir()
+	isolateRunTestUserDirs(t, root)
+	const leaseID = "cbx_identity_unsupported"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/leases/"+leaseID {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{
+			ID:           leaseID,
+			Provider:     runEnvProfileTestProvider{}.Name(),
+			TargetOS:     targetLinux,
+			Architecture: ArchitectureAMD64,
+			SSHHostKey:   "ssh-ed25519 AAAAauthoritative",
+		}})
+	}))
+	t.Cleanup(server.Close)
+	configPath := filepath.Join(root, ".crabbox.yaml")
+	if err := os.WriteFile(configPath, []byte("coordinator: "+server.URL+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	output := filepath.Join(root, "identity.json")
+	digest := "sha256:" + strings.Repeat("a", 64)
+	err := (App{Stdout: os.Stdout, Stderr: os.Stderr}).readyPoolIdentityCreate(t.Context(), []string{
+		"--id", leaseID,
+		"--repo", "example-org/example",
+		"--ref", "main",
+		"--commit", strings.Repeat("b", 40),
+		"--fingerprint", "setup-v1",
+		"--expected-image", "image-1",
+		"--expected-type", "standard-1",
+		"--expected-architecture", ArchitectureAMD64,
+		"--expected-profile", "linux-builder",
+		"--expected-recipe-digest", digest,
+		"--cache-abi-digest", "sha256:" + strings.Repeat("c", 64),
+		"--output", output,
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support verified ready-pool identity creation") {
+		t.Fatalf("error=%v", err)
+	}
+	if _, statErr := os.Stat(output); !os.IsNotExist(statErr) {
+		t.Fatalf("unsupported provider wrote identity output: %v", statErr)
 	}
 }
 
