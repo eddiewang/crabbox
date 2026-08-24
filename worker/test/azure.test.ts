@@ -1093,7 +1093,7 @@ describe("azure provider", () => {
   });
 
   it("claims, deletes, and clears an exact VM-less Azure NIC and public IP set", async () => {
-    const { records, storage } = memoryAzureDeleteClaimStorage();
+    const { putKeys, records, storage } = memoryAzureDeleteClaimStorage();
     const writtenClaims: unknown[] = [];
     const put = storage.put;
     storage.put = async (key, value) => {
@@ -1149,14 +1149,142 @@ describe("azure provider", () => {
 
     await expect(client.deleteOwnedServer(ownedAzureLease())).resolves.toBeUndefined();
     expect(deletes).toEqual([nicID, pipID]);
-    expect(writtenClaims).toContainEqual(
-      expect.objectContaining({
-        version: 2,
-        stableResourceIdentity: expect.stringContaining("nic-immutable-id"),
-      }),
+    expect([...new Set(putKeys)].map((key) => key.split(":").map(decodeURIComponent))).toEqual([
+      [
+        "provider:azure:delete-claim",
+        ownedAzureLease().providerScope,
+        ownedAzureLease().cloudID,
+        ownedAzureLease().id,
+      ],
+    ]);
+    const preparedClaim = writtenClaims.find(
+      (claim): claim is { stableResourceIdentity: string } =>
+        typeof claim === "object" &&
+        claim !== null &&
+        "stableResourceIdentity" in claim &&
+        typeof claim.stableResourceIdentity === "string",
     );
-    expect(JSON.stringify(writtenClaims)).toContain("pip-immutable-id");
+    expect(preparedClaim).toMatchObject({
+      version: 2,
+      provider: "azure",
+      leaseID: ownedAzureLease().id,
+      slug: ownedAzureLease().slug,
+      owner: ownedAzureLease().owner,
+      cloudID: ownedAzureLease().cloudID,
+      providerScope: ownedAzureLease().providerScope,
+    });
+    expect(preparedClaim).not.toHaveProperty("disk");
+    expect(JSON.parse(preparedClaim!.stableResourceIdentity)).toEqual([
+      expect.objectContaining({
+        kind: "networkInterfaces",
+        id: nicID.toLowerCase(),
+        immutableID: "nic-immutable-id",
+      }),
+      expect.objectContaining({
+        kind: "publicIPAddresses",
+        id: pipID.toLowerCase(),
+        immutableID: "pip-immutable-id",
+      }),
+    ]);
     expect(records.size).toBe(0);
+  });
+
+  it.each([
+    {
+      scenario: "a missing NIC",
+      missing: "nic",
+      expectedError: "canonical companion set is incomplete",
+    },
+    {
+      scenario: "a missing public IP",
+      missing: "pip",
+      expectedError: "NIC references an unexpected public IP",
+    },
+    {
+      scenario: "a public IP owned by another lease",
+      foreignPublicIP: true,
+      expectedError: "ownership does not match lease",
+    },
+    {
+      scenario: "a NIC attached to another VM",
+      foreignVMAttachment: true,
+      expectedError: "NIC is attached to an unexpected VM",
+    },
+    {
+      scenario: "a same-name public IP replacement after the claim is written",
+      replacePublicIPAfterClaim: true,
+      expectedError: "observed resource identity changed",
+    },
+  ])("refuses VM-less Azure cleanup with $scenario", async (testCase) => {
+    const { records, storage } = memoryAzureDeleteClaimStorage();
+    let publicIPIdentity = "pip-immutable-id";
+    if (testCase.replacePublicIPAfterClaim) {
+      const put = storage.put;
+      storage.put = async (key, value) => {
+        await put(key, value);
+        if (typeof value === "object" && value !== null && "stableResourceIdentity" in value) {
+          publicIPIdentity = "replacement-pip-immutable-id";
+        }
+      };
+    }
+    const client = new AzureClient(baseEnv, { ownedDeleteClaimStorage: storage });
+    seedAzureAuthCache(client);
+    const deletes: string[] = [];
+    const resourcePrefix = "/subscriptions/sub/resourceGroups/crabbox-leases/providers";
+    const nicID = `${resourcePrefix}/Microsoft.Network/networkInterfaces/crabbox-blue-lobster-nic`;
+    const pipID = `${resourcePrefix}/Microsoft.Network/publicIPAddresses/crabbox-blue-lobster-pip`;
+    client.fetcher = async (input, init) => {
+      const url = new URL(String(input));
+      if (init?.method === "DELETE") {
+        deletes.push(url.pathname);
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === nicID && testCase.missing !== "nic") {
+        return Response.json({
+          id: nicID,
+          name: "crabbox-blue-lobster-nic",
+          location: "eastus",
+          tags: ownedAzureTags(),
+          properties: {
+            resourceGuid: "nic-immutable-id",
+            ...(testCase.foreignVMAttachment
+              ? {
+                  virtualMachine: {
+                    id: `${resourcePrefix}/Microsoft.Compute/virtualMachines/crabbox-other`,
+                  },
+                }
+              : {}),
+            ipConfigurations: [
+              {
+                id: `${nicID}/ipConfigurations/ipconfig`,
+                properties: { publicIPAddress: { id: pipID } },
+              },
+            ],
+          },
+        });
+      }
+      if (url.pathname === pipID && testCase.missing !== "pip") {
+        return Response.json({
+          id: pipID,
+          name: "crabbox-blue-lobster-pip",
+          location: "eastus",
+          tags: ownedAzureTags(testCase.foreignPublicIP ? { lease: "cbx_987654321abc" } : {}),
+          properties: {
+            resourceGuid: publicIPIdentity,
+            ...(testCase.missing === "nic"
+              ? {}
+              : { ipConfiguration: { id: `${nicID}/ipConfigurations/ipconfig` } }),
+          },
+        });
+      }
+      return azureResourceNotFoundResponse(url);
+    };
+
+    await expect(client.deleteOwnedServer(ownedAzureLease())).rejects.toThrow(
+      testCase.expectedError,
+    );
+    expect(deletes).toEqual([]);
+    expect(records.size).toBe(1);
   });
 
   it("releases a VM with an ephemeral OS disk and no managed disk resource", async () => {
@@ -4025,6 +4153,10 @@ describe("azure provider", () => {
     const deleted: string[] = [];
     const vmSizes: string[] = [];
     const vmNames: string[] = [];
+    let firstAttemptClearedBeforeNextNetwork = false;
+    const resourcePrefix = "/subscriptions/sub/resourceGroups/crabbox-leases/providers";
+    const unrelatedNIC = `${resourcePrefix}/Microsoft.Network/networkInterfaces/crabbox-unrelated-nic`;
+    resources.set(unrelatedNIC, { id: unrelatedNIC, name: "crabbox-unrelated-nic" });
     client.fetcher = async (input, init) => {
       const url = new URL(String(input));
       const path = url.pathname;
@@ -4048,6 +4180,16 @@ describe("azure provider", () => {
       if (init?.method === "PUT") {
         const body = JSON.parse(String(init.body)) as Record<string, unknown>;
         const name = path.split("/").pop() ?? "";
+        if (path.includes("/publicIPAddresses/") && vmNames.length === 1) {
+          const firstName = vmNames[0]!;
+          const firstNIC = `${resourcePrefix}/Microsoft.Network/networkInterfaces/${firstName}-nic`;
+          const firstPIP = `${resourcePrefix}/Microsoft.Network/publicIPAddresses/${firstName}-pip`;
+          firstAttemptClearedBeforeNextNetwork =
+            !resources.has(firstNIC) &&
+            !resources.has(firstPIP) &&
+            records.size === 0 &&
+            deleted.length === 2;
+        }
         if (path.includes("/virtualMachines/")) {
           const properties = body["properties"] as {
             hardwareProfile?: { vmSize?: string };
@@ -4096,21 +4238,30 @@ describe("azure provider", () => {
 
     expect(vmSizes.slice(0, 2)).toEqual(["Standard_D32ads_v6", "Standard_D32ds_v6"]);
     expect(result.serverType).toBe("Standard_D32ds_v6");
+    expect(result.attempts?.[0]).toMatchObject({
+      serverType: "Standard_D32ads_v6",
+      category: "capacity",
+    });
+    expect(firstAttemptClearedBeforeNextNetwork).toBe(true);
     const [firstName, secondName] = vmNames as [string, string];
-    const prefix = "/subscriptions/sub/resourceGroups/crabbox-leases/providers";
-    const firstNIC = `${prefix}/Microsoft.Network/networkInterfaces/${firstName}-nic`;
-    const firstPIP = `${prefix}/Microsoft.Network/publicIPAddresses/${firstName}-pip`;
-    const secondNIC = `${prefix}/Microsoft.Network/networkInterfaces/${secondName}-nic`;
-    const secondPIP = `${prefix}/Microsoft.Network/publicIPAddresses/${secondName}-pip`;
-    const secondVM = `${prefix}/Microsoft.Compute/virtualMachines/${secondName}`;
+    const firstNIC = `${resourcePrefix}/Microsoft.Network/networkInterfaces/${firstName}-nic`;
+    const firstPIP = `${resourcePrefix}/Microsoft.Network/publicIPAddresses/${firstName}-pip`;
+    const secondNIC = `${resourcePrefix}/Microsoft.Network/networkInterfaces/${secondName}-nic`;
+    const secondPIP = `${resourcePrefix}/Microsoft.Network/publicIPAddresses/${secondName}-pip`;
+    const secondVM = `${resourcePrefix}/Microsoft.Compute/virtualMachines/${secondName}`;
     expect(deleted).toEqual([firstNIC, firstPIP]);
     expect(resources.has(firstNIC)).toBe(false);
     expect(resources.has(firstPIP)).toBe(false);
-    expect(resources.has(`${prefix}/Microsoft.Compute/virtualMachines/${firstName}`)).toBe(false);
-    expect(resources.has(`${prefix}/Microsoft.Compute/disks/${firstName}-osdisk`)).toBe(false);
+    expect(resources.has(`${resourcePrefix}/Microsoft.Compute/virtualMachines/${firstName}`)).toBe(
+      false,
+    );
+    expect(resources.has(`${resourcePrefix}/Microsoft.Compute/disks/${firstName}-osdisk`)).toBe(
+      false,
+    );
     expect(resources.has(secondNIC)).toBe(true);
     expect(resources.has(secondPIP)).toBe(true);
     expect(resources.has(secondVM)).toBe(true);
+    expect(resources.has(unrelatedNIC)).toBe(true);
     expect(result.server.cloudID).toBe(secondName);
     expect(records.size).toBe(0);
   });
