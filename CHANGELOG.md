@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.48.2 (Unreleased)
+
+### Fixed
+
+- Bound typed ready-pool capacity to canonical provider identities, migrated desired state to fixed-size v2 keys without legacy-reader exposure, and routed returns to fail-closed drain cleanup when provider or lease identity evidence changes.
+
 ## 0.48.1 - 2026-09-01
 
 ### Changes
