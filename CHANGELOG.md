@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- Kept local-container bootstrap mounts under the user cache directory so Colima and other desktop Docker VMs can read the script and publish the SSH port.
 - Required exact host/project-scoped Semaphore job ownership claims and fresh provider verification before stopping jobs.
 - Required exact API-scoped Morph instance ownership claims and fresh provider verification before pause or deletion.
 - Returned machine-readable missing checkpoint verdicts and made checkpoint deletion idempotent when local records or coordinator-owned resources are already absent.

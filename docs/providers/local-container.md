@@ -233,7 +233,9 @@ metadata updates.
 ## Lease behavior
 
 1. `warmup` or a fresh `run` creates a per-lease SSH key.
-2. The provider runs `docker run -d` with Crabbox labels, loopback SSH port
+2. The provider writes its bootstrap script under the user's cache directory,
+   which desktop Docker runtimes share with their Linux VM, then runs
+   `docker run -d` with Crabbox labels, loopback SSH port
    publishing, and the public-key auth environment the bootstrap script needs.
 3. On Debian/Ubuntu-compatible images, the container installs
    `openssh-server`, `git`, `rsync`, `curl`, and `sudo` when they are missing,

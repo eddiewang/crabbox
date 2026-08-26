@@ -1907,12 +1907,16 @@ func TestCreateContainerUsesDockerCompatibleSSHLease(t *testing.T) {
 	cfg := b.configForRun()
 	runner.responses[commandKey([]string{"run"})] = core.LocalCommandResult{Stdout: "container123456\n"}
 
-	id, _, err := b.createContainer(context.Background(), cfg, "crabbox-blue", "cbx_123", "blue-lobster", "ssh-ed25519 AAAA test", true)
+	id, bootstrapDir, err := b.createContainer(context.Background(), cfg, "crabbox-blue", "cbx_123", "blue-lobster", "ssh-ed25519 AAAA test", true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(bootstrapDir) })
 	if id != "container123456" {
 		t.Fatalf("id=%q", id)
+	}
+	if parent := filepath.Dir(bootstrapDir); parent != localContainerBootstrapRoot() {
+		t.Fatalf("bootstrap parent=%q want %q", parent, localContainerBootstrapRoot())
 	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("calls=%d", len(runner.calls))
@@ -5270,22 +5274,37 @@ func TestHostLeaseWorkRootRequiresTrustedLabels(t *testing.T) {
 }
 
 func TestTrustedBootstrapDir(t *testing.T) {
-	tmpDir := os.TempDir()
-	good := filepath.Join(tmpDir, "crabbox-bootstrap-abc123")
-	if !trustedBootstrapDir(good) {
-		t.Fatalf("should trust %q", good)
+	trusted := []string{
+		filepath.Join(localContainerBootstrapRoot(), "crabbox-bootstrap-abc123"),
+		filepath.Join(os.TempDir(), "crabbox-bootstrap-legacy"),
+	}
+	for _, good := range trusted {
+		if !trustedBootstrapDir(good) {
+			t.Fatalf("should trust %q", good)
+		}
 	}
 	for _, bad := range []string{
 		"",
 		"crabbox-bootstrap-abc123",
-		filepath.Join(tmpDir, "not-crabbox-dir"),
-		filepath.Join(tmpDir, "crabbox-bootstrap-abc123", ".."),
+		filepath.Join(localContainerBootstrapRoot(), "not-crabbox-dir"),
+		filepath.Join(localContainerBootstrapRoot(), "crabbox-bootstrap-abc123", ".."),
 		filepath.Join("/some/other/path", "crabbox-bootstrap-abc123"),
 		"/etc/passwd",
 	} {
 		if trustedBootstrapDir(bad) {
 			t.Fatalf("should reject %q", bad)
 		}
+	}
+}
+
+func TestLocalContainerBootstrapRootUsesUserCache(t *testing.T) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		t.Skip("user cache directory unavailable")
+	}
+	want := filepath.Join(cacheDir, "crabbox", "local-container-bootstrap")
+	if got := localContainerBootstrapRoot(); got != want {
+		t.Fatalf("bootstrap root=%q want %q", got, want)
 	}
 }
 

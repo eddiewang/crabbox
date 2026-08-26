@@ -1837,7 +1837,11 @@ func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.C
 	for _, vol := range cfg.LocalContainer.Volumes {
 		args = append(args, "-v", vol)
 	}
-	bootstrapDir, err := os.MkdirTemp("", "crabbox-bootstrap-*")
+	bootstrapRoot := localContainerBootstrapRoot()
+	if err := os.MkdirAll(bootstrapRoot, 0o700); err != nil {
+		return "", "", core.Exit(2, "create local-container bootstrap root %s: %v", bootstrapRoot, err)
+	}
+	bootstrapDir, err := os.MkdirTemp(bootstrapRoot, "crabbox-bootstrap-*")
 	if err != nil {
 		return "", "", core.Exit(2, "create bootstrap script directory: %v", err)
 	}
@@ -2707,7 +2711,16 @@ func trustedBootstrapDir(dir string) bool {
 		return false
 	}
 	parent := filepath.Dir(dir)
-	return parent == filepath.Clean(os.TempDir())
+	return parent == filepath.Clean(localContainerBootstrapRoot()) || parent == filepath.Clean(os.TempDir())
+}
+
+func localContainerBootstrapRoot() string {
+	if cache, err := os.UserCacheDir(); err == nil && strings.TrimSpace(cache) != "" {
+		// Desktop Docker runtimes share the user directory, but not necessarily
+		// the host's system temp directory, into their Linux VM.
+		return filepath.Join(cache, "crabbox", "local-container-bootstrap")
+	}
+	return os.TempDir()
 }
 
 func trustedLocalContainerWorkRoot(root string) bool {
