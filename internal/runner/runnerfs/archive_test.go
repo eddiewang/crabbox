@@ -428,7 +428,41 @@ func testCopyArchive(t *testing.T, header tar.Header, body string) []byte {
 }
 
 func TestArchivePathSeparator(t *testing.T) {
-	if hasTrailingPathSeparator(`build\`) {
-		t.Fatal("backslash is a literal POSIX filename byte")
+	if got := hasTrailingPathSeparator(`build\`); got != (runtime.GOOS == "windows") {
+		t.Fatalf("native backslash semantics: got=%v", got)
+	}
+}
+
+func TestCreateArchiveExcludesItsOutputFromSource(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
+	writeFixture(t, filepath.Join(dir, "source.txt"), "source bytes")
+	_, archive, err := CreateArchive(t.Context(), dir, CreateOptions{}, DefaultArchiveLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(archive.Name())
+	defer archive.Close()
+	gz, err := gzip.NewReader(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	reader := tar.NewReader(gz)
+	var names []string
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, header.Name)
+	}
+	if len(names) != 2 || names[0] != "payload" || names[1] != "payload/source.txt" {
+		t.Fatalf("archive included generated output: %v", names)
 	}
 }

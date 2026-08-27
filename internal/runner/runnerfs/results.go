@@ -107,7 +107,8 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 	if !options.Auto {
 		return result, nil
 	}
-	candidates, err := r.resultCandidates(ctx, options.After, identities)
+	candidates, warnings, err := r.resultCandidates(ctx, options.After, identities)
+	result.Warnings = append(result.Warnings, warnings...)
 	if err != nil {
 		return result, err
 	}
@@ -153,8 +154,9 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 	return result, nil
 }
 
-func (r *Root) resultCandidates(ctx context.Context, after time.Time, excluded []os.FileInfo) ([]resultCandidate, error) {
+func (r *Root) resultCandidates(ctx context.Context, after time.Time, excluded []os.FileInfo) ([]resultCandidate, []Warning, error) {
 	var passing, failing []resultCandidate
+	var warnings []Warning
 	err := r.walkDirectory(ctx, ".", func(name string, entry fs.DirEntry) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -186,8 +188,20 @@ func (r *Root) resultCandidates(ctx context.Context, after time.Time, excluded [
 				return nil
 			}
 		}
-		data, err := io.ReadAll(io.LimitReader(file, AutoFailureBytes))
+		sniffBytes := int64(AutoFailureBytes)
+		if info.Size() > AutoMaxFileBytes {
+			sniffBytes = AutoSniffBytes
+		}
+		data, err := io.ReadAll(io.LimitReader(file, sniffBytes))
 		if err != nil || !bytes.Contains(data[:min(len(data), AutoSniffBytes)], []byte("<testsuite")) {
+			return nil
+		}
+		if info.Size() > AutoMaxFileBytes {
+			// Rejected files must not consume eligible report slots. Bound their
+			// diagnostics independently of the candidate list.
+			if len(warnings) < AutoMaxFiles {
+				warnings = append(warnings, Warning{name, fmt.Sprintf("report exceeds %d-byte per-file limit", AutoMaxFileBytes)})
+			}
 			return nil
 		}
 		candidate := resultCandidate{name: name, failed: containsJUnitFailure(data), identity: info}
@@ -211,7 +225,7 @@ func (r *Root) resultCandidates(ctx context.Context, after time.Time, excluded [
 		}
 		return nil
 	})
-	return append(failing, passing...), err
+	return append(failing, passing...), warnings, err
 }
 
 // Retain only the earliest candidates in each priority class while still

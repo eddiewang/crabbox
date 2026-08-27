@@ -154,7 +154,8 @@ func TestWindowsBootstrapTransfersLargeBinaryInput(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", install.Command)
+	// Windows PowerShell launched from pwsh can lack the Get-FileHash module.
+	command := exec.CommandContext(ctx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "function Get-FileHash { throw 'hash module unavailable' };\n"+install.Command)
 	if runtime.GOOS != "windows" {
 		tarPath, err := exec.LookPath("tar")
 		if err != nil {

@@ -89,7 +89,7 @@ func CreateArchive(ctx context.Context, sourcePath string, options CreateOptions
 	if err := limits.validate(); err != nil {
 		return ArchiveSource{}, nil, err
 	}
-	trimmedSource := strings.TrimRight(sourcePath, "/")
+	trimmedSource := strings.TrimRight(filepath.ToSlash(sourcePath), "/")
 	if trimmedSource != "" {
 		lastComponent := trimmedSource
 		if index := strings.LastIndexByte(trimmedSource, '/'); index >= 0 {
@@ -131,6 +131,10 @@ func CreateArchive(ctx context.Context, sourcePath string, options CreateOptions
 			_ = os.Remove(name)
 		}
 	}()
+	outputIdentity, err := archive.Stat()
+	if err != nil {
+		return ArchiveSource{}, nil, fmt.Errorf("stat copy archive output: %w", err)
+	}
 	gz := gzip.NewWriter(&archiveBoundedWriter{writer: archive, remaining: limits.MaxCompressedBytes, limit: limits.MaxCompressedBytes})
 	tw := tar.NewWriter(gz)
 	rootPath := filepath.Dir(abs)
@@ -152,7 +156,7 @@ func CreateArchive(ctx context.Context, sourcePath string, options CreateOptions
 		_ = gz.Close()
 		return ArchiveSource{}, nil, invalid("copy source changed before it could be archived")
 	}
-	state := &copyArchiveCreateState{ctx: ctx, writer: tw, limits: limits, options: options}
+	state := &copyArchiveCreateState{ctx: ctx, writer: tw, limits: limits, options: options, outputIdentity: outputIdentity}
 	appendErr := state.append(root, rootRelative, ArchivePayloadRoot)
 	closeRootErr := root.Close()
 	if appendErr != nil {
@@ -185,13 +189,14 @@ func CreateArchive(ctx context.Context, sourcePath string, options CreateOptions
 }
 
 type copyArchiveCreateState struct {
-	ctx        context.Context
-	writer     *tar.Writer
-	limits     ArchiveLimits
-	options    CreateOptions
-	entries    int
-	totalBytes int64
-	activeDirs []os.FileInfo
+	ctx            context.Context
+	writer         *tar.Writer
+	limits         ArchiveLimits
+	options        CreateOptions
+	entries        int
+	totalBytes     int64
+	activeDirs     []os.FileInfo
+	outputIdentity os.FileInfo
 }
 
 func (s *copyArchiveCreateState) append(root *os.Root, name, archiveName string) error {
@@ -201,6 +206,11 @@ func (s *copyArchiveCreateState) append(root *os.Root, name, archiveName string)
 	info, err := root.Lstat(name)
 	if err != nil {
 		return invalid("read copy source %s: %v", archiveName, err)
+	}
+	// The temporary directory can itself be the source. Exclude only this
+	// archive's native identity, including aliases reached while following links.
+	if s.outputIdentity != nil && os.SameFile(info, s.outputIdentity) {
+		return nil
 	}
 	linkName := ""
 	if info.Mode()&os.ModeSymlink != 0 {
@@ -303,7 +313,7 @@ func (s *copyArchiveCreateState) append(root *os.Root, name, archiveName string)
 }
 
 func hasTrailingPathSeparator(value string) bool {
-	return strings.HasSuffix(value, "/")
+	return len(value) > 0 && os.IsPathSeparator(value[len(value)-1])
 }
 
 // DownloadSource derives publication semantics from the caller's POSIX path,

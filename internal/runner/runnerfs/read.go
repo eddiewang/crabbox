@@ -120,8 +120,10 @@ func (r *Root) open(name string) (*os.File, error) {
 	// Windows cleans parent components before os.Root opens them. Resolve those
 	// paths physically first so relative and absolute report aliases agree.
 	physicalParent := false
-	for _, component := range strings.Split(filepath.ToSlash(rel), "/") {
-		physicalParent = physicalParent || component == ".."
+	if filepath.Separator == '\\' {
+		for _, component := range strings.Split(filepath.ToSlash(rel), "/") {
+			physicalParent = physicalParent || component == ".."
+		}
 	}
 	if filepath.IsLocal(rel) && !physicalParent {
 		file, err := r.root.OpenFile(rel, os.O_RDONLY|nonblockingOpen, 0)

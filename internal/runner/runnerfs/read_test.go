@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -95,6 +96,33 @@ func TestReadKeepsAnchoredRootAfterRename(t *testing.T) {
 	file, err = root.Read("report", 64)
 	if err != nil || string(file.Data) != "ORIGINAL" {
 		t.Fatalf("followed replaced root: %+v %v", file, err)
+	}
+}
+
+func TestReadParentComponentsKeepRenamedPOSIXRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows parent components require physical path resolution")
+	}
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "root")
+	writeFixture(t, filepath.Join(dir, "sub", "placeholder"), "")
+	writeFixture(t, filepath.Join(dir, "report"), "ORIGINAL")
+	root, err := OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.Rename(dir, filepath.Join(parent, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	file, err := root.Read("sub/../report", 64)
+	if err != nil || string(file.Data) != "ORIGINAL" {
+		t.Fatalf("lost anchored parent read: data=%q err=%v", file.Data, err)
+	}
+	writeFixture(t, filepath.Join(dir, "report"), "REPLACEMENT")
+	file, err = root.Read("sub/../report", 64)
+	if err != nil || string(file.Data) != "ORIGINAL" {
+		t.Fatalf("followed replacement: data=%q err=%v", file.Data, err)
 	}
 }
 

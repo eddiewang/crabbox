@@ -31,9 +31,10 @@ func TestWindowsRootedAndDriveRelativePaths(t *testing.T) {
 			t.Fatalf("root %q: data=%q err=%v", name, file.Data, readErr)
 		}
 		destination, err := ArchiveTarget(name+`\destination`, "payload", false)
-		if err != nil || destination != filepath.Join(target, "destination") {
-			t.Fatalf("target %q resolved=%q err=%v", name, destination, err)
+		if err != nil {
+			t.Fatal(err)
 		}
+		assertWindowsArchiveParent(t, destination, target)
 	}
 }
 
@@ -78,8 +79,53 @@ func TestWindowsRootRelativeSymlinkKeepsAbsoluteIdentity(t *testing.T) {
 			t.Fatalf("root-relative link %q: data=%q err=%v", name, file.Data, readErr)
 		}
 		destination, err := ArchiveTarget(name+`\destination`, "payload", false)
-		if err != nil || destination != filepath.Join(target, "destination") {
-			t.Fatalf("destination=%q err=%v", destination, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertWindowsArchiveParent(t, destination, target)
+	}
+}
+
+func assertWindowsArchiveParent(t *testing.T, destination, parent string) {
+	t.Helper()
+	if !filepath.IsAbs(destination) || filepath.Base(destination) != "destination" {
+		t.Fatalf("destination is not an absolute selected leaf: %q", destination)
+	}
+	actual, err := os.Stat(filepath.Dir(destination))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.Stat(parent)
+	if err != nil || !os.SameFile(actual, want) {
+		t.Fatalf("destination parent identity differs: %q versus %q, err=%v", destination, parent, err)
+	}
+}
+
+func TestWindowsArchiveTrailingBackslashIntent(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, filepath.Join(dir, "file.txt"), "source")
+	source, archive, err := CreateArchive(t.Context(), dir+`\`, CreateOptions{}, DefaultArchiveLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(archive.Name())
+	defer archive.Close()
+	if !source.ContentsOnly {
+		t.Fatal("native trailing separator lost contents-only intent")
+	}
+	target, err := ArchiveTarget(filepath.Join(dir, "new-directory")+`\`, "destination", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertWindowsArchiveParent(t, target, filepath.Join(dir, "new-directory"))
+	for _, name := range []string{dir + `\.`, dir + `\..`, filepath.Join(dir, "file.txt") + `\`} {
+		_, invalidArchive, err := CreateArchive(t.Context(), name, CreateOptions{}, DefaultArchiveLimits())
+		if invalidArchive != nil {
+			invalidArchive.Close()
+			os.Remove(invalidArchive.Name())
+		}
+		if err == nil {
+			t.Fatalf("accepted invalid trailing component: %q", name)
 		}
 	}
 }

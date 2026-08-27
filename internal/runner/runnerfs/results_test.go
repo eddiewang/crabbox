@@ -188,6 +188,26 @@ func TestAutoResultsDeduplicateBeforeCandidateLimit(t *testing.T) {
 	}
 }
 
+func TestAutoResultsOversizedFilesDoNotConsumeCandidateSlots(t *testing.T) {
+	for _, body := range []string{"<testsuite/>", "<testsuite><failure/></testsuite>"} {
+		t.Run(body, func(t *testing.T) {
+			root, dir := testRoot(t)
+			for index := range AutoMaxFiles {
+				name := filepath.Join(dir, fmt.Sprintf("junit-%03d.xml", index))
+				writeFixture(t, name, body)
+				if err := os.Truncate(name, AutoMaxFileBytes+1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeFixture(t, filepath.Join(dir, "junit-zzz.xml"), body)
+			result, err := root.CollectResults(t.Context(), ResultOptions{Auto: true})
+			if err != nil || len(result.Files) != 1 || result.Files[0].Path != "junit-zzz.xml" || len(result.Warnings) != AutoMaxFiles {
+				t.Fatalf("files=%d warnings=%d err=%v", len(result.Files), len(result.Warnings), err)
+			}
+		})
+	}
+}
+
 func TestAutoResultsNeverFollowSymlinkCandidates(t *testing.T) {
 	root, dir := testRoot(t)
 	outside := filepath.Join(t.TempDir(), "outside.xml")

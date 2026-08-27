@@ -123,19 +123,25 @@ $stage=Join-Path $dir ([Guid]::NewGuid().ToString('N')+'.install')
 if (Test-Path -LiteralPath $stage) { throw 'runner staging collision' }
 [System.IO.Directory]::CreateDirectory($stage) | Out-Null
 $temp=Join-Path $stage 'runner.exe'
+function Get-CrabboxRunnerHash([string]$Name) {
+  $file=[IO.File]::OpenRead($Name)
+  $hash=[Security.Cryptography.SHA256]::Create()
+  try { return [BitConverter]::ToString($hash.ComputeHash($file)).Replace('-','').ToLowerInvariant() }
+  finally { $hash.Dispose(); $file.Dispose() }
+}
 try {
   & tar.exe -xf - -C $stage runner.exe
   if ($LASTEXITCODE -ne 0) { throw 'runner bootstrap transfer failed' }
   if ((Get-Item -LiteralPath $temp).Length -ne [Int64]` + strconv.Itoa(len(artifact.Data)) + `) { throw 'runner artifact size mismatch' }
-  if ((Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant() -ne '` + artifact.SHA256 + `') { throw 'runner digest mismatch' }
+  if ((Get-CrabboxRunnerHash $temp) -ne '` + artifact.SHA256 + `') { throw 'runner digest mismatch' }
   $file=[IO.File]::Open($temp,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
   try { $file.Flush($true) } finally { $file.Dispose() }
   if (Test-Path -LiteralPath $path) {
-    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '` + artifact.SHA256 + `') { throw 'existing runner digest mismatch' }
+    if ((Get-CrabboxRunnerHash $path) -ne '` + artifact.SHA256 + `') { throw 'existing runner digest mismatch' }
   } else {
     try { [System.IO.File]::Move($temp,$path) }
     catch {
-      if (-not (Test-Path -LiteralPath $path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '` + artifact.SHA256 + `') { throw }
+      if (-not (Test-Path -LiteralPath $path) -or (Get-CrabboxRunnerHash $path) -ne '` + artifact.SHA256 + `') { throw }
     }
   }
 } finally { if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue } }
