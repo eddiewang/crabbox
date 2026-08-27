@@ -476,11 +476,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	defer func() {
 		recorder.Failed(runFailure)
 	}()
-	defer func() {
-		if finalizeTerminalRun != nil {
-			finalizeTerminalRun()
-		}
-	}()
 	var finalTimingReport *timingReport
 	var artifactChangeResults []ArtifactChangeResult
 	var timingRecordRepo Repo
@@ -495,7 +490,14 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		report := *finalTimingReport
 		report.ArtifactChanges = artifactChangeResults
 		cleanup.apply(&report)
-		includeObservedRunnerTail(&report, runnerObservedStartedAt, time.Now())
+		if report.SyncDelegated {
+			if ms := time.Since(runnerObservedStartedAt).Milliseconds(); ms > 0 {
+				report.RunnerTotalMs += ms
+				report.RunnerPhases = append(report.RunnerPhases, RunnerPhase{Name: "unattributed", Ms: ms})
+			}
+		} else {
+			includeObservedRunnerTail(&report, runnerObservedStartedAt, time.Now())
+		}
 		report = finalizeTimingReport(report)
 		if timingRecordEnabled {
 			recordColdRun := timingRecordColdRun
@@ -527,6 +529,11 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	defer func() {
 		if finalizeFailureDigest != nil {
 			finalizeFailureDigest()
+		}
+	}()
+	defer func() {
+		if finalizeTerminalRun != nil {
+			finalizeTerminalRun()
 		}
 	}()
 	command := fs.Args()
@@ -994,6 +1001,17 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 		runnerObservedStartedAt = time.Now()
 		result, runErr := delegated.Run(ctx, runReq)
+		providerObservedEndedAt := time.Now()
+		if timingRecordEnabled || *timingJSON {
+			report := timingReportFromDelegatedRunResult(runReq, result, backend.Spec().Name, runErr)
+			if delegatedTimingCapture != nil && delegatedTimingCapture.report != nil {
+				report = *delegatedTimingCapture.report
+			}
+			includeObservedRunnerTail(&report, runnerObservedStartedAt, providerObservedEndedAt)
+			report = finalizeTimingReport(report)
+			finalTimingReport = &report
+		}
+		runnerObservedStartedAt = providerObservedEndedAt
 		if runErr == nil || result.Command > 0 || result.Total > 0 {
 			a.syncExternalRunnersBestEffort(ctx, cfg, backend)
 		}
@@ -1030,13 +1048,8 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			coldRun := !result.Session.Reused
 			timingRecordColdRun = &coldRun
 		}
-		if timingRecordEnabled || *timingJSON {
-			report := timingReportFromDelegatedRunResult(runReq, result, backend.Spec().Name, runErr)
-			if delegatedTimingCapture != nil && delegatedTimingCapture.report != nil {
-				report = *delegatedTimingCapture.report
-			}
-			report.Artifacts = result.Artifacts
-			finalTimingReport = &report
+		if finalTimingReport != nil {
+			finalTimingReport.Artifacts = result.Artifacts
 		}
 		return runErr
 	}
@@ -2445,6 +2458,14 @@ afterSync:
 	}
 	var artifactFailure error
 	var schemaValidationResults []SchemaValidationResult
+	var runArtifacts []runArtifact
+	snapshotTimingReport := func(total time.Duration, exitCode int, artifacts []runArtifact) timingReport {
+		report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, exitCode, actionsURL)
+		populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, artifacts)
+		report.Label, report.SchemaValidations = runLabelValue, schemaValidationResults
+		report.ArtifactChanges = artifactChangeResults
+		return report
+	}
 	var afterArtifacts []artifactChangeSnapshot
 	if len(requiredArtifactChanges) > 0 && code == 0 && (streamErr != nil || ctx.Err() != nil) {
 		return recordFailure(errors.Join(streamErr, ctx.Err()))
@@ -2487,6 +2508,8 @@ afterSync:
 			bytes, local, err := downloadRemoteFile(ctx, target, workdir, spec)
 			if err != nil {
 				finishArtifactTiming()
+				report := snapshotTimingReport(time.Since(timings.started), exitCodeForError(err, 7), runArtifacts)
+				finalTimingReport = &report
 				return recordFailure(err)
 			}
 			timings.artifactTransferCount++
@@ -2494,13 +2517,17 @@ afterSync:
 			fmt.Fprintf(a.Stderr, "downloaded %s bytes=%d\n", local, bytes)
 		}
 	}
-	var runArtifacts []runArtifact
 	if code == 0 && streamErr == nil && len(requiredArtifactChanges) > 0 {
 		collected, err := collectChangedArtifacts(repo.Root, executionRunID, leaseID, artifactChangeResults, afterArtifacts)
 		if err != nil {
+			finishArtifactTiming()
+			report := snapshotTimingReport(time.Since(timings.started), exitCodeForError(err, 7), runArtifacts)
+			finalTimingReport = &report
 			return recordFailure(err)
 		}
 		runArtifacts = append(runArtifacts, collected...)
+		timings.artifactTransferCount += len(collected)
+		timings.artifactTransferBytes += runArtifactBytes(collected)
 		for _, artifact := range collected {
 			fmt.Fprintf(a.Stderr, "artifact kind=%s path=%s bytes=%d\n", artifact.Kind, artifact.Path, artifact.Bytes)
 		}
@@ -2509,6 +2536,8 @@ afterSync:
 		collected, artifactOutput, err := collectRunArtifactGlobs(ctx, target, workdir, repo.Root, executionRunID, leaseID, runArtifactGlobs)
 		if err != nil {
 			finishArtifactTiming()
+			report := snapshotTimingReport(time.Since(timings.started), exitCodeForError(err, 7), runArtifacts)
+			finalTimingReport = &report
 			return recordFailure(err)
 		}
 		if strings.TrimSpace(artifactOutput) != "" {
@@ -2542,11 +2571,7 @@ afterSync:
 		timings.retryLikely = classification.RetryLikely
 		failureClassificationPrinted = true
 	}
-	report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, code, actionsURL)
-	populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, runArtifacts)
-	report.Label = runLabelValue
-	report.SchemaValidations = schemaValidationResults
-	report.ArtifactChanges = artifactChangeResults
+	report := snapshotTimingReport(total, code, runArtifacts)
 	if strings.TrimSpace(*emitProof) != "" && code == 0 {
 		template := cfg.ProofTemplates[strings.TrimSpace(*proofTemplate)]
 		proof, err := writeRunProof(strings.TrimSpace(*emitProof), strings.TrimSpace(*proofTemplate), proofRenderInput{
