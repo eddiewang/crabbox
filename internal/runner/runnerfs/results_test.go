@@ -1,0 +1,190 @@
+package runnerfs
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestExplicitPOSIXBackslashIsNotASeparator(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("literal POSIX filename")
+	}
+	root, dir := testRoot(t)
+	writeFixture(t, filepath.Join(dir, `reports\junit.xml`), "<testsuite tests=\"1\"/>")
+	writeFixture(t, filepath.Join(dir, "reports", "junit.xml"), "<testsuite tests=\"1\" failures=\"1\"/>")
+	result, err := root.CollectResults(t.Context(), ResultOptions{Paths: []string{`reports\junit.xml`, "reports/junit.xml"}, ExplicitMaxBytes: 1024, ExplicitTotalBytes: 2048})
+	if err != nil || len(result.Files) != 2 {
+		t.Fatalf("files=%v err=%v", result.Files, err)
+	}
+}
+
+func TestReportSymlinkAliasesDoNotDuplicateOrConsumeBudget(t *testing.T) {
+	root, dir := testRoot(t)
+	const content = "<testsuite/>"
+	writeFixture(t, filepath.Join(dir, "junit.xml"), content)
+	writeFixture(t, filepath.Join(dir, "junit-other.xml"), content)
+	symlinkFixture(t, "junit.xml", filepath.Join(dir, "alias.xml"))
+	result, err := root.CollectResults(t.Context(), ResultOptions{
+		Paths: []string{"alias.xml", "junit.xml"}, Auto: true,
+		ExplicitMaxBytes: int64(len(content)), ExplicitTotalBytes: int64(len(content)),
+	})
+	if err != nil || len(result.Files) != 2 || result.Files[0].Path != "alias.xml" || result.Files[1].Path != "junit-other.xml" || len(result.Warnings) != 0 {
+		t.Fatalf("files=%v warnings=%v err=%v", result.Files, result.Warnings, err)
+	}
+}
+
+func TestJUnitFilenamePreservesPlatformCaseRules(t *testing.T) {
+	for _, name := range []string{"JUNIT.XML", "test-one.XML", "RESULTS.XML"} {
+		if !junitFilenameForOS("windows", name) || junitFilenameForOS("linux", name) {
+			t.Fatalf("unexpected platform matching for %q", name)
+		}
+	}
+}
+
+func TestCollectResultsFreshnessPruningAndDeduplication(t *testing.T) {
+	root, dir := testRoot(t)
+	const good = `<testsuite tests="1"><testcase name="ok"/></testsuite>`
+	for _, name := range []string{"reports/junit-ok.xml", "reports/junit-old.xml", ".git/junit-hidden.xml", "node_modules/junit-hidden.xml", "nested/node_modules/TEST-hidden.xml", "plain.xml"} {
+		writeFixture(t, filepath.Join(dir, filepath.FromSlash(name)), good)
+	}
+	after := time.Now().Add(-time.Minute)
+	old := after.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "reports/junit-old.xml"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	options := ResultOptions{Paths: []string{"reports/junit-ok.xml", filepath.Join(dir, "reports/junit-ok.xml"), "plain.xml"}, Auto: true, After: after, ExplicitMaxBytes: 1024, ExplicitTotalBytes: 4096}
+	result, err := root.CollectResults(context.Background(), options)
+	if err != nil || len(result.Files) != 2 || len(result.Warnings) != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if result.Files[0].Path != "reports/junit-ok.xml" || result.Files[1].Path != "plain.xml" {
+		t.Fatalf("paths changed: %+v", result.Files)
+	}
+}
+
+func TestAutoResultsPrioritizeLateFailuresWithinCountLimit(t *testing.T) {
+	root, dir := testRoot(t)
+	for i := 0; i < 65; i++ {
+		writeFixture(t, filepath.Join(dir, fmt.Sprintf("junit-%03d.xml", i)), `<testsuite tests="1"/>`)
+	}
+	writeFixture(t, filepath.Join(dir, "junit-zzz.xml"), `<testsuite tests="1"><testcase><failure message="expected"/></testcase></testsuite>`)
+	result, err := root.CollectResults(context.Background(), ResultOptions{Auto: true})
+	if err != nil || len(result.Files) != AutoMaxFiles || result.Files[0].Path != "junit-zzz.xml" {
+		t.Fatalf("result count=%d err=%v", len(result.Files), err)
+	}
+}
+
+func TestAutoResultsNeverFollowSymlinkCandidates(t *testing.T) {
+	root, dir := testRoot(t)
+	outside := filepath.Join(t.TempDir(), "outside.xml")
+	writeFixture(t, outside, `<testsuite tests="900"/>`)
+	symlinkFixture(t, outside, filepath.Join(dir, "junit-outside.xml"))
+	result, err := root.CollectResults(context.Background(), ResultOptions{Auto: true})
+	if err != nil || len(result.Files) != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestAutoResultsWarnInsteadOfTruncatingOversizedReport(t *testing.T) {
+	root, dir := testRoot(t)
+	name := filepath.Join(dir, "junit-big.xml")
+	f, err := os.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.WriteString(`<testsuite tests="1">`); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Truncate(AutoMaxFileBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := root.CollectResults(context.Background(), ResultOptions{Auto: true})
+	if err != nil || len(result.Files) != 0 || len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0].Message, "per-file limit") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestCanceledResultCollectionReturnsCancellation(t *testing.T) {
+	root, _ := testRoot(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := root.CollectResults(ctx, ResultOptions{Auto: true}); err != context.Canceled {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestExplicitLimitDoesNotChargeDuplicatePaths(t *testing.T) {
+	root, dir := testRoot(t)
+	writeFixture(t, filepath.Join(dir, "one.xml"), "1234")
+	writeFixture(t, filepath.Join(dir, "two.xml"), "5678")
+	result, err := root.CollectResults(context.Background(), ResultOptions{
+		Paths:            []string{"one.xml", "./one.xml", filepath.Join(dir, "one.xml"), "two.xml"},
+		ExplicitMaxBytes: 4, ExplicitTotalBytes: 4,
+	})
+	if err != nil || len(result.Files) != 1 || len(result.Warnings) != 1 || result.Warnings[0].Path != "two.xml" {
+		t.Fatalf("files=%d warnings=%+v err=%v", len(result.Files), result.Warnings, err)
+	}
+}
+
+func TestAutoAggregateLimitNeverReturnsPartialReport(t *testing.T) {
+	root, dir := testRoot(t)
+	prefix, suffix := []byte(`<testsuite tests="0"><!--`), []byte(`--></testsuite>`)
+	padding := bytes.Repeat([]byte{' '}, 64<<10)
+	for i := 0; i < 5; i++ {
+		f, err := os.Create(filepath.Join(dir, fmt.Sprintf("junit-%d.xml", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.Write(prefix); err != nil {
+			t.Fatal(err)
+		}
+		remaining := AutoMaxFileBytes - len(prefix) - len(suffix)
+		for remaining > 0 {
+			count := min(remaining, len(padding))
+			if _, err = f.Write(padding[:count]); err != nil {
+				t.Fatal(err)
+			}
+			remaining -= count
+		}
+		if _, err = f.Write(suffix); err != nil {
+			t.Fatal(err)
+		}
+		if err = f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := root.CollectResults(context.Background(), ResultOptions{Auto: true})
+	if err != nil || len(result.Files) != 4 || len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0].Message, "aggregate limit") {
+		t.Fatalf("files=%d warnings=%+v err=%v", len(result.Files), result.Warnings, err)
+	}
+	for _, file := range result.Files {
+		if len(file.Data) != AutoMaxFileBytes || !bytes.HasSuffix(file.Data, suffix) {
+			t.Fatalf("truncated %s", file.Path)
+		}
+	}
+}
+
+func TestCandidateRetentionIsBoundedAndLexicallySorted(t *testing.T) {
+	var values []resultCandidate
+	for i := 999; i >= 0; i-- {
+		values = retainResultCandidate(values, resultCandidate{name: fmt.Sprintf("junit-%04d.xml", i)})
+		if len(values) > AutoMaxFiles {
+			t.Fatal("unbounded candidate list")
+		}
+	}
+	for i, value := range values {
+		if want := fmt.Sprintf("junit-%04d.xml", i); value.name != want {
+			t.Fatalf("index %d=%s want=%s", i, value.name, want)
+		}
+	}
+}
