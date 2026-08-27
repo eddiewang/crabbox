@@ -19,8 +19,10 @@ type runCleanupWorkspaceOwnerTransport struct {
 
 	blockInspectAt int
 	inspectCount   int
+	releaseBudget  time.Duration
 	renewErr       error
 	destroyed      atomic.Bool
+	releaseEarly   atomic.Bool
 
 	renewStarted   chan struct{}
 	allowRenew     chan struct{}
@@ -54,12 +56,12 @@ func (r *runCleanupWorkspaceOwnerTransport) Do(ctx context.Context, req workspac
 	switch req.Action {
 	case workspaceOwnerRenew:
 		r.renewStartOnce.Do(func() { close(r.renewStarted) })
+		defer r.renewFinishOnce.Do(func() { close(r.renewFinished) })
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-r.allowRenew:
 		}
-		r.renewFinishOnce.Do(func() { close(r.renewFinished) })
 		if r.destroyed.Load() {
 			return "", errors.New("renew transport destroyed with lease")
 		}
@@ -82,11 +84,27 @@ func (r *runCleanupWorkspaceOwnerTransport) Do(ctx context.Context, req workspac
 		}
 		return "OWNED", nil
 	case workspaceOwnerRelease:
+		r.mu.Lock()
+		if deadline, ok := ctx.Deadline(); ok {
+			r.releaseBudget = time.Until(deadline)
+		}
+		r.mu.Unlock()
+		select {
+		case <-r.renewFinished:
+		default:
+			r.releaseEarly.Store(true)
+		}
 		r.ownerReleaseOnce.Do(func() { close(r.ownerReleased) })
 		return "RELEASED", nil
 	default:
 		return "", errors.New("unexpected workspace-owner action")
 	}
+}
+
+func (r *runCleanupWorkspaceOwnerTransport) observedReleaseBudget() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.releaseBudget
 }
 
 func (r *runCleanupWorkspaceOwnerTransport) unblockRenewal() {
@@ -382,6 +400,12 @@ func TestRunCommandRetainedLeaseRetainsFailClosedRenewal(t *testing.T) {
 			default:
 			}
 			waitRunCleanupSignal(t, remote.ownerReleased, "retained owner release")
+			if remote.releaseEarly.Load() {
+				t.Fatal("owner release began before failed renewal transport cleanup completed")
+			}
+			if budget := remote.observedReleaseBudget(); budget <= workspaceOwnerCallTimeout-time.Second || budget > workspaceOwnerCallTimeout {
+				t.Fatalf("release budget=%s want fresh %s transport call after renewal cleanup", budget, workspaceOwnerCallTimeout)
+			}
 		})
 	}
 }

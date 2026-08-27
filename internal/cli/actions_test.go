@@ -1369,6 +1369,7 @@ func TestExecuteLocalActionsHydrationNormalizesConfigDerivedWSL2Target(t *testin
 	sshPath := filepath.Join(dir, "ssh")
 	logPath := filepath.Join(dir, "ssh.log")
 	hydratedPath := filepath.Join(dir, "hydrated")
+	stagedCommandPath := filepath.Join(dir, "staged-command")
 	sshScript := `#!/bin/sh
 remote=""
 for arg do remote="$arg"; done
@@ -1392,6 +1393,9 @@ case "$remote" in
     fi
     ;;
 esac
+if [ -s "$CRABBOX_FAKE_STAGED_COMMAND" ]; then
+  decoded=$(/bin/cat "$CRABBOX_FAKE_STAGED_COMMAND")
+fi
 printf '%s\n---\n' "$decoded" >> "$CRABBOX_FAKE_SSH_LOG"
 case "$decoded" in
   *"nohup"*) exit 42 ;;
@@ -1413,6 +1417,27 @@ exit 0
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CRABBOX_FAKE_SSH_LOG", logPath)
 	t.Setenv("CRABBOX_FAKE_HYDRATED", hydratedPath)
+	t.Setenv("CRABBOX_FAKE_STAGED_COMMAND", stagedCommandPath)
+	oldStage := stageWSLSpool
+	stageWSLSpool = func(spool *wslStageSpool, _ context.Context, target *SSHTarget, _ wslStageTiming, _, _ string, _ io.Writer) (string, error) {
+		spool.shell = wslStageCMD
+		reader, err := spool.input.reset()
+		if err != nil {
+			return "", err
+		}
+		raw, err := io.ReadAll(reader)
+		if err != nil {
+			return "", err
+		}
+		_, _, command, _ := decodeWSLStage(t, raw)
+		if err := os.WriteFile(stagedCommandPath, []byte(command), 0o600); err != nil {
+			return "", err
+		}
+
+		target.NoControlMaster = true
+		return strings.Repeat("a", 32), nil
+	}
+	t.Cleanup(func() { stageWSLSpool = oldStage })
 	cfg := defaultConfig()
 	cfg.TargetOS = targetWindows
 	cfg.WindowsMode = windowsModeWSL2
