@@ -134,6 +134,9 @@ func serveOperation(ctx context.Context, input io.Reader, output io.Writer, iden
 }
 
 func serveResults(ctx context.Context, request Request, output io.Writer) (Outcome, error) {
+	if err := validateResultPaths(request.Paths); err != nil {
+		return Outcome{}, err
+	}
 	workdir, err := expandPath(request.Workdir)
 	if err != nil {
 		return Outcome{}, err

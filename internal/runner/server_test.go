@@ -20,6 +20,68 @@ func testIdentity() Identity {
 	return Identity{BuildID: "test-build", OS: runtime.GOOS, Arch: runtime.GOARCH, Protocol: runnerwire.Version}
 }
 
+func TestCollectRejectsExcessExplicitPathsBeforeIO(t *testing.T) {
+	paths := make([]string, 4097)
+	for i := range paths {
+		paths[i] = "report.xml"
+	}
+	request := Request{BuildID: testIdentity().BuildID, Operation: Collect, Workdir: filepath.Join(t.TempDir(), "missing"), Paths: paths}
+	t.Run("request", func(t *testing.T) {
+		var wire bytes.Buffer
+		if err := WriteRequest(&wire, request, 0, nil); err == nil || !strings.Contains(err.Error(), "explicit result path limit") || wire.Len() != 0 {
+			t.Fatalf("request wrote %d bytes: %v", wire.Len(), err)
+		}
+	})
+	t.Run("client", func(t *testing.T) {
+		called := false
+		client := Client{Identity: testIdentity(), Transport: func(context.Context, io.Reader, io.Writer) error { called = true; return nil }}
+		_, err := client.Collect(t.Context(), request.Workdir, paths, false, "")
+		if err == nil || !strings.Contains(err.Error(), "explicit result path limit") || called {
+			t.Fatalf("transport called=%t err=%v", called, err)
+		}
+	})
+	t.Run("server", func(t *testing.T) {
+		var input, output bytes.Buffer
+		if err := writeFrame(&input, runnerwire.Request, request, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeFrame(&input, runnerwire.End, nil, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := Serve(t.Context(), &input, &output, testIdentity()); err == nil || !strings.Contains(err.Error(), "explicit result path limit") {
+			t.Fatalf("server did not reject count before filesystem access: %v", err)
+		}
+		_, err := ReadResponse(t.Context(), &output, testIdentity(), Collect, func(FileInfo, io.Reader) error { t.Error("server emitted file"); return nil })
+		if err == nil || !strings.Contains(err.Error(), "explicit result path limit") {
+			t.Fatalf("invalid refusal response: %v", err)
+		}
+	})
+}
+
+func TestCollectMaximumExplicitAndAutoFiles(t *testing.T) {
+	root := t.TempDir()
+	paths := make([]string, 4096)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("r%04d", i)
+		if err := os.WriteFile(filepath.Join(root, paths[i]), []byte("<testsuite/>"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range runnerfs.AutoMaxFiles {
+		name := fmt.Sprintf("junit-%02d.xml", i)
+		if err := os.WriteFile(filepath.Join(root, name), []byte("<testsuite/>"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := Client{Identity: testIdentity(), Transport: func(ctx context.Context, input io.Reader, output io.Writer) error {
+		return Serve(ctx, input, output, testIdentity())
+	}}
+	results, err := client.Collect(t.Context(), root, paths, true, "")
+	if err != nil || len(results.Files) != len(paths)+runnerfs.AutoMaxFiles || len(results.Warnings) != 0 {
+		t.Fatalf("files=%d warnings=%v err=%v", len(results.Files), results.Warnings, err)
+	}
+}
+
 func TestResultWarningOverflowPreservesValidFiles(t *testing.T) {
 	root := t.TempDir()
 	paths := []string{"valid"}

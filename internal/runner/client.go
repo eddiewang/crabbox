@@ -13,6 +13,11 @@ func WriteRequest(output io.Writer, request Request, size uint64, body io.Reader
 	if request.BuildID == "" {
 		return errors.New("runner request requires a build identity")
 	}
+	if request.Operation == Collect {
+		if err := validateResultPaths(request.Paths); err != nil {
+			return err
+		}
+	}
 	if request.Operation != Upload && size != 0 {
 		return errors.New("runner operation cannot send a payload")
 	}
@@ -71,7 +76,7 @@ func ReadResponse(ctx context.Context, input io.Reader, expected Identity, opera
 					return Outcome{}, errors.New("download returned an invalid archive frame")
 				}
 			} else {
-				if operation != Collect || info.Archive || info.Path == "" || seen[info.Path] || count > 4096+runnerfs.AutoMaxFiles {
+				if operation != Collect || info.Archive || info.Path == "" || seen[info.Path] || count > ExplicitMaxFiles+runnerfs.AutoMaxFiles {
 					return Outcome{}, errors.New("invalid runner result file")
 				}
 				seen[info.Path] = true

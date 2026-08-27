@@ -75,7 +75,7 @@ func artifactFromBundle(data []byte, buildID string, target Target) (Artifact, e
 		return Artifact{}, errors.New("runner bundle metadata is not canonical")
 	}
 	idBytes, idErr := hex.DecodeString(buildID)
-	if manifest.Version != 1 || idErr != nil || len(idBytes) != 20 || strings.ToLower(buildID) != buildID || manifest.BuildID != buildID || len(manifest.Entries) != 6 {
+	if manifest.Version != 1 || idErr != nil || (len(idBytes) != 20 && len(idBytes) != 32) || strings.ToLower(buildID) != buildID || manifest.BuildID != buildID || len(manifest.Entries) != 6 {
 		return Artifact{}, errors.New("runner bundle identity or inventory mismatch")
 	}
 	payload := data[12+headerSize:]

@@ -102,19 +102,35 @@ func TestProtectedRunnerPackerMatchesRuntimeFormat(t *testing.T) {
 			}
 		}
 	}
-	output := filepath.Join(t.TempDir(), "bundle.bin")
-	id := strings.Repeat("a", 40)
-	command := exec.CommandContext(t.Context(), "node", "../../scripts/pack-release-runners.mjs", directory, id, output)
-	if diagnostic, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("pack: %v: %s", err, diagnostic)
+	for _, width := range []int{40, 64} {
+		output := filepath.Join(t.TempDir(), "bundle.bin")
+		id := strings.Repeat("a", width)
+		command := exec.CommandContext(t.Context(), "node", "../../scripts/pack-release-runners.mjs", directory, id, output)
+		if diagnostic, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("pack: %v: %s", err, diagnostic)
+		}
+		data, err := os.ReadFile(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, osName := range []string{"darwin", "linux", "windows"} {
+			for _, arch := range []string{"amd64", "arm64"} {
+				artifact, err := artifactFromBundle(data, id, Target{OS: osName, Arch: arch})
+				if err != nil || string(artifact.Data) != osName+"-"+arch || artifact.Identity.BuildID != id {
+					t.Fatalf("build width=%d target=%s/%s err=%v", width, osName, arch, err)
+				}
+			}
+		}
 	}
-	data, err := os.ReadFile(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	artifact, err := artifactFromBundle(data, id, Target{OS: "linux", Arch: "arm64"})
-	if err != nil || string(artifact.Data) != "linux-arm64" {
-		t.Fatalf("artifact=%v err=%v", artifact, err)
+}
+
+func TestRunnerBundleRejectsOtherBuildIdentityWidths(t *testing.T) {
+	_, manifest, payload := fixtureBundle(t)
+	for _, id := range []string{"", strings.Repeat("a", 39), strings.Repeat("a", 42), strings.Repeat("a", 62), strings.Repeat("a", 66), strings.Repeat("A", 64), strings.Repeat("z", 64)} {
+		manifest.BuildID = id
+		if _, err := artifactFromBundle(encodeFixtureBundle(t, manifest, payload), id, Target{OS: "linux", Arch: "amd64"}); err == nil {
+			t.Fatalf("unsupported build identity accepted: %q", id)
+		}
 	}
 }
 

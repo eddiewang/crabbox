@@ -86,6 +86,35 @@ func TestWindowsRootRelativeSymlinkKeepsAbsoluteIdentity(t *testing.T) {
 	}
 }
 
+func TestWindowsRootRelativeReportLink(t *testing.T) {
+	root, dir := testRoot(t)
+	t.Chdir(dir)
+	volume := filepath.VolumeName(dir)
+	if len(volume) != 2 || volume[1] != ':' {
+		t.Skip("fixture requires a local Windows drive")
+	}
+	writeFixture(t, filepath.Join(dir, "report.xml"), "REPORT")
+	outside := filepath.Join(t.TempDir(), "outside.xml")
+	writeFixture(t, outside, "OUTSIDE")
+	symlinkFixture(t, strings.TrimPrefix(filepath.Join(dir, "report.xml"), volume), filepath.Join(dir, "alias.xml"))
+	symlinkFixture(t, strings.TrimPrefix(outside, volume), filepath.Join(dir, "escape.xml"))
+	for _, name := range []string{"alias.xml", filepath.Join(dir, "alias.xml")} {
+		file, err := root.Read(name, 64)
+		if err != nil || string(file.Data) != "REPORT" {
+			t.Fatalf("root-relative report %q: data=%q err=%v", name, file.Data, err)
+		}
+		results, err := root.CollectResults(t.Context(), ResultOptions{Paths: []string{name}, ExplicitMaxBytes: 64, ExplicitTotalBytes: 64})
+		if err != nil || len(results.Files) != 1 || len(results.Warnings) != 0 || string(results.Files[0].Data) != "REPORT" {
+			t.Fatalf("root-relative collection %q: files=%d warnings=%v err=%v", name, len(results.Files), results.Warnings, err)
+		}
+	}
+	for _, name := range []string{"escape.xml", filepath.Join(dir, "escape.xml")} {
+		if file, err := root.Read(name, 64); err == nil || len(file.Data) != 0 {
+			t.Fatalf("outside rooted link read: %q %v", file.Data, err)
+		}
+	}
+}
+
 func assertWindowsArchiveParent(t *testing.T, destination, parent string) {
 	t.Helper()
 	if !filepath.IsAbs(destination) || filepath.Base(destination) != "destination" {

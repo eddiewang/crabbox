@@ -24,6 +24,9 @@ type Client struct {
 type Factory func(context.Context) (*Client, error)
 
 func (client *Client) Collect(ctx context.Context, workdir string, paths []string, auto bool, marker string) (runnerfs.Results, error) {
+	if err := validateResultPaths(paths); err != nil {
+		return runnerfs.Results{}, err
+	}
 	var results runnerfs.Results
 	outcome, err := client.invoke(ctx, Request{Operation: Collect, Workdir: workdir, Paths: paths, Auto: auto, Marker: marker}, 0, nil, func(info FileInfo, input io.Reader) error {
 		data, err := io.ReadAll(input)

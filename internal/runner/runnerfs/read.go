@@ -120,7 +120,7 @@ func (r *Root) openRegular(name string) (*os.File, error) {
 func (r *Root) open(name string) (*os.File, error) {
 	rel := name
 	if filepath.IsAbs(name) {
-		resolved, err := filepath.EvalSymlinks(name)
+		resolved, err := physicalAbsolutePath(name)
 		if err != nil {
 			return nil, err
 		}
@@ -144,7 +144,7 @@ func (r *Root) open(name string) (*os.File, error) {
 	if !filepath.IsAbs(candidate) {
 		candidate = strings.TrimRight(r.path, string(filepath.Separator)) + string(filepath.Separator) + candidate
 	}
-	resolved, err := filepath.EvalSymlinks(candidate)
+	resolved, err := physicalAbsolutePath(candidate)
 	if err != nil {
 		return nil, err
 	}

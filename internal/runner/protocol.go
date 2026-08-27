@@ -18,9 +18,17 @@ import (
 )
 
 const (
+	ExplicitMaxFiles      = 4096
 	ExplicitMaxFileBytes  = 64 << 20
 	ExplicitMaxTotalBytes = 256 << 20
 )
+
+func validateResultPaths(paths []string) error {
+	if len(paths) > ExplicitMaxFiles {
+		return fmt.Errorf("explicit result path limit is %d", ExplicitMaxFiles)
+	}
+	return nil
+}
 
 // BuildID is injected from the bundled source digest when building a helper.
 var BuildID = "development"
