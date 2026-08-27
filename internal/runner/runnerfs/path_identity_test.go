@@ -42,6 +42,43 @@ func TestReadPreservesPhysicalParentResolution(t *testing.T) {
 	}
 }
 
+func TestRelativeRootsUsePhysicalWorkingDirectory(t *testing.T) {
+	base := t.TempDir()
+	physical := filepath.Join(base, "physical", "project")
+	logical := filepath.Join(base, "logical")
+	writeFixture(t, filepath.Join(physical, "junit.xml"), "report")
+	if err := os.Mkdir(logical, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(logical, "alias")
+	symlinkFixture(t, physical, alias)
+	t.Chdir(alias)
+	t.Setenv("PWD", alias)
+	root, err := OpenRoot(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	file, err := root.Read(filepath.Join(physical, "junit.xml"), 64)
+	if err != nil || string(file.Data) != "report" {
+		t.Errorf("absolute report under relative root: data=%q err=%v", file.Data, err)
+	}
+	parent, err := OpenRoot("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	file, err = parent.Read("project/junit.xml", 64)
+	if err != nil || string(file.Data) != "report" {
+		t.Errorf("physical parent root: data=%q err=%v", file.Data, err)
+	}
+	target, err := ArchiveTarget("destination", "payload", false)
+	want, resolveErr := filepath.EvalSymlinks(physical)
+	if err != nil || resolveErr != nil || target != filepath.Join(want, "destination") {
+		t.Errorf("relative copy target=%q want=%q err=%v resolve=%v", target, want, err, resolveErr)
+	}
+}
+
 func TestReportsUseOpenedIdentityNotLexicalPath(t *testing.T) {
 	root, dir := physicalParentFixture(t)
 	results, err := root.CollectResults(t.Context(), ResultOptions{Paths: []string{"junit.xml", "alias/../junit.xml", dir + "/alias/../junit.xml"}, ExplicitMaxBytes: 64, ExplicitTotalBytes: 128})

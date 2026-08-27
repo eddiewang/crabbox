@@ -19,7 +19,7 @@ func TestWindowsBootstrapConcurrentInstall(t *testing.T) {
 	digest := sha256.Sum256(data)
 	artifact := Artifact{Identity: CurrentIdentity(), SHA256: hex.EncodeToString(digest[:]), Data: data}
 	platform := Runtime{Target: Target{OS: runtime.GOOS, Arch: runtime.GOARCH}, Home: t.TempDir()}
-	install, err := InstallCommand(platform, artifact)
+	install, err := PrepareInstallation(platform, artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,8 +28,8 @@ func TestWindowsBootstrapConcurrentInstall(t *testing.T) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			command := exec.CommandContext(t.Context(), "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", install)
-			command.Stdin = bytes.NewReader(data)
+			command := exec.CommandContext(t.Context(), "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", install.Command)
+			command.Stdin = bytes.NewReader(install.Input)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Errorf("concurrent installer: %v: %s", err, output)
 			}
@@ -47,8 +47,8 @@ func TestWindowsBootstrapConcurrentInstall(t *testing.T) {
 	if err := os.WriteFile(name, []byte("corruption"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	command := exec.CommandContext(t.Context(), "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", install)
-	command.Stdin = bytes.NewReader(data)
+	command := exec.CommandContext(t.Context(), "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", install.Command)
+	command.Stdin = bytes.NewReader(install.Input)
 	if output, err := command.CombinedOutput(); err == nil || !bytes.Contains(output, []byte("digest mismatch")) {
 		t.Fatalf("corruption accepted: %v: %s", err, output)
 	}

@@ -27,14 +27,11 @@ func newResolvedRunnerClient(ctx context.Context, session *sshTransportSession, 
 	if err != nil {
 		return nil, err
 	}
-	if err := runner.ValidateArtifact(artifact); err != nil {
-		return nil, err
-	}
-	install, err := runner.InstallCommand(platform, artifact)
+	install, err := runner.PrepareInstallation(platform, artifact)
 	if err != nil {
 		return nil, err
 	}
-	if err := runResolvedRunnerCommand(ctx, session, target, install, bytes.NewReader(artifact.Data), io.Discard, stderr, nil); err != nil {
+	if err := runResolvedRunnerCommand(ctx, session, target, install.Command, bytes.NewReader(install.Input), io.Discard, stderr, nil); err != nil {
 		return nil, fmt.Errorf("install verified remote runner: %w", err)
 	}
 	textOnly := isWindowsNativeTarget(target) || isWindowsWSL2Target(target)

@@ -32,11 +32,7 @@ type File struct {
 }
 
 func OpenRoot(name string) (*Root, error) {
-	resolved, err := filepath.EvalSymlinks(name)
-	if err != nil {
-		return nil, err
-	}
-	canonical, err := filepath.Abs(resolved)
+	canonical, err := physicalAbsolutePath(name)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +117,13 @@ func (r *Root) open(name string) (*os.File, error) {
 		}
 		rel, _ = filepath.Rel(r.path, resolved)
 	}
-	if filepath.IsLocal(rel) {
+	// Windows cleans parent components before os.Root opens them. Resolve those
+	// paths physically first so relative and absolute report aliases agree.
+	physicalParent := false
+	for _, component := range strings.Split(filepath.ToSlash(rel), "/") {
+		physicalParent = physicalParent || component == ".."
+	}
+	if filepath.IsLocal(rel) && !physicalParent {
 		file, err := r.root.OpenFile(rel, os.O_RDONLY|nonblockingOpen, 0)
 		if err == nil {
 			return file, nil

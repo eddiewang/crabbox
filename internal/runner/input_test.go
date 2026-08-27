@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -109,18 +110,32 @@ func TestMainInputBoundsGateUploadPublication(t *testing.T) {
 	}
 }
 
-func TestWindowsInstallUsesKnownArtifactLength(t *testing.T) {
-	artifact := Artifact{Identity: Identity{BuildID: "fixture", OS: "windows", Arch: "amd64", Protocol: 1}, SHA256: strings.Repeat("a", 64), Data: []byte("fixture")}
-	command, err := InstallCommand(Runtime{Target: Target{OS: "windows", Arch: "amd64"}, Home: `C:\fixture`}, artifact)
+func TestWindowsInstallBindsNativeTransferToArtifact(t *testing.T) {
+	data := []byte("fixture")
+	digest := sha256.Sum256(data)
+	artifact := Artifact{Identity: Identity{BuildID: "fixture", OS: "windows", Arch: "amd64", Protocol: 1}, SHA256: hex.EncodeToString(digest[:]), Data: data}
+	install, err := PrepareInstallation(Runtime{Target: Target{OS: "windows", Arch: "amd64"}, Home: `C:\fixture`}, artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(command, "CopyTo") || !strings.Contains(command, "$remaining = [Int64]7") {
-		t.Fatalf("installer depends on stdin EOF: %s", command)
+	if strings.Contains(install.Command, "OpenStandardInput") || !strings.Contains(install.Command, "& tar.exe -xf - -C $stage runner.exe") || !strings.Contains(install.Command, ".Length -ne [Int64]7") {
+		t.Fatalf("installer does not use a bounded native transfer: %s", install.Command)
+	}
+	reader := tar.NewReader(bytes.NewReader(install.Input))
+	header, err := reader.Next()
+	if err != nil || header.Name != "runner.exe" || header.Typeflag != tar.TypeReg {
+		t.Fatalf("install header=%v err=%v", header, err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("install payload=%q err=%v", got, err)
+	}
+	if _, err := reader.Next(); err != io.EOF {
+		t.Fatalf("unexpected additional install member: %v", err)
 	}
 }
 
-func TestWindowsBootstrapInstallsWithoutTransportEOF(t *testing.T) {
+func TestWindowsBootstrapTransfersLargeBinaryInput(t *testing.T) {
 	shell := "pwsh"
 	if runtime.GOOS == "windows" {
 		shell = "powershell.exe"
@@ -129,17 +144,28 @@ func TestWindowsBootstrapInstallsWithoutTransportEOF(t *testing.T) {
 	if err != nil {
 		t.Skip("PowerShell is unavailable")
 	}
-	data := []byte("bounded installer fixture\n")
+	data := bytes.Repeat([]byte{0, 0xff, 0x1a, '\r', '\n', 'M', 'Z', 0x90}, 1<<17)
 	digest := sha256.Sum256(data)
 	artifact := Artifact{Identity: Identity{BuildID: "fixture", OS: "windows", Arch: "amd64", Protocol: 1}, SHA256: hex.EncodeToString(digest[:]), Data: data}
 	platform := Runtime{Target: Target{OS: "windows", Arch: "amd64"}, Home: t.TempDir()}
-	script, err := InstallCommand(platform, artifact)
+	install, err := PrepareInstallation(platform, artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script)
+	command := exec.CommandContext(ctx, shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", install.Command)
+	if runtime.GOOS != "windows" {
+		tarPath, err := exec.LookPath("tar")
+		if err != nil {
+			t.Skip("native tar is unavailable")
+		}
+		tools := t.TempDir()
+		if err := os.Symlink(tarPath, filepath.Join(tools, "tar.exe")); err != nil {
+			t.Fatal(err)
+		}
+		command.Env = append(os.Environ(), "PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	var output bytes.Buffer
 	command.Stdout, command.Stderr = &output, &output
 	command.WaitDelay = time.Second
@@ -151,7 +177,12 @@ func TestWindowsBootstrapInstallsWithoutTransportEOF(t *testing.T) {
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stdin.Write(data); err != nil {
+	if _, err := stdin.Write(install.Input); err != nil {
+		cancel()
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	if err := stdin.Close(); err != nil {
 		cancel()
 		_ = command.Wait()
 		t.Fatal(err)
@@ -166,7 +197,7 @@ func TestWindowsBootstrapInstallsWithoutTransportEOF(t *testing.T) {
 	case <-ctx.Done():
 		_ = stdin.Close()
 		<-done
-		t.Fatalf("installer waited for EOF: %s", &output)
+		t.Fatalf("installer did not finish after complete input: %s", &output)
 	}
 	name, err := artifact.RemotePath(platform)
 	if err != nil {
@@ -174,6 +205,6 @@ func TestWindowsBootstrapInstallsWithoutTransportEOF(t *testing.T) {
 	}
 	got, err := os.ReadFile(name)
 	if err != nil || !bytes.Equal(got, data) {
-		t.Fatalf("installed=%q err=%v", got, err)
+		t.Fatalf("installed bytes=%d want=%d err=%v", len(got), len(data), err)
 	}
 }

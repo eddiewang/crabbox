@@ -3,13 +3,13 @@ package runnerfs
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -43,11 +43,38 @@ type Results struct {
 }
 
 type resultCandidate struct {
-	name   string
-	failed bool
+	name     string
+	failed   bool
+	identity os.FileInfo
 }
 
-var junitFailure = regexp.MustCompile(`<(failure|error)([\t\r\n >])`)
+// The bounded discovery prefix is not a full report parse. Tokenize it so log
+// text in comments or CDATA cannot displace reports with real failure elements.
+func containsJUnitFailure(data []byte) bool {
+	// Discovery only inspects ASCII markup, not decoded diagnostic text. Keep
+	// ASCII-compatible declarations and invalid text bytes from hiding tags;
+	// returned report bytes and the full parser's validation remain unchanged.
+	data = bytes.ToValidUTF8(data, []byte("\uFFFD"))
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.CharsetReader = func(_ string, input io.Reader) (io.Reader, error) { return input, nil }
+	for {
+		// A long attribute can cross the sniff limit. At a token boundary the
+		// tag's name is sufficient; comments and CDATA are consumed as tokens.
+		prefix := bytes.TrimSpace(data[decoder.InputOffset():])
+		for _, name := range []string{"<failure", "<error"} {
+			if bytes.HasPrefix(prefix, []byte(name)) && len(prefix) > len(name) && strings.ContainsRune("\t\r\n />", rune(prefix[len(name)])) {
+				return true
+			}
+		}
+		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if element, ok := token.(xml.StartElement); ok && (element.Name.Local == "failure" || element.Name.Local == "error") {
+			return true
+		}
+	}
+}
 
 // CollectResults reads explicit files before bounded automatic discovery. An
 // external symlink is never treated as a report, even if its filename matches.
@@ -80,7 +107,7 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 	if !options.Auto {
 		return result, nil
 	}
-	candidates, err := r.resultCandidates(ctx, options.After)
+	candidates, err := r.resultCandidates(ctx, options.After, identities)
 	if err != nil {
 		return result, err
 	}
@@ -91,8 +118,9 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 		return candidates[i].name < candidates[j].name
 	})
 	autoTotal := int64(0)
-	for index, candidate := range candidates {
-		if index >= AutoMaxFiles {
+	autoCount := 0
+	for _, candidate := range candidates {
+		if autoCount >= AutoMaxFiles {
 			break
 		}
 		if err := ctx.Err(); err != nil {
@@ -118,13 +146,14 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 			continue
 		}
 		autoTotal += int64(len(file.Data))
+		autoCount++
 		result.Files = append(result.Files, file)
 		identities = append(identities, file.identity)
 	}
 	return result, nil
 }
 
-func (r *Root) resultCandidates(ctx context.Context, after time.Time) ([]resultCandidate, error) {
+func (r *Root) resultCandidates(ctx context.Context, after time.Time, excluded []os.FileInfo) ([]resultCandidate, error) {
 	var passing, failing []resultCandidate
 	err := r.walkDirectory(ctx, ".", func(name string, entry fs.DirEntry) error {
 		if err := ctx.Err(); err != nil {
@@ -152,14 +181,32 @@ func (r *Root) resultCandidates(ctx context.Context, after time.Time) ([]resultC
 		if err != nil || (!after.IsZero() && info.ModTime().Before(after)) {
 			return nil
 		}
+		for _, identity := range excluded {
+			if os.SameFile(identity, info) {
+				return nil
+			}
+		}
 		data, err := io.ReadAll(io.LimitReader(file, AutoFailureBytes))
 		if err != nil || !bytes.Contains(data[:min(len(data), AutoSniffBytes)], []byte("<testsuite")) {
 			return nil
 		}
-		candidate := resultCandidate{name, junitFailure.Match(data)}
+		candidate := resultCandidate{name: name, failed: containsJUnitFailure(data), identity: info}
 		if candidate.failed {
+			// A changed report may cross priority classes between alias reads.
+			for index, previous := range passing {
+				if os.SameFile(previous.identity, info) {
+					candidate.name = min(candidate.name, previous.name)
+					passing = append(passing[:index], passing[index+1:]...)
+					break
+				}
+			}
 			failing = retainResultCandidate(failing, candidate)
 		} else {
+			for _, previous := range failing {
+				if os.SameFile(previous.identity, info) {
+					return nil
+				}
+			}
 			passing = retainResultCandidate(passing, candidate)
 		}
 		return nil
@@ -170,6 +217,15 @@ func (r *Root) resultCandidates(ctx context.Context, after time.Time) ([]resultC
 // Retain only the earliest candidates in each priority class while still
 // inspecting the whole tree. Later failures must outrank earlier passing files.
 func retainResultCandidate(values []resultCandidate, next resultCandidate) []resultCandidate {
+	for index, previous := range values {
+		if previous.identity != nil && next.identity != nil && os.SameFile(previous.identity, next.identity) {
+			if previous.name <= next.name {
+				return values
+			}
+			values = append(values[:index], values[index+1:]...)
+			break
+		}
+	}
 	index := sort.Search(len(values), func(i int) bool { return values[i].name >= next.name })
 	if index >= AutoMaxFiles {
 		return values

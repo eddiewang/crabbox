@@ -573,7 +573,9 @@ tests without reading the raw log. See [test results](../features/test-results.m
 
 SSH result collection uses the same versioned runner on Linux, macOS, and
 native Windows. Official CLIs carry the runner; development builds require Go
-1.26 or later on the operator, never on the lease. Explicit reports are bounded
+1.26 or later on the operator, never on the lease. Native Windows bootstrap
+uses the target's `tar.exe` to transfer the embedded executable, then verifies
+its size and SHA-256 before installation. Explicit reports are bounded
 to 64 MiB each and 256 MiB total. Automatic discovery retains its 50-file,
 16-MiB-per-file, and 64-MiB-total limits. Paths remain confined to the workspace;
 raw file bytes travel in length-delimited frames, so marker-like XML text does

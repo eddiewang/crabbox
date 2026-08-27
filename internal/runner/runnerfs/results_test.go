@@ -81,6 +81,113 @@ func TestAutoResultsPrioritizeLateFailuresWithinCountLimit(t *testing.T) {
 	}
 }
 
+func TestAutoResultsPrioritizeSelfClosingFailures(t *testing.T) {
+	for _, element := range []string{"<failure/>", "<error/>"} {
+		t.Run(element, func(t *testing.T) {
+			root, dir := testRoot(t)
+			for index := range AutoMaxFiles {
+				writeFixture(t, filepath.Join(dir, fmt.Sprintf("junit-%03d.xml", index)), "<testsuite/>")
+			}
+			writeFixture(t, filepath.Join(dir, "junit-zzz.xml"), "<testsuite><testcase>"+element+"</testcase></testsuite>")
+			result, err := root.CollectResults(t.Context(), ResultOptions{Auto: true})
+			if err != nil || len(result.Files) != AutoMaxFiles || result.Files[0].Path != "junit-zzz.xml" {
+				t.Fatalf("late failure omitted: files=%d err=%v", len(result.Files), err)
+			}
+		})
+	}
+}
+
+func TestAutoResultsIgnoreFailureTextOutsideElements(t *testing.T) {
+	for _, content := range []string{
+		`<!-- <failure/> -->`,
+		`<!-- <error/> -->`,
+		`<system-out><![CDATA[<failure/>]]></system-out>`,
+		`<system-out><![CDATA[<error/>]]></system-out>`,
+		`<system-out>&lt;failure/&gt;</system-out>`,
+		`<failure-count>0</failure-count>`,
+	} {
+		t.Run(content, func(t *testing.T) {
+			root, dir := testRoot(t)
+			for index := range AutoMaxFiles + 2 {
+				writeFixture(t, filepath.Join(dir, fmt.Sprintf("junit-%03d.xml", index)), `<testsuite tests="1" failures="0">`+content+`</testsuite>`)
+			}
+			writeFixture(t, filepath.Join(dir, "junit-zzz.xml"), `<testsuite><testcase><failure/></testcase></testsuite>`)
+			result, err := root.CollectResults(t.Context(), ResultOptions{Auto: true})
+			if err != nil || len(result.Files) != AutoMaxFiles || result.Files[0].Path != "junit-zzz.xml" {
+				t.Fatalf("literal failure text displaced the failing report: files=%d err=%v", len(result.Files), err)
+			}
+		})
+	}
+}
+
+func TestAutoResultsPriorityIgnoresTextEncodingDeclarations(t *testing.T) {
+	for _, encoding := range []string{"US-ASCII", "ISO-8859-1", "windows-1252"} {
+		t.Run(encoding, func(t *testing.T) {
+			root, dir := testRoot(t)
+			for index := range AutoMaxFiles {
+				writeFixture(t, filepath.Join(dir, fmt.Sprintf("junit-%03d.xml", index)), "<testsuite/>")
+			}
+			output := "plain text"
+			if encoding != "US-ASCII" {
+				output = "encoded caf\xe9"
+			}
+			report := `<?xml version="1.0" encoding="` + encoding + `"?><testsuite><system-out>` + output + `</system-out><testcase><failure/></testcase></testsuite>`
+			writeFixture(t, filepath.Join(dir, "junit-zzz.xml"), report)
+			result, err := root.CollectResults(t.Context(), ResultOptions{Auto: true})
+			if err != nil || len(result.Files) != AutoMaxFiles || result.Files[0].Path != "junit-zzz.xml" || string(result.Files[0].Data) != report {
+				t.Fatalf("encoding affected discovery priority or report bytes: files=%d err=%v", len(result.Files), err)
+			}
+		})
+	}
+}
+
+func TestAutoResultsPrioritizeOpeningTagCrossingSniffLimit(t *testing.T) {
+	for _, element := range []string{"failure", "error"} {
+		t.Run(element, func(t *testing.T) {
+			root, dir := testRoot(t)
+			for index := range AutoMaxFiles {
+				writeFixture(t, filepath.Join(dir, fmt.Sprintf("junit-%03d.xml", index)), "<testsuite/>")
+			}
+			report := `<testsuite><testcase><` + element + ` message="` + strings.Repeat("x", AutoFailureBytes) + `"/></testcase></testsuite>`
+			writeFixture(t, filepath.Join(dir, "junit-zzz.xml"), report)
+			result, err := root.CollectResults(t.Context(), ResultOptions{Auto: true})
+			if err != nil || len(result.Files) != AutoMaxFiles || result.Files[0].Path != "junit-zzz.xml" {
+				t.Fatalf("partial opening tag displaced the failing report: files=%d err=%v", len(result.Files), err)
+			}
+		})
+	}
+}
+
+func TestAutoResultsDeduplicateBeforeCandidateLimit(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%v", explicit), func(t *testing.T) {
+			root, dir := testRoot(t)
+			options := ResultOptions{Auto: true, ExplicitMaxBytes: 64, ExplicitTotalBytes: 4096}
+			first := filepath.Join(dir, "junit-000.xml")
+			for index := range AutoMaxFiles + 1 {
+				name := fmt.Sprintf("junit-%03d.xml", index)
+				if explicit || index == 0 {
+					writeFixture(t, filepath.Join(dir, name), "<testsuite/>")
+				} else if err := os.Link(first, filepath.Join(dir, name)); err != nil {
+					t.Skipf("hard-link fixture unavailable: %v", err)
+				}
+				if explicit {
+					options.Paths = append(options.Paths, name)
+				}
+			}
+			writeFixture(t, filepath.Join(dir, "junit-zzz.xml"), "<testsuite/>")
+			result, err := root.CollectResults(t.Context(), options)
+			want := 2
+			if explicit {
+				want = len(options.Paths) + 1
+			}
+			if err != nil || len(result.Files) != want || result.Files[len(result.Files)-1].Path != "junit-zzz.xml" {
+				t.Fatalf("duplicates exhausted candidates: files=%d want=%d err=%v", len(result.Files), want, err)
+			}
+		})
+	}
+}
+
 func TestAutoResultsNeverFollowSymlinkCandidates(t *testing.T) {
 	root, dir := testRoot(t)
 	outside := filepath.Join(t.TempDir(), "outside.xml")

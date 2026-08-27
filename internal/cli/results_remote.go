@@ -26,24 +26,6 @@ func collectRemoteJUnitResults(ctx context.Context, target SSHTarget, workdir st
 	return collection.Summary, errors.Join(collection.Warnings...)
 }
 
-func collectRemoteJUnitResultFilesAuto(ctx context.Context, target SSHTarget, workdir, marker string) (files map[string]string, warnings []error, err error) {
-	session, err := newSSHTransportSession(ctx, target, false)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer func() { err = errors.Join(err, session.Close()) }()
-	client, err := newResolvedRunnerClient(ctx, session, target, io.Discard)
-	if err != nil {
-		return nil, nil, err
-	}
-	results, err := client.Collect(ctx, workdir, nil, true, marker)
-	if err != nil {
-		return nil, nil, err
-	}
-	files, warnings = runnerResultFiles(results)
-	return files, warnings, nil
-}
-
 func remoteTouchResultsMarker(workdir string) string {
 	return "cd " + shellQuote(workdir) + " && marker=.crabbox/results-start; if git_marker=$(git rev-parse --git-path " + shellQuote(remoteResultsMarker) + " 2>/dev/null); then marker=$git_marker; fi; mkdir -p \"$(dirname \"$marker\")\" && : > \"$marker\""
 }

@@ -394,6 +394,9 @@ func ExtractArchive(ctx context.Context, archive io.Reader, stage, archiveRoot s
 		if entries > limits.MaxEntries {
 			return invalid("copy archive exceeds entry limit (%d)", limits.MaxEntries)
 		}
+		if !filepath.IsLocal(header.Name) {
+			return invalid("copy archive contains unsafe path: %q", header.Name)
+		}
 		clean, rel, err := validatedCopyArchiveEntryPath(header.Name, archiveRoot)
 		if err != nil {
 			return err
@@ -859,27 +862,6 @@ func writeCopyArchiveTransactionMarker(name string) error {
 		return err
 	}
 	return nil
-}
-
-func SyncArchiveTree(root string) error {
-	return filepath.WalkDir(root, func(name string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return invalid("refusing to sync symlink in downloaded copy archive: %s", name)
-		}
-		file, err := os.Open(name)
-		if err != nil {
-			return fmt.Errorf("open staged copy archive path for sync: %w", err)
-		}
-		syncErr := file.Sync()
-		closeErr := file.Close()
-		if syncErr != nil && !(runtime.GOOS == "windows" && entry.IsDir()) {
-			return fmt.Errorf("sync staged copy archive path %s: %w", name, syncErr)
-		}
-		return closeErr
-	})
 }
 
 func syncCopyArchiveDirectory(name string) error {

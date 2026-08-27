@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -71,9 +73,43 @@ func (artifact Artifact) RemotePath(runtime Runtime) (string, error) {
 	return name, nil
 }
 
-// Bootstrap scripts only install/verify bytes and launch the helper; all file
-// collection, archive validation and publication algorithms live in Go.
-func InstallCommand(runtime Runtime, artifact Artifact) (string, error) {
+type Installation struct {
+	Command string
+	Input   []byte
+}
+
+// PrepareInstallation binds the install command to its wire bytes. Windows
+// PowerShell cannot reliably consume large SSH stdin streams; native tar reads
+// this single trusted executable, never a user-supplied archive.
+func PrepareInstallation(runtime Runtime, artifact Artifact) (Installation, error) {
+	if err := ValidateArtifact(artifact); err != nil {
+		return Installation{}, err
+	}
+	command, err := installCommand(runtime, artifact)
+	if err != nil {
+		return Installation{}, err
+	}
+	input := artifact.Data
+	if runtime.Target.OS == "windows" {
+		var archive bytes.Buffer
+		writer := tar.NewWriter(&archive)
+		if err := writer.WriteHeader(&tar.Header{Name: "runner.exe", Mode: 0o600, Size: int64(len(input))}); err != nil {
+			return Installation{}, err
+		}
+		if _, err := writer.Write(input); err != nil {
+			return Installation{}, err
+		}
+		if err := writer.Close(); err != nil {
+			return Installation{}, err
+		}
+		input = archive.Bytes()
+	}
+	return Installation{Command: command, Input: input}, nil
+}
+
+// Bootstrap scripts only install/verify bytes and launch the helper; all user
+// file collection, archive validation and publication algorithms live in Go.
+func installCommand(runtime Runtime, artifact Artifact) (string, error) {
 	name, err := artifact.RemotePath(runtime)
 	if err != nil {
 		return "", err
@@ -83,22 +119,17 @@ func InstallCommand(runtime Runtime, artifact Artifact) (string, error) {
 $path=` + powerShellLiteral(name) + `
 $dir=Split-Path -Parent $path
 [System.IO.Directory]::CreateDirectory($dir) | Out-Null
-$temp=Join-Path $dir ([Guid]::NewGuid().ToString('N')+'.tmp')
+$stage=Join-Path $dir ([Guid]::NewGuid().ToString('N')+'.install')
+if (Test-Path -LiteralPath $stage) { throw 'runner staging collision' }
+[System.IO.Directory]::CreateDirectory($stage) | Out-Null
+$temp=Join-Path $stage 'runner.exe'
 try {
-  $file=[System.IO.File]::Open($temp,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)
-  try {
-    $stdin = [Console]::OpenStandardInput()
-    $remaining = [Int64]` + strconv.Itoa(len(artifact.Data)) + `
-    $buffer = New-Object byte[] 65536
-    while ($remaining -gt 0) {
-      $read = $stdin.Read($buffer, 0, [int][Math]::Min([Int64]$buffer.Length, $remaining))
-      if ($read -le 0) { throw 'runner input ended before the artifact byte count' }
-      $file.Write($buffer, 0, $read)
-      $remaining -= $read
-    }
-    $file.Flush($true)
-  } finally { $file.Dispose() }
+  & tar.exe -xf - -C $stage runner.exe
+  if ($LASTEXITCODE -ne 0) { throw 'runner bootstrap transfer failed' }
+  if ((Get-Item -LiteralPath $temp).Length -ne [Int64]` + strconv.Itoa(len(artifact.Data)) + `) { throw 'runner artifact size mismatch' }
   if ((Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant() -ne '` + artifact.SHA256 + `') { throw 'runner digest mismatch' }
+  $file=[IO.File]::Open($temp,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+  try { $file.Flush($true) } finally { $file.Dispose() }
   if (Test-Path -LiteralPath $path) {
     if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '` + artifact.SHA256 + `') { throw 'existing runner digest mismatch' }
   } else {
@@ -107,7 +138,7 @@ try {
       if (-not (Test-Path -LiteralPath $path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '` + artifact.SHA256 + `') { throw }
     }
   }
-} finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
+} finally { if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue } }
 `, nil
 	}
 	script := `set -eu
@@ -152,7 +183,7 @@ func InstallUploadedCommand(runtime Runtime, artifact Artifact, uploaded string)
 	if uploaded == "" || strings.ContainsAny(uploaded, "\x00\r\n") {
 		return "", errors.New("invalid uploaded runner path")
 	}
-	command, err := InstallCommand(runtime, artifact)
+	command, err := installCommand(runtime, artifact)
 	if err != nil {
 		return "", err
 	}

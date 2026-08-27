@@ -53,6 +53,9 @@ func TestArchivePreservesLiteralPOSIXNames(t *testing.T) {
 }
 
 func TestCopyArchiveRoundTripNormalizesDownloads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX download permission normalization")
+	}
 	source := filepath.Join(t.TempDir(), "source")
 	if err := os.Mkdir(source, 0o750); err != nil {
 		t.Fatal(err)
