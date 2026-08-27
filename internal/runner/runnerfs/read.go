@@ -3,6 +3,8 @@
 package runnerfs
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -52,12 +54,15 @@ func (r *Root) Read(name string, limit int64) (File, error) {
 	if limit < 1 || limit >= 1<<62 {
 		return File{}, errors.New("invalid file byte limit")
 	}
-	return r.readDistinct(name, limit, nil)
+	return r.readDistinct(context.Background(), name, limit, nil)
 }
 
 var errDuplicateReport = errors.New("report file already collected")
 
-func (r *Root) readDistinct(name string, limit int64, seen []os.FileInfo) (File, error) {
+func (r *Root) readDistinct(ctx context.Context, name string, limit int64, seen []os.FileInfo) (File, error) {
+	if err := ctx.Err(); err != nil {
+		return File{}, err
+	}
 	file, err := r.openRegular(name)
 	if err != nil {
 		return File{}, err
@@ -75,10 +80,11 @@ func (r *Root) readDistinct(name string, limit int64, seen []os.FileInfo) (File,
 	if limit <= 0 || before.Size() > limit {
 		return File{}, ErrLimit
 	}
-	data, err := io.ReadAll(io.LimitReader(file, limit+1))
-	if err != nil {
+	var buffer bytes.Buffer
+	if err := Copy(ctx, &buffer, io.LimitReader(file, limit+1)); err != nil {
 		return File{}, err
 	}
+	data := buffer.Bytes()
 	if int64(len(data)) > limit {
 		return File{}, ErrLimit
 	}
@@ -88,6 +94,9 @@ func (r *Root) readDistinct(name string, limit int64, seen []os.FileInfo) (File,
 	}
 	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || int64(len(data)) != after.Size() {
 		return File{}, ErrChanged
+	}
+	if err := ctx.Err(); err != nil {
+		return File{}, err
 	}
 	return File{Path: name, Data: data, ModTime: after.ModTime(), identity: after}, nil
 }

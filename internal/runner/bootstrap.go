@@ -123,12 +123,7 @@ $stage=Join-Path $dir ([Guid]::NewGuid().ToString('N')+'.install')
 if (Test-Path -LiteralPath $stage) { throw 'runner staging collision' }
 [System.IO.Directory]::CreateDirectory($stage) | Out-Null
 $temp=Join-Path $stage 'runner.exe'
-function Get-CrabboxRunnerHash([string]$Name) {
-  $file=[IO.File]::OpenRead($Name)
-  $hash=[Security.Cryptography.SHA256]::Create()
-  try { return [BitConverter]::ToString($hash.ComputeHash($file)).Replace('-','').ToLowerInvariant() }
-  finally { $hash.Dispose(); $file.Dispose() }
-}
+` + windowsDigestFunction + `
 try {
   & tar.exe -xf - -C $stage runner.exe
   if ($LASTEXITCODE -ne 0) { throw 'runner bootstrap transfer failed' }
@@ -223,10 +218,22 @@ func invokeCommand(runtime Runtime, artifact Artifact, textOnly bool, inputBound
 		if !textOnly {
 			return "", errors.New("native Windows shell transport requires base64 framing")
 		}
-		return `$ErrorActionPreference='Stop'; $path=` + powerShellLiteral(name) + `; if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne '` + artifact.SHA256 + `') { throw 'runner digest mismatch' }; & $path ` + mode + `; exit $LASTEXITCODE`, nil
+		return `$ErrorActionPreference='Stop'
+` + windowsDigestFunction + `
+$path=` + powerShellLiteral(name) + `
+if ((Get-CrabboxRunnerHash $path) -ne '` + artifact.SHA256 + `') { throw 'runner digest mismatch' }
+& $path ` + mode + `
+exit $LASTEXITCODE`, nil
 	}
 	return "sh -c " + shellLiteral("set -eu\n"+digestFunction+"\ndest="+shellLiteral(name)+"\n[ ! -L \"$dest\" ] && [ -f \"$dest\" ] && [ \"$(digest \"$dest\")\" = '"+artifact.SHA256+"' ] || { echo 'runner digest mismatch' >&2; exit 2; }\nexec \"$dest\" "+mode), nil
 }
+
+const windowsDigestFunction = `function Get-CrabboxRunnerHash([string]$Name) {
+  $file=[IO.File]::OpenRead($Name)
+  $hash=[Security.Cryptography.SHA256]::Create()
+  try { return [BitConverter]::ToString($hash.ComputeHash($file)).Replace('-','').ToLowerInvariant() }
+  finally { $hash.Dispose(); $file.Dispose() }
+}`
 
 const digestFunction = `digest() {
   if command -v sha256sum >/dev/null 2>&1; then value=$(sha256sum < "$1");

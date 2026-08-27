@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProbeUsesActualRuntime(t *testing.T) {
@@ -112,5 +114,73 @@ func TestBootstrapRejectsArtifactPathInjection(t *testing.T) {
 		if _, err := artifact.RemotePath(platform); err == nil {
 			t.Fatalf("accepted %q", digest)
 		}
+	}
+}
+
+func TestWindowsInvocationWithoutHashModule(t *testing.T) {
+	shell := "pwsh"
+	if runtime.GOOS == "windows" {
+		shell = "powershell.exe"
+	}
+	shell, err := exec.LookPath(shell)
+	if err != nil {
+		t.Skip("PowerShell unavailable")
+	}
+	artifact, err := DevelopmentArtifact(t.Context(), Target{OS: runtime.GOOS, Arch: runtime.GOARCH})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the Windows command renderer with a native executable on either
+	// host. The protocol identity remains that executable's actual identity.
+	installed := artifact
+	installed.Identity.OS = "windows"
+	platform := Runtime{Target: Target{OS: "windows", Arch: runtime.GOARCH}, Home: t.TempDir()}
+	name, err := installed.RemotePath(platform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, artifact.Data, 0700); err != nil {
+		t.Fatal(err)
+	}
+	command, err := InvokeCommand(platform, installed, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("EXACT"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var request bytes.Buffer
+	if err := WriteRequest(&request, Request{BuildID: artifact.Identity.BuildID, Operation: Collect, Workdir: root, Paths: []string{"file"}}, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	run := func() ([]byte, []byte, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+		child := exec.CommandContext(ctx, shell, "-NoProfile", "-NonInteractive", "-Command", "function Get-FileHash { throw 'hash module unavailable' };\n"+command)
+		child.Stdin = strings.NewReader(base64.StdEncoding.EncodeToString(request.Bytes()))
+		var output, diagnostic bytes.Buffer
+		child.Stdout, child.Stderr = &output, &diagnostic
+		err := child.Run()
+		return output.Bytes(), diagnostic.Bytes(), err
+	}
+	output, diagnostic, err := run()
+	if err != nil {
+		t.Fatalf("invoke: %v: %s", err, diagnostic)
+	}
+	var received []byte
+	_, err = ReadResponse(t.Context(), base64.NewDecoder(base64.StdEncoding, bytes.NewReader(output)), artifact.Identity, Collect, func(_ FileInfo, body io.Reader) error { received, err = io.ReadAll(body); return err })
+	if err != nil || string(received) != "EXACT" {
+		t.Fatalf("received=%q err=%v diagnostic=%s", received, err, diagnostic)
+	}
+	if err := os.WriteFile(name, []byte("corruption"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	output, diagnostic, err = run()
+	if err == nil || len(output) != 0 || !bytes.Contains(diagnostic, []byte("digest mismatch")) {
+		t.Fatalf("corruption accepted: %v stdout=%q stderr=%s", err, output, diagnostic)
 	}
 }

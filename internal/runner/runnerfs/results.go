@@ -80,6 +80,9 @@ func containsJUnitFailure(data []byte) bool {
 // external symlink is never treated as a report, even if its filename matches.
 func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Results, error) {
 	var result Results
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	var identities []os.FileInfo
 	total := int64(0)
 	if options.ExplicitMaxBytes < 1 || options.ExplicitTotalBytes < 1 {
@@ -93,8 +96,11 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 		}
 		remaining := options.ExplicitTotalBytes - total
 		limit := min(options.ExplicitMaxBytes, remaining)
-		file, err := r.readDistinct(name, limit, identities)
+		file, err := r.readDistinct(ctx, name, limit, identities)
 		if err != nil {
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
 			if errors.Is(err, ErrLimit) || errors.Is(err, ErrChanged) {
 				result.Warnings = append(result.Warnings, Warning{name, err.Error()})
 			}
@@ -105,7 +111,7 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 		total += int64(len(file.Data))
 	}
 	if !options.Auto {
-		return result, nil
+		return result, ctx.Err()
 	}
 	candidates, warnings, err := r.resultCandidates(ctx, options.After, identities)
 	result.Warnings = append(result.Warnings, warnings...)
@@ -127,8 +133,11 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		file, err := r.readDistinct(candidate.name, AutoMaxFileBytes, identities)
+		file, err := r.readDistinct(ctx, candidate.name, AutoMaxFileBytes, identities)
 		if err != nil {
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
 			if errors.Is(err, ErrLimit) {
 				result.Warnings = append(result.Warnings, Warning{candidate.name, fmt.Sprintf("report exceeds %d-byte per-file limit", AutoMaxFileBytes)})
 			} else if errors.Is(err, ErrChanged) {
@@ -151,7 +160,7 @@ func (r *Root) CollectResults(ctx context.Context, options ResultOptions) (Resul
 		result.Files = append(result.Files, file)
 		identities = append(identities, file.identity)
 	}
-	return result, nil
+	return result, ctx.Err()
 }
 
 func (r *Root) resultCandidates(ctx context.Context, after time.Time, excluded []os.FileInfo) ([]resultCandidate, []Warning, error) {

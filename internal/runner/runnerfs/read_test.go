@@ -2,6 +2,7 @@ package runnerfs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -73,6 +74,17 @@ func TestReadLimitNeverReturnsTruncatedData(t *testing.T) {
 	file, err = root.Read("report", int64(len(data)-1))
 	if !errors.Is(err, ErrLimit) || len(file.Data) != 0 {
 		t.Fatalf("partial result: %+v %v", file, err)
+	}
+}
+
+func TestDistinctReadHonorsCancellationWithoutReturningFileBytes(t *testing.T) {
+	root, dir := testRoot(t)
+	writeFixture(t, filepath.Join(dir, "report"), "CONTENT")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	file, err := root.readDistinct(ctx, "report", 64, nil)
+	if !errors.Is(err, context.Canceled) || len(file.Data) != 0 {
+		t.Fatalf("canceled read=%+v err=%v", file, err)
 	}
 }
 

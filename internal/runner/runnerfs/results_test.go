@@ -250,6 +250,15 @@ func TestCanceledResultCollectionReturnsCancellation(t *testing.T) {
 	}
 }
 
+func TestCanceledEmptyResultCollectionReturnsCancellation(t *testing.T) {
+	root, _ := testRoot(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := root.CollectResults(ctx, ResultOptions{}); err != context.Canceled {
+		t.Fatalf("empty canceled collection: %v", err)
+	}
+}
+
 func TestExplicitLimitDoesNotChargeDuplicatePaths(t *testing.T) {
 	root, dir := testRoot(t)
 	writeFixture(t, filepath.Join(dir, "one.xml"), "1234")

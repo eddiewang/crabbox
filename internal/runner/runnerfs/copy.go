@@ -25,7 +25,7 @@ func Copy(ctx context.Context, dst io.Writer, src io.Reader) error {
 			}
 		}
 		if readErr == io.EOF {
-			return nil
+			return ctx.Err()
 		}
 		if readErr != nil {
 			return readErr

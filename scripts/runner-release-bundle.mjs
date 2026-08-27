@@ -12,6 +12,8 @@ export const runnerBundleMagic = Buffer.from("CBXRPK01", "ascii");
 export const maxRunnerBytes = 32 * 1024 * 1024;
 export const maxRunnerBundleBytes = 6 * maxRunnerBytes + 65548;
 export const runnerSHA256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+export const isRunnerBuildID = (value) =>
+  typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
 
 function exactKeys(value, expected) {
   if (
@@ -43,7 +45,7 @@ export function unpackRunnerBundle(bytes, expectedBuildId) {
   exactKeys(manifest, ["version", "buildId", "entries"]);
   if (
     manifest.version !== 1 ||
-    !/^[0-9a-f]{40}$/.test(expectedBuildId) ||
+    !isRunnerBuildID(expectedBuildId) ||
     manifest.buildId !== expectedBuildId ||
     !Array.isArray(manifest.entries) ||
     manifest.entries.length !== runnerTargets.length

@@ -15,7 +15,7 @@ import {
 const sourceCommit = "b".repeat(40);
 const root = path.resolve(import.meta.dirname, "..");
 
-function fixture(t) {
+function fixture(t, sourceCommit = "b".repeat(40)) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-runner-bundle-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const raw = path.join(directory, "raw");
@@ -43,6 +43,18 @@ function fixture(t) {
   };
   return { directory, bytes, provenance };
 }
+
+test("runner packer and reader accept both supported build ID widths", (t) => {
+  for (const width of [40, 64]) {
+    const id = "c".repeat(width);
+    const { bytes } = fixture(t, id);
+    const unpacked = unpackRunnerBundle(bytes, id);
+    assert.equal(unpacked.manifest.buildId, id);
+    assert.equal(unpacked.members.length, 6);
+    assert.throws(() => unpackRunnerBundle(bytes, "c".repeat(width - 1)), /identity/);
+    assert.throws(() => unpackRunnerBundle(bytes, "g".repeat(width)), /identity/);
+  }
+});
 
 test("protected runner extraction reads candidate bytes without executing candidate code", (t) => {
   const { directory, bytes, provenance } = fixture(t);

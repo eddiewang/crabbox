@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import {
+  isRunnerBuildID,
   maxRunnerBytes,
   runnerSHA256,
   runnerTargets,
@@ -11,7 +12,7 @@ import {
 } from "./runner-release-bundle.mjs";
 
 const [directory, buildId, output] = process.argv.slice(2);
-if (process.argv.length !== 5 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(buildId ?? "")) {
+if (process.argv.length !== 5 || !isRunnerBuildID(buildId)) {
   throw new Error(
     "usage: pack-release-runners.mjs <raw-runner-directory> <source-build-id> <output>",
   );
