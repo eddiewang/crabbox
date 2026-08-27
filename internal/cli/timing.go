@@ -499,3 +499,14 @@ func includeObservedRunnerTail(report *TimingReport, startedAt, endedAt time.Tim
 	}
 	report.RunnerTotalMs = max(report.RunnerTotalMs, endedAt.Sub(startedAt).Milliseconds())
 }
+
+func includeObservedDelegatedRunnerTail(report *TimingReport, startedAt, endedAt time.Time, cleanup time.Duration) {
+	if report == nil || startedAt.IsZero() || endedAt.Before(startedAt) {
+		return
+	}
+	tail := endedAt.Sub(startedAt) - cleanup
+	if ms := tail.Milliseconds(); ms > 0 {
+		report.RunnerTotalMs += ms
+		report.RunnerPhases = append(report.RunnerPhases, RunnerPhase{Name: "unattributed", Ms: ms})
+	}
+}

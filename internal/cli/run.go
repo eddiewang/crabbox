@@ -473,9 +473,6 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var runFailure error
 	recorder := &runRecorder{}
 	var finalizeTerminalRun func()
-	defer func() {
-		recorder.Failed(runFailure)
-	}()
 	var finalTimingReport *timingReport
 	var artifactChangeResults []ArtifactChangeResult
 	var timingRecordRepo Repo
@@ -483,47 +480,44 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	var timingRecordColdRun *bool
 	var delegatedTimingCapture *capturedTimingReportWriter
 	var runnerObservedStartedAt time.Time
-	defer func() {
+	terminalReceiptExpected := strings.TrimSpace(*attestOut) != ""
+	snapshotFinalTimingReport := func() (timingReport, bool) {
 		if finalTimingReport == nil {
-			return
+			return timingReport{}, false
 		}
 		report := *finalTimingReport
 		report.ArtifactChanges = artifactChangeResults
 		cleanup.apply(&report)
 		if report.SyncDelegated {
-			if ms := time.Since(runnerObservedStartedAt).Milliseconds(); ms > 0 {
-				report.RunnerTotalMs += ms
-				report.RunnerPhases = append(report.RunnerPhases, RunnerPhase{Name: "unattributed", Ms: ms})
-			}
+			includeObservedDelegatedRunnerTail(&report, runnerObservedStartedAt, time.Now(), cleanup.Duration)
 		} else {
 			includeObservedRunnerTail(&report, runnerObservedStartedAt, time.Now())
 		}
-		report = finalizeTimingReport(report)
-		if timingRecordEnabled {
-			recordColdRun := timingRecordColdRun
-			if benchmarkCtx.ColdRun != nil {
-				recordColdRun = benchmarkCtx.ColdRun
-			}
-			record := newBenchmarkTimingRecord(time.Now().UTC(), firstNonBlank(strings.TrimSpace(benchmarkCtx.Source), "run"), report, timingRecordRepo, timingRecordCommand, recordColdRun, benchmarkCtx.RepeatIndex)
-			if writeErr := appendBenchmarkTimingRecord(timingRecordPath, record); writeErr != nil {
-				if err == nil {
-					err = writeErr
-				} else {
-					fmt.Fprintf(a.Stderr, "warning: benchmark timing record skipped: %v\n", writeErr)
-				}
-			} else {
-				if benchmarkCtx.OnRecord != nil {
-					benchmarkCtx.OnRecord()
-				}
-				fmt.Fprintf(a.Stderr, "benchmark timing record appended path=%s observations=1\n", timingRecordPath)
-			}
+		if err != nil && report.ExitCode == 0 {
+			report.ExitCode = exitCodeForError(err, 7)
+			report.RunStatus, report.ErrorKind = "", ""
 		}
+		return finalizeTimingReport(report), true
+	}
+	defer func() {
 		if !*timingJSON {
 			return
 		}
-		if writeErr := writeTimingJSON(a.Stderr, report); writeErr != nil && err == nil {
-			err = writeErr
+		report, ok := snapshotFinalTimingReport()
+		if !ok {
+			return
 		}
+		if writeErr := writeTimingJSON(a.Stderr, report); writeErr != nil && err == nil {
+			// The terminal receipt is already finalized when this defer runs so
+			// timing JSON stays last. Do not rewrite an attested command result
+			// because its final output sink failed afterward.
+			if !terminalReceiptExpected && recorder.runID == "" {
+				err = writeErr
+			}
+		}
+	}()
+	defer func() {
+		recorder.Failed(runFailure)
 	}()
 	// Cleanup runs first; the final timing JSON must still be the last line.
 	defer func() {
@@ -534,6 +528,29 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 	defer func() {
 		if finalizeTerminalRun != nil {
 			finalizeTerminalRun()
+		}
+	}()
+	defer func() {
+		report, ok := snapshotFinalTimingReport()
+		if !ok || !timingRecordEnabled {
+			return
+		}
+		recordColdRun := timingRecordColdRun
+		if benchmarkCtx.ColdRun != nil {
+			recordColdRun = benchmarkCtx.ColdRun
+		}
+		record := newBenchmarkTimingRecord(time.Now().UTC(), firstNonBlank(strings.TrimSpace(benchmarkCtx.Source), "run"), report, timingRecordRepo, timingRecordCommand, recordColdRun, benchmarkCtx.RepeatIndex)
+		if writeErr := appendBenchmarkTimingRecord(timingRecordPath, record); writeErr != nil {
+			if err == nil {
+				err = writeErr
+			} else {
+				fmt.Fprintf(a.Stderr, "warning: benchmark timing record skipped: %v\n", writeErr)
+			}
+		} else {
+			if benchmarkCtx.OnRecord != nil {
+				benchmarkCtx.OnRecord()
+			}
+			fmt.Fprintf(a.Stderr, "benchmark timing record appended path=%s observations=1\n", timingRecordPath)
 		}
 	}()
 	command := fs.Args()

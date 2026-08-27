@@ -2044,6 +2044,32 @@ func TestRunnerTotalIncludesPostCommandTailAsUnattributed(t *testing.T) {
 	}
 }
 
+func TestDelegatedRunnerTailExcludesMeasuredCleanup(t *testing.T) {
+	startedAt := time.Unix(100, 0)
+	report := TimingReport{
+		Provider:      "sandbox",
+		RunnerTotalMs: 500,
+		RunnerPhases:  []RunnerPhase{{Name: "delegated.opaque", Ms: 500}},
+	}
+	cleanup := leaseCleanupResult{Duration: 100 * time.Millisecond}
+	cleanup.apply(&report)
+	includeObservedDelegatedRunnerTail(&report, startedAt, startedAt.Add(350*time.Millisecond), cleanup.Duration)
+	report = finalizeTimingReport(report)
+
+	if report.RunnerTotalMs != 850 {
+		t.Fatalf("runner total=%d, want provider 500 + client tail 250 + cleanup 100", report.RunnerTotalMs)
+	}
+	if len(report.RunnerPhases) != 3 {
+		t.Fatalf("runner phases=%#v", report.RunnerPhases)
+	}
+	if phase := report.RunnerPhases[1]; phase.Name != "cleanup" || phase.Ms != 100 {
+		t.Fatalf("cleanup phase=%#v", phase)
+	}
+	if phase := report.RunnerPhases[2]; phase.Name != "unattributed" || phase.Ms != 250 {
+		t.Fatalf("unattributed phase=%#v", phase)
+	}
+}
+
 func TestFailedReplacementAcquirePreservesLegacyLeaseDuration(t *testing.T) {
 	timings := runTimings{
 		lease: 600 * time.Millisecond,
@@ -3524,6 +3550,120 @@ func TestRunCommandTimingJSONRemainsFinalLineWithCleanup(t *testing.T) {
 	}
 }
 
+type rejectTimingJSONWriter struct {
+	bytes.Buffer
+	rejected bool
+}
+
+func (w *rejectTimingJSONWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"runnerTotalMs"`)) {
+		w.rejected = true
+		return 0, errors.New("timing JSON sink unavailable")
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestRunCommandTimingJSONWriteFailureDoesNotRewriteReceipt(t *testing.T) {
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	sshPath := filepath.Join(dir, "ssh")
+	receiptPath := filepath.Join(dir, "receipt.json")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	_, sshPort, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installWorkspaceOwnerAwareSSH(t, sshPath, "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", sshPort)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, ".crabbox.yaml"))
+
+	var stdout bytes.Buffer
+	var stderr rejectTimingJSONWriter
+	err = (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "run-env-profile-test",
+		"--no-sync",
+		"--timing-json",
+		"--stop-after", "success",
+		"--attest", receiptPath,
+		"--", "true",
+	})
+	if err != nil {
+		t.Fatalf("runCommand error=%v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if !stderr.rejected {
+		t.Fatal("timing JSON writer was not exercised")
+	}
+	data, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := decodeTerminalRunReceipt(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.ExitCode != 0 {
+		t.Fatalf("receipt exit=%d, want 0", receipt.ExitCode)
+	}
+}
+
+func TestRunCommandTimingJSONWriteFailureIsReturnedWithoutReceipt(t *testing.T) {
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	sshPath := filepath.Join(dir, "ssh")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	_, sshPort, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installWorkspaceOwnerAwareSSH(t, sshPath, "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", sshPort)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, ".crabbox.yaml"))
+
+	var stdout bytes.Buffer
+	var stderr rejectTimingJSONWriter
+	err = (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "run-env-profile-test",
+		"--no-sync",
+		"--timing-json",
+		"--stop-after", "success",
+		"--", "true",
+	})
+	if err == nil || !strings.Contains(err.Error(), "timing JSON sink unavailable") {
+		t.Fatalf("runCommand error=%v, want timing JSON writer failure", err)
+	}
+	if !stderr.rejected {
+		t.Fatal("timing JSON writer was not exercised")
+	}
+}
+
 func TestRunCommandTimingJSONSurfacesCleanupFailure(t *testing.T) {
 	dir := t.TempDir()
 	isolateRunTestUserDirs(t, dir)
@@ -3845,6 +3985,7 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 		"--provider", "run-env-profile-test",
 		"--no-sync",
 		"--timing-record", timingRecordPath,
+		"--timing-json",
 		"--attest", receiptPath,
 		"--", "true",
 	})
@@ -3865,6 +4006,24 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 	}
 	if !strings.Contains(exitErr.Message, "open benchmark timing store") {
 		t.Fatalf("missing timing-record failure: %v", exitErr)
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	var report TimingReport
+	jsonLine := ""
+	jsonCount := 0
+	for _, line := range lines {
+		var candidate TimingReport
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Provider != "" {
+			report = candidate
+			jsonLine = line
+			jsonCount++
+		}
+	}
+	if jsonCount != 1 || jsonLine != lines[len(lines)-1] || report.ExitCode != 2 {
+		t.Fatalf("timing JSON count=%d final=%t exit=%d, want one final exit 2 report\nstderr:\n%s", jsonCount, jsonLine == lines[len(lines)-1], report.ExitCode, stderr.String())
+	}
+	if receiptIndex, jsonIndex := strings.LastIndex(stderr.String(), "artifact kind=receipt"), strings.LastIndex(stderr.String(), jsonLine); receiptIndex < 0 || jsonIndex <= receiptIndex {
+		t.Fatalf("receipt was not written before final timing JSON:\n%s", stderr.String())
 	}
 }
 
