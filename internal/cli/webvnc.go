@@ -3189,7 +3189,7 @@ func resolveWebVNCPortalCredentials(
 	if target.TargetOS == targetMacOS {
 		return resolveMacOSWebVNCCredentials(ctx, cfg, target, readPassword)
 	}
-	password, _ := readPassword(ctx, target, vncPasswordCommand(target))
+	password, _ := readPassword(ctx, target, remoteVNCCredentialReadCommand(target))
 	return rfbCredentials{Password: strings.TrimSpace(password)}, localWebVNCAuthAuto, nil
 }
 
@@ -3357,7 +3357,7 @@ func (a App) directSSHWebVNC(ctx context.Context, cfg Config, id, localPort stri
 	if err := verifyVNCForegroundTunnelListener(tunnel, tunnelPort); err != nil {
 		return exit(5, "verify direct SSH WebVNC tunnel before credential retrieval: %v", err)
 	}
-	passwordOutput, passwordErr := runSSHOutput(ctx, target, vncPasswordCommand(target))
+	passwordOutput, passwordErr := runSSHOutput(ctx, target, remoteVNCCredentialReadCommand(target))
 	password := strings.TrimSpace(passwordOutput)
 	if passwordErr != nil && !allowNone {
 		return exit(5, "read direct SSH WebVNC credential: %v", passwordErr)
@@ -3423,7 +3423,7 @@ func (a App) directSSHWindowsWebVNC(
 		case <-bridgeCtx.Done():
 		}
 	}()
-	password, err := runSSHOutput(ctx, target, vncPasswordCommand(target))
+	password, err := runSSHOutput(ctx, target, remoteVNCCredentialReadCommand(target))
 	if err != nil {
 		return exit(5, "read native Windows VNC credential: %v", err)
 	}
@@ -3525,7 +3525,7 @@ func (a App) directSSHWebVNCStatus(ctx context.Context, cfg Config, id, localPor
 		authenticationErr = verifyDirectSSHWebVNCListenerOwner(localPort, expectedListenerOwnerPID)
 		if authenticationErr == nil {
 			var passwordErr error
-			password, passwordErr = runSSHOutput(ctx, target, vncPasswordCommand(target))
+			password, passwordErr = runSSHOutput(ctx, target, remoteVNCCredentialReadCommand(target))
 			password = strings.TrimSpace(password)
 			if passwordErr != nil && !allowNone {
 				authenticationErr = passwordErr

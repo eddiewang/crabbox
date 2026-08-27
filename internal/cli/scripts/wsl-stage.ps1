@@ -34,8 +34,8 @@ try {
     if (@DISCARD@) { exit 0 }
     $f.Position = 0
     $r = [IO.BinaryReader]::new($f)
-    $d = $r.ReadBytes(48)
-    if ($d.Length -ne 48 -or [Text.Encoding]::ASCII.GetString($d,0,8) -cne 'CBXFLAT1') { throw 'invalid WSL2 descriptor' }
+    $d = $r.ReadBytes(80)
+    if ($d.Length -ne 80 -or [Text.Encoding]::ASCII.GetString($d,0,8) -cne 'CBXFLAT2') { throw 'invalid WSL2 descriptor' }
     $w = [BitConverter]::ToUInt32($d,8)
     if (!$w -or $w -gt 32768) { throw 'invalid WSL2 program length' }
     $b = $r.ReadBytes($w)

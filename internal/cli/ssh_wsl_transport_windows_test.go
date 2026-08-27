@@ -5,7 +5,6 @@ package cli
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -626,23 +625,31 @@ func TestWSLStageLauncherRejectsSameNonceValidReplacement(t *testing.T) {
 	home, nonce := t.TempDir(), strings.Repeat("c", 32)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	original, _ := newTestWSLStageSpool(t, []byte("original"))
-	replacement, _ := newTestWSLStageSpool(t, []byte("replacement"))
-	reader, err := replacement.input.reset()
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ready := writeWSLStageReady(t, home, nonce, data)
-	output, err := runWindowsPowerShellScript(t, decodePowerShellCommand(t, wslStageLauncherCommand(nonce, original.size, original.digest(), wslStageCMD)))
-	if err == nil || !bytes.Contains(output, []byte("WSL2 stage")) {
-		t.Fatalf("same-nonce replacement output=%q err=%v", output, err)
-	}
-	if preserved, readErr := os.ReadFile(ready); readErr != nil || !bytes.Equal(preserved, data) {
-		t.Fatalf("unowned same-nonce replacement was deleted or modified: err=%v", readErr)
+	original, raw := newTestWSLStageSpool(t, []byte("original"))
+	_, replacement := newTestWSLStageSpool(t, []byte("replaced"))
+	for _, test := range []struct {
+		name   string
+		data   []byte
+		mutate int
+	}{
+		{"valid envelope", replacement, -1},
+		{"descriptor byte", raw, 40},
+		{"blinder byte", raw, wslStageHeaderSize - 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := bytes.Clone(test.data)
+			if test.mutate >= 0 {
+				data[test.mutate] ^= 1
+			}
+			ready := writeWSLStageReady(t, home, nonce, data)
+			output, err := runWindowsPowerShellScript(t, decodePowerShellCommand(t, wslStageLauncherCommand(nonce, original.size, original.digest(), wslStageCMD)))
+			if err == nil || !bytes.Contains(output, []byte("WSL2 stage digest mismatch")) {
+				t.Fatalf("same-nonce replacement output=%q err=%v", output, err)
+			}
+			if preserved, readErr := os.ReadFile(ready); readErr != nil || !bytes.Equal(preserved, data) {
+				t.Fatalf("unowned same-nonce replacement was deleted or modified: err=%v", readErr)
+			}
+		})
 	}
 }
 
@@ -651,13 +658,19 @@ func TestWSLStageLauncherIsFixedAndCarriesDigestBinding(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	spool, raw := newTestWSLStageSpool(t, []byte("original"))
+	sensitivePrefix := wslStageHeaderSize + int(binary.LittleEndian.Uint32(raw[8:])) + int(binary.LittleEndian.Uint32(raw[12:])) + 1
 	for _, test := range []struct {
 		name, suffix           string
 		mutate, missing, probe bool
 		size                   int
+		blinder                bool
 	}{
 		{name: "native disposition declaration compiles and invokes", suffix: ".ready", size: len(raw)},
 		{name: "incomplete partial uses exact prefix", suffix: ".part", size: 13},
+		{name: "partial inside blinder", suffix: ".part", size: wslStageHeaderSize - 1},
+		{name: "complete blinded descriptor", suffix: ".part", size: wslStageHeaderSize},
+		{name: "sensitive prefix includes blinder", suffix: ".part", size: sensitivePrefix},
+		{name: "changed blinder preserves sensitive partial", suffix: ".part", size: sensitivePrefix, mutate: true, blinder: true},
 		{name: "changed partial survives", suffix: ".part", size: 13, mutate: true},
 		{name: "changed ready survives", suffix: ".ready", size: len(raw), mutate: true},
 		{name: "already absent", suffix: ".ready", size: len(raw), missing: true},
@@ -674,7 +687,11 @@ func TestWSLStageLauncherIsFixedAndCarriesDigestBinding(t *testing.T) {
 			digest := sha256.Sum256(expected)
 			data := bytes.Clone(expected)
 			if test.mutate {
-				data[len(data)-1] ^= 1
+				index := len(data) - 1
+				if test.blinder {
+					index = wslStageHeaderSize - 1
+				}
+				data[index] ^= 1
 			}
 			path := filepath.Join(home, filepath.FromSlash(wslStageRoot), name)
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -877,7 +894,7 @@ func TestWSLStageFrameworkInputPreamble(t *testing.T) {
 				}
 				frame := append(append([]byte(helper), []byte(command)...), payload...)
 				path := filepath.Join(t.TempDir(), "frame")
-				if err := os.WriteFile(path, frame, 0600); err != nil {
+				if err := os.WriteFile(path, raw, 0600); err != nil {
 					t.Fatal(err)
 				}
 				flag := "$false"
@@ -889,7 +906,9 @@ func TestWSLStageFrameworkInputPreamble(t *testing.T) {
 [Environment]::CurrentDirectory=` + psQuote(bin) + `
 $file=[IO.File]::OpenRead(` + psQuote(path) + `)
 try {
-  & ([ScriptBlock]::Create(` + psQuote(owner) + `)) $file ([Convert]::FromBase64String('` + base64.StdEncoding.EncodeToString(raw[:wslStageHeaderSize]) + `')) '` + strings.Repeat("a", 32) + `'
+  $descriptor = [IO.BinaryReader]::new($file).ReadBytes(` + fmt.Sprint(wslStageHeaderSize) + `)
+  $file.Position += ` + fmt.Sprint(len(owner)) + `
+  & ([ScriptBlock]::Create(` + psQuote(owner) + `)) $file $descriptor '` + strings.Repeat("a", 32) + `'
 } finally { $file.Dispose() }`
 				process := windowsPowerShellScriptCommand(t, script)
 				// Encoding changes belong only to this disposable test console.

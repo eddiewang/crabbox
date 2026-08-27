@@ -924,7 +924,7 @@ func TestWorkspaceOwnerWSL2StagesThenExecutesOnceWithoutStdin(t *testing.T) {
 			return "", err
 		}
 		data, err := io.ReadAll(reader)
-		if err != nil || len(data) != int(spool.size) || string(data[:8]) != "CBXFLAT1" {
+		if err != nil || len(data) != int(spool.size) || string(data[:8]) != "CBXFLAT2" {
 			t.Fatalf("invalid staged owner spool bytes=%d err=%v", len(data), err)
 		}
 		if spool.size > 1<<20 || wslStageBudget(timing.stage, timing.idle, spool.size) != sshTransportTiming(sshCommandLimit{execution: workspaceOwnerRemoteTimeout, control: true}).stage {

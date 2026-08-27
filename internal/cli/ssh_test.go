@@ -798,7 +798,7 @@ func TestWSL2WrapsLargeRemoteBelowWindowsCommandLimit(t *testing.T) {
 
 func decodeWSLStage(t *testing.T, data []byte) (owner, helper, command string, payload []byte) {
 	t.Helper()
-	if len(data) < wslStageHeaderSize || string(data[:8]) != "CBXFLAT1" {
+	if len(data) < wslStageHeaderSize || string(data[:8]) != "CBXFLAT2" {
 		t.Fatal("invalid envelope descriptor")
 	}
 	offset := wslStageHeaderSize
@@ -840,7 +840,7 @@ func TestWSL2StagedTransportBuildsExactPrivateSpool(t *testing.T) {
 	if command != remote || helper != wslLinuxHelper || !bytes.Equal(input, payload) || sha256.Sum256(data) != spool.digest() {
 		t.Fatal("envelope changed exact bytes")
 	}
-	for _, index := range []int{0, 8, 40, len(data) - 1} {
+	for _, index := range []int{0, 8, 40, wslStageBlindingOffset, wslStageHeaderSize - 1, len(data) - 1} {
 		changed := bytes.Clone(data)
 		changed[index] ^= 1
 		if sha256.Sum256(changed) == spool.digest() {

@@ -218,7 +218,13 @@ launcher command line.
 
 The staged file is one finite envelope: a bounded descriptor, a Windows owner,
 a Linux helper, the command, and binary input. The launcher binds its complete
-length and SHA-256 digest, including the descriptor. SFTP validates the fresh
+length and SHA-256 digest, including the descriptor. The private `CBXFLAT2`
+descriptor is 80 bytes: version, length, and limit fields occupy its first 48
+bytes, followed by 32 cryptographically random blinding bytes generated once per
+spool. The blinder stays inside the private envelope across retries; it is never
+included in launcher arguments or route proofs. Every prefix containing program,
+command, or input bytes includes the entire blinder, keeping exposed integrity
+digests from revealing predictable payloads. SFTP validates the fresh
 nonce-root proof before sensitive writes, then uploads once and checks regular-file
 metadata and exact size before publication. It does not download the envelope
 again: the mandatory native verifier is the full-content authority. Size-scaled

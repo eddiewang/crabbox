@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -417,6 +420,121 @@ func newTestWSLStageSpool(t *testing.T, payload []byte) (*wslStageSpool, []byte)
 		t.Fatal(err)
 	}
 	return spool, raw
+}
+
+func TestWSLStageBlindingBindsFullAndPartialDigests(t *testing.T) {
+	spool, raw := newTestWSLStageSpool(t, []byte{0, 255, 128, 1})
+	other, second := newTestWSLStageSpool(t, []byte{0, 255, 128, 1})
+	if bytes.Equal(raw[wslStageBlindingOffset:wslStageHeaderSize], second[wslStageBlindingOffset:wslStageHeaderSize]) || spool.digest() == other.digest() {
+		t.Fatal("identical workloads reused blinding or digest")
+	}
+	if !bytes.Equal(raw[:wslStageBlindingOffset], second[:wslStageBlindingOffset]) || !bytes.Equal(raw[wslStageHeaderSize:], second[wslStageHeaderSize:]) {
+		t.Fatal("blinding changed program or workload bytes")
+	}
+	commandStart := wslStageHeaderSize + int(binary.LittleEndian.Uint32(raw[8:])) + int(binary.LittleEndian.Uint32(raw[12:]))
+	payloadStart := commandStart + int(binary.LittleEndian.Uint64(raw[16:]))
+	for _, size := range []int{-1, 0, 47, 48, 49, 79, 80, 81, commandStart, commandStart + 1, payloadStart, payloadStart + 1, len(raw), len(raw) + 1} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			digest, err := spool.prefixDigest(int64(size))
+			if size < 0 || size > len(raw) {
+				if err == nil {
+					t.Fatal("invalid prefix length accepted")
+				}
+				return
+			}
+			if err != nil || digest != sha256.Sum256(raw[:size]) {
+				t.Fatalf("prefix is not the exact private bytes: %v", err)
+			}
+			// Every byte of the field must affect any hash reaching user data.
+			for i := wslStageBlindingOffset; i < min(size, wslStageHeaderSize); i++ {
+				changed := bytes.Clone(raw[:size])
+				changed[i] ^= 1
+				if sha256.Sum256(changed) == digest {
+					t.Fatal("prefix omitted blinding byte")
+				}
+			}
+		})
+	}
+	reader, err := spool.input.reset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := io.ReadAll(reader)
+	if err != nil || !bytes.Equal(raw, replayed) || sha256.Sum256(replayed) != spool.digest() {
+		t.Fatal("replay regenerated or lost the blinding field")
+	}
+}
+
+func TestWSLStageEntropyFailurePreventsDeliveryAndSpoolCreation(t *testing.T) {
+	for _, available := range []int{0, wslStageBlindingSize - 1} {
+		t.Run(fmt.Sprint(available), func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+				t.Setenv(name, dir)
+			}
+			oldEntropy, oldStage := wslStageEntropy, stageWSLSpool
+			t.Cleanup(func() { wslStageEntropy, stageWSLSpool = oldEntropy, oldStage })
+			wslStageEntropy = io.MultiReader(bytes.NewReader(bytes.Repeat([]byte{0x91}, available)), iotest.ErrReader(errors.New("private entropy diagnostics")))
+			stageWSLSpool = func(*wslStageSpool, context.Context, *SSHTarget, wslStageTiming, string, string, io.Writer) (string, error) {
+				t.Fatal("entropy failure reached SSH staging/delivery")
+				return "", nil
+			}
+			var stdout, stderr bytes.Buffer
+			target := SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeWSL2}
+			err := executePreparedSSH(t.Context(), &target, "printf exact", nil, 0, sshCommandLimit{}, "1", "1", &stdout, &stderr)
+			if err == nil || err.Error() != "generate private WSL2 envelope blinding failed" || stdout.Len() != 0 || stderr.Len() != 0 {
+				t.Fatal("entropy failure succeeded or exposed diagnostics")
+			}
+			files, err := os.ReadDir(dir)
+			if err != nil || len(files) != 0 {
+				t.Fatalf("entropy failure left local spool residue: %v", err)
+			}
+		})
+	}
+}
+
+func TestWSLStageBlindingStaysOutOfPublicTransportMetadata(t *testing.T) {
+	spool, raw := newTestWSLStageSpool(t, []byte("finite input"))
+	blinder := raw[wslStageBlindingOffset:wslStageHeaderSize]
+	nonce := strings.Repeat("a", 32)
+	old := startWSLStageUploadSubsystem
+	t.Cleanup(func() { startWSLStageUploadSubsystem = old })
+	startWSLStageUploadSubsystem = func(_ context.Context, _ SSHTarget, _, _, _ string, stderr io.Writer) (io.Reader, io.WriteCloser, func() error, error) {
+		_, _ = io.WriteString(stderr, "connection unavailable\n")
+		return nil, nil, nil, io.EOF
+	}
+	var diagnostics bytes.Buffer
+	err := spool.upload(t.Context(), SSHTarget{Port: "22"}, nonce, time.Second, "1", "1", &diagnostics)
+	if err == nil {
+		t.Fatal("diagnostic fixture succeeded")
+	}
+	public := []string{diagnostics.String(), err.Error(), wslStageRootPreparationCommand(nonce), wslStagePreparationMarker + " " + nonce + " cmd"}
+	sensitivePrefix := int64(wslStageHeaderSize) + int64(binary.LittleEndian.Uint32(raw[8:])) + int64(binary.LittleEndian.Uint32(raw[12:])) + 1
+	digest, err := spool.prefixDigest(sensitivePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial := wslStageFileCommand(nonce, nonce+".part", sensitivePrefix, digest, true, wslStageCMD)
+	public = append(public, partial, decodePowerShellCommand(t, partial), decodePowerShellCommand(t, wslStageRootPreparationCommand(nonce)))
+	for _, shell := range []wslStageShell{wslStageCMD, wslStagePowerShell} {
+		for _, discard := range []bool{false, true} {
+			command := wslStageFileCommand(nonce, nonce+".ready", spool.size, spool.digest(), discard, shell)
+			if command == "" || len(command) >= wslStageLauncherCommandLimit {
+				t.Fatal("invalid or oversized blinded launcher")
+			}
+			public = append(public, command)
+			if shell == wslStageCMD {
+				public = append(public, decodePowerShellCommand(t, command))
+			}
+		}
+	}
+	for _, representation := range []string{string(blinder), hex.EncodeToString(blinder), strings.ToUpper(hex.EncodeToString(blinder)), base64.StdEncoding.EncodeToString(blinder), base64.RawStdEncoding.EncodeToString(blinder)} {
+		for _, value := range public {
+			if strings.Contains(value, representation) {
+				t.Fatal("private blinding escaped into public transport metadata")
+			}
+		}
+	}
 }
 
 func TestUploadToSFTPPublishesExactPrivateStage(t *testing.T) {
@@ -943,7 +1061,7 @@ func TestUploadToSFTPCollisionPreservesForeignReady(t *testing.T) {
 
 func TestWSLStagePinsOnlySuccessfulRetryableFallback(t *testing.T) {
 	stubWSLStageRoutePreparation(t, func(context.Context, SSHTarget, string, string) error { return nil })
-	spool, _ := newTestWSLStageSpool(t, nil)
+	spool, expected := newTestWSLStageSpool(t, nil)
 	oldUpload := uploadWSLSpool
 	t.Cleanup(func() { uploadWSLSpool = oldUpload })
 	target := SSHTarget{Port: "2222", FallbackPorts: []string{"22"}}
@@ -965,6 +1083,14 @@ func TestWSLStagePinsOnlySuccessfulRetryableFallback(t *testing.T) {
 			t.Fatalf("stage attempt deadline=%v ok=%t", deadline, ok)
 		}
 		ports, nonces = append(ports, candidate.Port), append(nonces, nonce)
+		reader, err := spool.input.reset()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(reader)
+		if err != nil || !bytes.Equal(data, expected) || sha256.Sum256(data) != spool.digest() {
+			t.Fatal("candidate retry changed the private blinding/envelope")
+		}
 		if candidate.Port == "2222" {
 			return finishWSLStageAttempt(ctx, sftp.ErrSSHFxConnectionLost, nil, waitErr)
 		}

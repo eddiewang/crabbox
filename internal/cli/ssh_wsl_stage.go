@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
@@ -20,7 +21,8 @@ import (
 	"github.com/pkg/sftp"
 )
 
-const wslStageHeaderSize, wslStageRoot, wslStageTimeout, wslStageIdleTimeout = 48, ".crabbox/wsl-stage", 2 * time.Minute, 15 * time.Second
+const wslStageBlindingOffset, wslStageBlindingSize = 48, 32
+const wslStageHeaderSize, wslStageRoot, wslStageTimeout, wslStageIdleTimeout = wslStageBlindingOffset + wslStageBlindingSize, ".crabbox/wsl-stage", 2 * time.Minute, 15 * time.Second
 const sshTransportPreparationTimeout = 47 * time.Second
 const wslStageCompletionMargin = time.Second
 const wsl2LauncherGrace, wsl2SignalGrace, wsl2FallbackCleanupTimeout = 5 * time.Second, 5 * time.Second, 15 * time.Second
@@ -72,6 +74,7 @@ var startWSLSFTPSubsystem = startOwnedSSHTransportSubsystem
 var startWSLStageUploadSubsystem = startOwnedSSHTransportSubsystem
 var startWSLStageCleanupSubsystem = startOwnedSSHTransportSubsystem
 var discardWSLStageFile = discardWSLStageFileNative
+var wslStageEntropy io.Reader = rand.Reader
 
 func IsWSLSFTPUnavailable(err error) bool { return errors.Is(err, errWSLSFTPUnavailable) }
 
@@ -310,7 +313,7 @@ func newWSLStageSpool(command string, payload []byte, source io.ReadSeeker, payl
 		return nil, err
 	}
 	var descriptor [wslStageHeaderSize]byte
-	copy(descriptor[:], "CBXFLAT1")
+	copy(descriptor[:], "CBXFLAT2")
 	binary.LittleEndian.PutUint32(descriptor[8:], uint32(len(owner)))
 	binary.LittleEndian.PutUint32(descriptor[12:], uint32(len(wslLinuxHelper)))
 	binary.LittleEndian.PutUint64(descriptor[16:], uint64(len(command)))
@@ -318,6 +321,11 @@ func newWSLStageSpool(command string, payload []byte, source io.ReadSeeker, payl
 	binary.LittleEndian.PutUint64(descriptor[32:], uint64(limit.execution.Milliseconds()))
 	binary.LittleEndian.PutUint32(descriptor[40:], uint32(sshTransportTiming(limit).idle.Milliseconds()))
 	binary.LittleEndian.PutUint32(descriptor[44:], uint32(wsl2SignalGrace.Milliseconds()))
+	// Keep hidden entropy before all program/user bytes, including in partial
+	// digests. Generate once, before any spool file, and retain it across retries.
+	if _, err := io.ReadFull(wslStageEntropy, descriptor[wslStageBlindingOffset:]); err != nil {
+		return nil, errors.New("generate private WSL2 envelope blinding failed")
+	}
 	prefix := append(descriptor[:], []byte(owner+wslLinuxHelper+command)...)
 	total := int64(len(prefix)) + payloadSize
 	if total > wslStageMaxSize {
