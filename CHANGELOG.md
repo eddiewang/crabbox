@@ -11,7 +11,7 @@
 
 ### Fixed
 
-- Simplified WSL2 SSH execution into one verified SFTP envelope with private digest blinding, separate startup and transfer budgets within existing deadlines, identity-checked cleanup, and no replay after publication uncertainty. Thanks @vincentkoc.
+- Unified provider-owned routing for stop, retry, rescue, and WebVNC commands, preserving scope, explicit false release settings, and Kubernetes environment selectors without exposing URL credentials.
 - Refreshed coordinator runtime and Worker development dependencies, including Nano ID and Undici advisory fixes.
 - Preserved Daytona recovery claims and lookup errors when `stop` cannot verify the sandbox, instead of reporting release from an unverified not-found response.
 - Fixed portable Node coordinator control heartbeats deadlocking subsequent lifecycle operations, releases, and graceful shutdown.
@@ -30,6 +30,7 @@
 - Redacted configured and runtime-only credentials from coordinator-stored run failure diagnostics while preserving raw command output. Thanks @coygeek.
 - Retried temporary Machine0 read outages within the existing operation deadline while keeping provider mutations single-attempt.
 - Added actionable Machine0 recovery hints for unclaimed lease IDs without treating short name hashes as proof of lease ownership.
+- Simplified WSL2 SSH execution into one verified SFTP envelope with private digest blinding, separate startup and transfer budgets within existing deadlines, identity-checked cleanup, and no replay after publication uncertainty. Thanks @vincentkoc.
 
 ## 0.46.1 - 2026-08-24
 

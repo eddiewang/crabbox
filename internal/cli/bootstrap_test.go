@@ -921,7 +921,8 @@ func TestWindowsStableSSHProbeUsesWindowsReadinessProfile(t *testing.T) {
 		ProxyCommand:   "provider proxy %h %p",
 		ReadyCheck:     "true",
 	}
-	if !probeWindowsSSHStable(context.Background(), &target, time.Now().Add(time.Second)) {
+	// This checks readiness options; deadline enforcement is tested separately.
+	if !probeWindowsSSHStable(t.Context(), &target, time.Now().Add(30*time.Second)) {
 		t.Fatal("stable Windows SSH probe failed with fake ssh")
 	}
 	args := readSSHArgsRecorder(t, logPath)
