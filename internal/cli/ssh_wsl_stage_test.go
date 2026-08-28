@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
+	"testing/synctest"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -27,11 +28,18 @@ import (
 
 type delayedWriteConn struct {
 	net.Conn
+	ctx   context.Context
 	delay time.Duration
 }
 
 func (c delayedWriteConn) Write(p []byte) (int, error) {
-	time.Sleep(c.delay)
+	timer := time.NewTimer(c.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	}
 	return c.Conn.Write(p)
 }
 
@@ -1644,7 +1652,7 @@ func TestWSLStageProgressingCandidateTimeoutReservesFallback(t *testing.T) {
 		{name: "multiple fallbacks", fallbacks: []string{"2200", "22", "2200"}, wantRoutes: 3},
 		{name: "caller expiry", parentTimeout: 200 * time.Millisecond, fallbacks: []string{"22"}, wantRoutes: 1},
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		run := func(t *testing.T) {
 			root := t.TempDir()
 			installWSLStageDiscardFixture(t, root)
 			stageRoot := filepath.Join(root, filepath.FromSlash(wslStageRoot))
@@ -1681,7 +1689,7 @@ func TestWSLStageProgressingCandidateTimeoutReservesFallback(t *testing.T) {
 				events = append(events, "upload:"+target.Port)
 				output, input, wait, err := startLoopbackWSLSFTPSubsystem(ctx, root, func(conn net.Conn) net.Conn {
 					if target.Port != "22" {
-						return delayedWriteConn{Conn: conn, delay: 20 * time.Millisecond}
+						return delayedWriteConn{Conn: conn, ctx: ctx, delay: 20 * time.Millisecond}
 					}
 					return conn
 				})
@@ -1743,7 +1751,10 @@ func TestWSLStageProgressingCandidateTimeoutReservesFallback(t *testing.T) {
 					t.Fatalf("cleanup/process ordering changed: %v", events)
 				}
 			}
-		})
+		}
+		// The fixture uses net.Pipe: only its deliberate response delays should
+		// consume transfer budgets, not host scheduling or filesystem latency.
+		t.Run(test.name, func(t *testing.T) { synctest.Test(t, run) })
 	}
 }
 
@@ -2158,6 +2169,17 @@ func TestWSLStagePartialObservationCancellationClosesPipes(t *testing.T) {
 }
 
 func TestWSLStageInitialHandoffBudgets(t *testing.T) {
+	t.Run("embedded programs use LF", func(t *testing.T) {
+		for name, program := range map[string]string{
+			"wsl-stage.ps1":     wslStageVerifier,
+			"wsl-owner.ps1":     wslWindowsOwner,
+			"wsl-supervisor.sh": wslLinuxHelper,
+		} {
+			if strings.ContainsRune(program, '\r') || !strings.HasSuffix(program, "\n") {
+				t.Errorf("embedded %s must use LF line endings; check .gitattributes", name)
+			}
+		}
+	})
 	executable := "pwsh"
 	if runtime.GOOS == "windows" {
 		executable = "powershell.exe"
