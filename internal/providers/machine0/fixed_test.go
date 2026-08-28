@@ -418,34 +418,22 @@ func TestMachine0FixedPinnedInvisibleAttemptFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMachine0FixedDefiniteCreateFailureClearsAttemptForRetry(t *testing.T) {
-	repo := setupState(t)
-	createErr := errors.New("machine0 capacity unavailable")
-	api := &fakeAPI{sizes: []machineSize{testSize()}, machines: []machine{}, createErr: createErr}
-	b := testBackendWithAPI(api)
-	req := AcquireRequest{RequestedLeaseID: fixedMachine0TestLeaseID, RequestedSlug: "fixed", Repo: core.Repo{Root: repo}}
-
+func TestMachine0FixedAmbiguousCreateFailureRetainsAttempt(t *testing.T) {
+	b, api, req := fixedMachine0TestFixture(t)
+	createErr := errors.New("machine0 create response lost")
+	api.createFn = func(context.Context, createMachineRequest) error { return createErr }
 	_, err := b.Acquire(context.Background(), req)
-	if err != createErr {
-		t.Fatalf("create error=%v want exact %v", err, createErr)
+	if !errors.Is(err, createErr) {
+		t.Fatalf("create error=%v want %v", err, createErr)
 	}
 	claim := readFixedMachine0Claim(t, req.RequestedLeaseID)
-	if len(claim.FixedCreateIntent.Attempt) != 0 || claim.FixedCreateIntent.State != fixedMachine0IntentPrepared {
-		t.Fatalf("claim after definite failure=%#v", claim)
+	if len(claim.FixedCreateIntent.Attempt) == 0 || claim.FixedCreateIntent.State != fixedMachine0IntentPrepared {
+		t.Fatalf("ambiguous failure lost its attempt: %#v", claim)
 	}
-	api.createErr = nil
-	api.createFn = func(_ context.Context, createReq createMachineRequest) error {
-		item := fixedMachine0TestMachine(createReq)
-		api.machine = item
-		api.machines = []machine{item}
-		return nil
-	}
-	lease, err := b.Acquire(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease.Server.CloudID != "vm-fixed" || len(api.created) != 2 {
-		t.Fatalf("lease=%#v Create calls=%d", lease, len(api.created))
+	_, err = b.Acquire(context.Background(), req)
+	assertMachine0Exit(t, err, 4, "unresolved create attempt")
+	if len(api.created) != 1 {
+		t.Fatalf("ambiguous failure allowed %d create calls", len(api.created))
 	}
 }
 

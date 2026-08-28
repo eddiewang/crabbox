@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Bound Machine0 fixed-lease identities before readiness checks and made prepared leases inspectable and stoppable without SSH, preserving ambiguous attempts and rejecting resource or claim substitution.
 - Unified provider-owned routing for stop, retry, rescue, and WebVNC commands, preserving scope, explicit false release settings, and Kubernetes environment selectors without exposing URL credentials.
 - Saved automatic failure bundles in private user state when the project capture destination is unwritable, retaining verified directories through creation, publication, and cleanup to prevent path substitution while preserving the command exit status.
 - Refreshed coordinator runtime and Worker development dependencies, including Nano ID and Undici advisory fixes.

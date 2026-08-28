@@ -211,10 +211,11 @@ An ambiguous create remains pinned to its original name, size, region, image,
 image version, and key. Replay fails closed without another `machine0 new` call
 while that attempt has no visible machine, deliberately accepting a false
 negative if the process stopped after persisting the attempt but before sending
-the request. When `machine0 new` returns an error, the original invocation polls
-inventory for a bounded 60-second reconciliation window. A machine that appears
-is retained and adopted; a definite no-machine result clears the attempt so an
-ordinary capacity failure remains retryable.
+the request. When `machine0 new` returns an error, Crabbox checks inventory for
+the matching resource. If it is still invisible, the attempt remains pinned:
+neither an error nor an empty inventory proves an external creation cannot
+finish later. Retain the claim and retry inspection or stop when inventory
+converges; replay never sends another create for that attempt.
 
 The `machine0 ls --json` summary can omit a VM's entire SSH-key object. When a
 fixed replay has a durable selected key but its exactly owned inventory entry
@@ -225,15 +226,26 @@ retain public-key semantics, and replay without a selected provider key keeps
 generic SSH-key fallback without an additional detail read.
 
 Once creation may have succeeded, later readiness or SSH failures never roll the
-VM back: the caller's fixed lease identity remains bound to it, and a matching
-replay can finish adoption. Repository binding is also durable; `--reclaim` is
-the explicit override for replay from a different repository. With
+VM back. Native `new` prints no resource ID, so Crabbox durably binds the first
+attested inventory or detail result before checking readiness or SSH. An older
+prepared claim can be inspected and stopped by its original lease ID or slug:
+the same fixed-intent resolver verifies the durable attempt, resource metadata,
+and any recorded immutable ID. Destroy does not start, resume, or wait for SSH.
+Automatic cleanup leaves unfinished prepared claims for explicit stop, even
+when they already have a resource ID; invisible preparation never proves absence.
+A matching replay can finish adoption. Repository binding is also durable;
+`--reclaim` is the explicit override for replay from a different repository. With
 `machine0.releasePolicy: suspend`, release keeps the live fixed claim and replay
 starts the exact suspended machine before refreshing its endpoint.
 
 Destroy release replaces the live claim with a compact terminal tombstone, so a
-fixed ID is single-use and automatic cleanup never makes it replayable. Fixed
-claims and tombstones use the downgrade-safe local discriminator
+fixed ID is single-use and automatic cleanup never makes it replayable. Stop
+is idempotent after release; an already acquired resource absent from
+successful inventory can also be finalized without another native removal.
+Native `rm` accepts names only: Crabbox rechecks the exact UUID immediately
+before removal under its claim lock, but operators must serialize native
+same-name replacement against cleanup because the CLI has no atomic expected-ID
+delete option. Fixed claims and tombstones use the downgrade-safe local discriminator
 `machine0-fixed-v1`: current clients map it to runtime provider `machine0`, while
 older clients see an unknown provider and skip or refuse destructive cleanup
 instead of erasing fixed identity state.
