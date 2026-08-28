@@ -18,7 +18,7 @@ $null = $utf8.GetString($helper)
 $bootstrap = @BOOTSTRAP@
 $directory = '/tmp/crabbox-command-' + $nonce
 $clock = [Diagnostics.Stopwatch]::StartNew()
-$phase = 'helper-write'
+$phase = 'launcher-start'
 $read = 0L
 $written = 0L
 $process = $null
@@ -73,7 +73,9 @@ function Stop-Exact($child) {
 }
 try {
     $process = Start-Linux 'run'
+    $phase = 'pipe-open'
     $writer = Open-LinuxInput $process
+    $phase = 'helper-write'
     Write-Pipe $writer $helper $helper.Length
     $buffer = [byte[]]::new(65536)
     $remaining = [long]$commandSize + [long]$payloadSize

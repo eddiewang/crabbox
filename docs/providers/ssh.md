@@ -238,7 +238,11 @@ Unknown objects are not swept by age. An unacknowledged create, changed partial,
 or uncertain publication requires cleanup investigation and never authorizes replay.
 
 Windows sends the helper and finite input through bounded asynchronous WSL pipe
-writes through an unbuffered view of the same stdin handle. Windows PowerShell
+writes through an unbuffered view of the same stdin handle. Failure phases
+distinguish launcher startup, pipe opening/flushing, and helper writing. In these
+diagnostics, `expected` is the command/input length; `read` and `written` count
+workload bytes from completed reads and writes. They exclude the helper and do
+not measure kernel progress during an unfinished write. Windows PowerShell
 5.1 remains supported: its Framework StreamWriter uses the console input
 encoding, so the launcher declares and flushes its preamble first. The bounded
 bootstrap accepts exactly the declared empty preamble or UTF-8 BOM before the

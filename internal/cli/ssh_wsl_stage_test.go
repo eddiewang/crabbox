@@ -2156,6 +2156,73 @@ func TestWSLStagePartialObservationCancellationClosesPipes(t *testing.T) {
 	}
 }
 
+func TestWSLStageOwnerReportsExactFailurePhase(t *testing.T) {
+	executable := "pwsh"
+	if runtime.GOOS == "windows" {
+		executable = "powershell.exe"
+	}
+	powerShell, err := exec.LookPath(executable)
+	if err != nil {
+		t.Skip("PowerShell is unavailable")
+	}
+	_, raw := newTestWSLStageSpool(t, []byte{0, 255})
+	owner, _, command, payload := decodeWSLStage(t, raw)
+	path := filepath.Join(t.TempDir(), "envelope")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	const privateFailure = "private-operation-detail"
+	for _, test := range []struct{ name, phase, call, reason string }{
+		{"launch", "launcher-start", "$process = Start-Linux 'run'", privateFailure},
+		{"flush", "pipe-open", "$writer = Open-LinuxInput $process", "WSL2 pipe transfer made no progress"},
+		{"open fault", "pipe-open", "$writer = Open-LinuxInput $process", privateFailure},
+		{"helper", "helper-write", "Write-Pipe $writer $helper $helper.Length", "WSL2 pipe transfer made no progress"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Execute the generated owner's validation/catch/finally paths, but
+			// replace external operations so this fixture never launches WSL.
+			script := owner
+			for call, replacement := range map[string]string{
+				"$process = Start-Linux 'run'":              "$process = $null",
+				"$writer = Open-LinuxInput $process":        "$writer = [IO.MemoryStream]::new()",
+				"Write-Pipe $writer $helper $helper.Length": "",
+				"$cleanup = Start-Linux 'cleanup'":          "throw " + psQuote(privateFailure),
+			} {
+				if call == test.call {
+					replacement = "throw " + psQuote(test.reason)
+				}
+				if !strings.Contains(script, call) {
+					t.Fatal("owner fixture injection point missing")
+				}
+				script = strings.Replace(script, call, replacement, 1)
+			}
+			script = `$file=[IO.File]::OpenRead(` + psQuote(path) + `)
+try {
+  $descriptor=[IO.BinaryReader]::new($file).ReadBytes(` + fmt.Sprint(wslStageHeaderSize) + `)
+  $file.Position+=` + fmt.Sprint(len(owner)) + `
+  & ([ScriptBlock]::Create(` + psQuote(script) + `)) $file $descriptor 'diagnostic-fixture'
+} catch { [Console]::Out.Write($_.Exception.Message) } finally { $file.Dispose() }`
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, powerShell, "-NoProfile", "-NonInteractive", "-Command", "& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))")
+			cmd.Stdin = strings.NewReader(script)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("owner fixture failed: %v", err)
+			}
+			reason := test.reason
+			if reason == privateFailure {
+				reason = "WSL2 transport failed"
+			}
+			want := fmt.Sprintf("%s phase=%s expected=%d read=0 written=0", reason, test.phase, len(command)+len(payload))
+			if stdout.String() != want || strings.TrimSpace(stderr.String()) != "WSL2 command cleanup failed" {
+				t.Fatal("owner diagnostic lost the exact phase, workload counters, or error redaction")
+			}
+		})
+	}
+}
+
 func TestWSLStageShellProofRequiresExactNonceAndKnownShell(t *testing.T) {
 	for _, result := range []string{"cmd", "powershell", "bash", "", "cmd extra", "wrong-nonce"} {
 		t.Run(result, func(t *testing.T) {
