@@ -870,7 +870,9 @@ func TestWSL2StagedTransportPowerShellParses(t *testing.T) {
 	if size := len(wslStageRootPreparationCommand(strings.Repeat("a", 32))); size >= wslStageLauncherCommandLimit {
 		t.Fatalf("root preparation bytes=%d", size)
 	}
-	for name, script := range map[string]string{"verifier": decodePowerShellCommand(t, launcher), "owner": strings.ReplaceAll(wslWindowsOwner, "@BOOTSTRAP@", psQuote(wslHelperBootstrap)), "root": decodePowerShellCommand(t, wslStageRootPreparationCommand(strings.Repeat("a", 32)))} {
+	_, raw := newTestWSLStageSpool(t, nil)
+	owner, _, _, _ := decodeWSLStage(t, raw)
+	for name, script := range map[string]string{"verifier": decodePowerShellCommand(t, launcher), "owner": owner, "root": decodePowerShellCommand(t, wslStageRootPreparationCommand(strings.Repeat("a", 32)))} {
 		t.Run(name, func(t *testing.T) {
 			cmd := exec.CommandContext(t.Context(), powerShell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `$errors=$null;[Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(),[ref]$null,[ref]$errors)|Out-Null;if($errors){$errors|%{[Console]::Error.WriteLine($_.Message)};exit 1}`)
 			cmd.Stdin = strings.NewReader(script)

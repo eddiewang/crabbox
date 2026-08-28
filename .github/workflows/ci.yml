@@ -141,6 +141,8 @@ jobs:
             'TestWSLStageRootPreparationSecuresInheritedWindowsACL',
             'TestWSLStageRootPreparationRejectsFilesAndReparsePoints',
             'TestWSLStageFrameworkInputPreamble',
+            'TestWSLStageDelayedInitialHandoff',
+            'TestWSLStageInitialHandoffBudgets',
             'TestWSLStageBlindingBindsFullAndPartialDigests',
             'TestWSLStageEntropyFailurePreventsDeliveryAndSpoolCreation',
             'TestWSLStageBlindingStaysOutOfPublicTransportMetadata'

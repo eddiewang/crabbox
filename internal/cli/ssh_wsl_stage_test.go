@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2156,6 +2157,118 @@ func TestWSLStagePartialObservationCancellationClosesPipes(t *testing.T) {
 	}
 }
 
+func TestWSLStageInitialHandoffBudgets(t *testing.T) {
+	executable := "pwsh"
+	if runtime.GOOS == "windows" {
+		executable = "powershell.exe"
+	}
+	powerShell, err := exec.LookPath(executable)
+	if err != nil {
+		t.Skip("PowerShell is unavailable")
+	}
+	_, raw := newTestWSLStageSpool(t, []byte{0, 255, 13, 10})
+	owner, helper, command, payload := decodeWSLStage(t, raw)
+	functions, _, found := strings.Cut(owner, "\ntry {\n    $process = Start-Linux 'run'")
+	if !found {
+		t.Fatal("owner function fixture boundary missing")
+	}
+	path := filepath.Join(t.TempDir(), "envelope")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name                                     string
+		execution, elapsed, flush, helper, input int
+		ceilings                                 string
+		end                                      int
+		reason                                   string
+		complete                                 bool
+	}{
+		{"delayed helper", 12000, 0, 0, 3000, 0, "[12000,12000,2000]", 3000, "", true},
+		{"delayed flush and helper", 12000, 0, 3000, 3000, 0, "[12000,9000,2000]", 6000, "", true},
+		{"never ready", 12000, 0, 0, 20000, 0, "[12000,12000]", 12000, "WSL2 command timed out", false},
+		{"no execution clock reset", 12000, 11000, 0, 1500, 0, "[1000,1000]", 12000, "WSL2 command timed out", false},
+		{"later input stall", 12000, 0, 0, 3000, 3000, "[12000,12000,2000]", 5000, "WSL2 pipe transfer made no progress", false},
+		{"ordinary transfer idle unchanged", 0, 0, 0, 3000, 3000, "[15000,15000,15000]", 6000, "", true},
+		{"unlimited execution bounded startup", 0, 0, 0, 20000, 0, "[15000,15000]", 15000, "WSL2 pipe transfer made no progress", false},
+		{"shared startup cap", 0, 14000, 600, 600, 0, "[1000,400]", 15000, "WSL2 pipe transfer made no progress", false},
+		{"cleanup total clips startup", 10000, 0, 3000, 8000, 0, "[10000,7000]", 10000, "WSL2 command timed out", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Exercise the generated functions with a deterministic clock/task;
+			// Windows fixtures separately exercise the real anonymous pipe reader.
+			idle := sshTransportTiming(sshCommandLimit{control: test.execution > 0}).idle.Milliseconds()
+			script := `Add-Type -TypeDefinition '
+public class HandoffFixture {
+    public long ElapsedMilliseconds;
+    public int Delay;
+    public System.IO.FileStream BaseStream;
+    public System.IO.MemoryStream Wire = new System.IO.MemoryStream();
+    public System.Collections.Generic.List<int> Ceilings = new System.Collections.Generic.List<int>();
+    private byte[] pending;
+    public HandoffFixture FlushAsync() { pending = null; return this; }
+    public HandoffFixture WriteAsync(byte[] bytes, int offset, int count) {
+        pending = new byte[count]; System.Array.Copy(bytes, offset, pending, 0, count); return this;
+    }
+    public bool Wait(int ceiling) {
+        Ceilings.Add(ceiling); ElapsedMilliseconds += System.Math.Min(Delay, ceiling);
+        if (Delay > ceiling) return false;
+        if (pending != null) Wire.Write(pending, 0, pending.Length);
+        return true;
+    }
+    public HandoffFixture GetAwaiter() { return this; }
+    public void GetResult() { }
+}'
+$file=[IO.File]::OpenRead(` + psQuote(path) + `)
+try {
+  $descriptor=[IO.BinaryReader]::new($file).ReadBytes(` + fmt.Sprint(wslStageHeaderSize) + `)
+  $file.Position+=` + fmt.Sprint(len(owner)) + `
+  & {` + functions + fmt.Sprintf(`
+$execution=%d; $idle=%d
+$clock=[HandoffFixture]::new(); $clock.ElapsedMilliseconds=%d
+$clock.BaseStream=[IO.File]::Open(`, test.execution, idle, test.elapsed) + psQuote(filepath.Join(t.TempDir(), "pipe-view")) + `,'CreateNew','Write','ReadWrite')
+$reason=''
+try {
+  $clock.Delay=` + fmt.Sprint(test.flush) + `
+  $view=Open-LinuxInput ([pscustomobject]@{StandardInput=$clock})
+  $view.Dispose()
+  $clock.Delay=` + fmt.Sprint(test.helper) + `
+  Write-Pipe $clock $helper $helper.Length -startup
+  $frame=[IO.BinaryReader]::new($file).ReadBytes([int]($commandSize+$payloadSize))
+  $clock.Delay=` + fmt.Sprint(test.input) + `
+  Write-Pipe $clock $frame $frame.Length
+} catch { $reason=$_.Exception.Message } finally { $clock.BaseStream.Dispose() }
+@{ceilings=@($clock.Ceilings.ToArray());elapsed=$clock.ElapsedMilliseconds;reason=$reason;wire=[Convert]::ToBase64String($clock.Wire.ToArray())}|ConvertTo-Json -Compress
+  } $file $descriptor 'handoff-fixture'
+} finally { $file.Dispose() }`
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, powerShell, "-NoProfile", "-NonInteractive", "-Command", "& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))")
+			cmd.Stdin = strings.NewReader(script)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("handoff fixture: %v", err)
+			}
+			var got struct {
+				Ceilings []int
+				Elapsed  int
+				Reason   string
+				Wire     []byte
+			}
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			ceilings, _ := json.Marshal(got.Ceilings)
+			if string(ceilings) != test.ceilings || got.Elapsed != test.end || got.Reason != test.reason {
+				t.Fatalf("ceilings=%s elapsed=%d reason=%q; want %s %d %q", ceilings, got.Elapsed, got.Reason, test.ceilings, test.end, test.reason)
+			}
+			if test.complete && !bytes.Equal(got.Wire, append([]byte(helper+command), payload...)) {
+				t.Fatal("initial handoff changed helper/frame bytes")
+			}
+		})
+	}
+}
+
 func TestWSLStageOwnerReportsExactFailurePhase(t *testing.T) {
 	executable := "pwsh"
 	if runtime.GOOS == "windows" {
@@ -2176,17 +2289,17 @@ func TestWSLStageOwnerReportsExactFailurePhase(t *testing.T) {
 		{"launch", "launcher-start", "$process = Start-Linux 'run'", privateFailure},
 		{"flush", "pipe-open", "$writer = Open-LinuxInput $process", "WSL2 pipe transfer made no progress"},
 		{"open fault", "pipe-open", "$writer = Open-LinuxInput $process", privateFailure},
-		{"helper", "helper-write", "Write-Pipe $writer $helper $helper.Length", "WSL2 pipe transfer made no progress"},
+		{"helper", "helper-write", "Write-Pipe $writer $helper $helper.Length -startup", "WSL2 pipe transfer made no progress"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			// Execute the generated owner's validation/catch/finally paths, but
 			// replace external operations so this fixture never launches WSL.
 			script := owner
 			for call, replacement := range map[string]string{
-				"$process = Start-Linux 'run'":              "$process = $null",
-				"$writer = Open-LinuxInput $process":        "$writer = [IO.MemoryStream]::new()",
-				"Write-Pipe $writer $helper $helper.Length": "",
-				"$cleanup = Start-Linux 'cleanup'":          "throw " + psQuote(privateFailure),
+				"$process = Start-Linux 'run'":                       "$process = $null",
+				"$writer = Open-LinuxInput $process":                 "$writer = [IO.MemoryStream]::new()",
+				"Write-Pipe $writer $helper $helper.Length -startup": "",
+				"$cleanup = Start-Linux 'cleanup'":                   "throw " + psQuote(privateFailure),
 			} {
 				if call == test.call {
 					replacement = "throw " + psQuote(test.reason)

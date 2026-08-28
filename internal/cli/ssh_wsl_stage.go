@@ -296,7 +296,8 @@ func wslStageBudget(floor, idle time.Duration, frameBytes int64) time.Duration {
 }
 
 func newWSLStageSpool(command string, payload []byte, source io.ReadSeeker, payloadSize int64, limit sshCommandLimit) (*wslStageSpool, error) {
-	owner := strings.ReplaceAll(wslWindowsOwner, "@BOOTSTRAP@", psQuote(wslHelperBootstrap))
+	owner := strings.NewReplacer("@BOOTSTRAP@", psQuote(wslHelperBootstrap),
+		"@STARTUP@", fmt.Sprint(wslStageIdleTimeout.Milliseconds())).Replace(wslWindowsOwner)
 	if len(owner) == 0 || len(wslLinuxHelper) == 0 || len(owner) > wslStageMaxHelper || len(wslLinuxHelper) > wslStageMaxHelper ||
 		!utf8.ValidString(wslLinuxHelper) || strings.ContainsRune(wslLinuxHelper, 0) ||
 		len(command) > wslStageMaxCommand || payloadSize < 0 || payloadSize > wslStageMaxSize || limit.execution < 0 {

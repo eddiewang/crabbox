@@ -11,7 +11,7 @@
 
 ### Fixed
 
-- Simplified WSL2 SSH execution into one verified SFTP envelope with private digest blinding, bounded transfer, identity-checked cleanup, and no replay after publication uncertainty. Thanks @vincentkoc.
+- Simplified WSL2 SSH execution into one verified SFTP envelope with private digest blinding, separate startup and transfer budgets within existing deadlines, identity-checked cleanup, and no replay after publication uncertainty. Thanks @vincentkoc.
 - Refreshed coordinator runtime and Worker development dependencies, including Nano ID and Undici advisory fixes.
 - Preserved Daytona recovery claims and lookup errors when `stop` cannot verify the sandbox, instead of reporting release from an unverified not-found response.
 - Fixed portable Node coordinator control heartbeats deadlocking subsequent lifecycle operations, releases, and graceful shutdown.

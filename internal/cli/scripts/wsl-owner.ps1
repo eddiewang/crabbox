@@ -33,15 +33,21 @@ function Remaining([long]$ceiling) {
     }
     return [int][Math]::Min($ceiling,[int]::MaxValue)
 }
-function Wait-Pipe($task) {
-    if (!$task.Wait((Remaining $idle))) {
-        $null = Remaining $idle
+function Wait-Pipe($task, [switch]$startup) {
+    $ceiling = $idle
+    if ($startup) {
+        # Opening and helper delivery share the original startup/total clock.
+        $ceiling = @STARTUP@ - $clock.ElapsedMilliseconds
+        if ($ceiling -le 0) { throw 'WSL2 command timed out' }
+    }
+    if (!$task.Wait((Remaining $ceiling))) {
+        $null = Remaining $ceiling
         throw 'WSL2 pipe transfer made no progress'
     }
     $null = $task.GetAwaiter().GetResult()
 }
-function Write-Pipe($stream, [byte[]]$bytes, [int]$count) {
-    Wait-Pipe ($stream.WriteAsync($bytes,0,$count))
+function Write-Pipe($stream, [byte[]]$bytes, [int]$count, [switch]$startup) {
+    Wait-Pipe ($stream.WriteAsync($bytes,0,$count)) -startup:$startup
 }
 function Start-Linux([string]$mode) {
     $info = [Diagnostics.ProcessStartInfo]::new('wsl.exe')
@@ -62,7 +68,7 @@ function Start-Linux([string]$mode) {
     return [Diagnostics.Process]::Start($info)
 }
 function Open-LinuxInput($child) {
-    Wait-Pipe ($child.StandardInput.FlushAsync())
+    Wait-Pipe ($child.StandardInput.FlushAsync()) -startup
     # Public Framework API: one unbuffered view of the same pipe handle.
     # Never write text again or let a small final raw write wait for Close.
     return [IO.FileStream]::new($child.StandardInput.BaseStream.SafeFileHandle,[IO.FileAccess]::Write,1,$false)
@@ -76,7 +82,7 @@ try {
     $phase = 'pipe-open'
     $writer = Open-LinuxInput $process
     $phase = 'helper-write'
-    Write-Pipe $writer $helper $helper.Length
+    Write-Pipe $writer $helper $helper.Length -startup
     $buffer = [byte[]]::new(65536)
     $remaining = [long]$commandSize + [long]$payloadSize
     while ($remaining -gt 0) {
@@ -119,7 +125,7 @@ if ($failure) {
         $clock.Restart()
         $cleanup = Start-Linux 'cleanup'
         $cleanupWriter = Open-LinuxInput $cleanup
-        Write-Pipe $cleanupWriter $helper $helper.Length
+        Write-Pipe $cleanupWriter $helper $helper.Length -startup
         $cleanupWriter.Dispose()
         if (!$cleanup.WaitForExit((Remaining 10000))) { throw 'cleanup timeout' }
         if ($cleanup.ExitCode -ne 0) { throw 'cleanup refused' }

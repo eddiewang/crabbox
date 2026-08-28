@@ -238,8 +238,13 @@ Unknown objects are not swept by age. An unacknowledged create, changed partial,
 or uncertain publication requires cleanup investigation and never authorizes replay.
 
 Windows sends the helper and finite input through bounded asynchronous WSL pipe
-writes through an unbuffered view of the same stdin handle. Failure phases
-distinguish launcher startup, pipe opening/flushing, and helper writing. In these
+writes through an unbuffered view of the same stdin handle. Initial stdin opening
+and helper delivery share a 15-second cap measured from launcher startup, clipped
+to the remaining original execution deadline (12 seconds for control calls). Neither step resets
+that clock. Later command/input writes retain their transfer idle limit: 2 seconds
+for control calls, 15 seconds otherwise. Cleanup handoff is clipped to its own
+existing 10-second deadline; unlimited workloads still have bounded startup.
+Failure phases distinguish launcher startup, pipe opening/flushing, and helper writing. In these
 diagnostics, `expected` is the command/input length; `read` and `written` count
 workload bytes from completed reads and writes. They exclude the helper and do
 not measure kernel progress during an unfinished write. Windows PowerShell

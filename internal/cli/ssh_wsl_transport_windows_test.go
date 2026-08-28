@@ -79,8 +79,14 @@ func runFakeWSLStageLauncher(mode string) {
 	}
 	switch role {
 	case "run":
+		if mode == "delayed-read" {
+			time.Sleep(3 * time.Second)
+		}
 		if mode != "main-no-read" {
 			_ = readFakeWSLStageInput()
+		}
+		if mode == "delayed-read" {
+			os.Exit(23)
 		}
 		_ = os.WriteFile(logPath+".main.pid", []byte(strconv.Itoa(os.Getpid())), 0o600)
 		log("main-started")
@@ -877,20 +883,37 @@ func runWSLStageRootScript(t *testing.T, script string) ([]byte, error) {
 }
 
 func TestWSLStageFrameworkInputPreamble(t *testing.T) {
+	testWSLStageFrameworkInput(t, false)
+}
+
+func TestWSLStageDelayedInitialHandoff(t *testing.T) {
+	testWSLStageFrameworkInput(t, true)
+}
+
+func testWSLStageFrameworkInput(t *testing.T, delayed bool) {
+	t.Helper()
 	bin := installFakeWSLStageExecutable(t)
 	for _, bom := range []bool{false, true} {
 		for _, cleanup := range []bool{false, true} {
+			if delayed && cleanup {
+				continue
+			}
 			t.Run(fmt.Sprintf("bom=%t/cleanup=%t", bom, cleanup), func(t *testing.T) {
 				log := filepath.Join(t.TempDir(), "input")
 				t.Setenv("CRABBOX_FAKE_WSL_STAGE_INPUT", log)
 				t.Setenv("CRABBOX_FAKE_WSL_STAGE_LAUNCHER_LOG", log+".launcher")
 				if cleanup {
 					t.Setenv(fakeWSLStageLauncherMode, "main-delay")
+				} else if delayed {
+					t.Setenv(fakeWSLStageLauncherMode, "delayed-read")
 				}
 				_, raw := newTestWSLStageSpool(t, []byte{0, 255, 13, 10})
 				owner, helper, command, payload := decodeWSLStage(t, raw)
 				if cleanup {
 					binary.LittleEndian.PutUint64(raw[32:], 1500)
+				} else if delayed {
+					binary.LittleEndian.PutUint64(raw[32:], uint64(sshControlExecutionLimit.Milliseconds()))
+					binary.LittleEndian.PutUint32(raw[40:], uint32(sshTransportTiming(sshCommandLimit{control: true}).idle.Milliseconds()))
 				}
 				frame := append(append([]byte(helper), []byte(command)...), payload...)
 				path := filepath.Join(t.TempDir(), "frame")
