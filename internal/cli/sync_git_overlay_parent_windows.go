@@ -77,7 +77,7 @@ func thawGitOverlaySnapshotFiles(root *os.Root) error {
 		if opened.Mode().Perm()&0o200 != 0 {
 			return nil
 		}
-		if err := file.Chmod(opened.Mode().Perm() | 0o200); err != nil {
+		if err := root.Chmod(path, opened.Mode().Perm()|0o200); err != nil {
 			return fmt.Errorf("thaw git overlay snapshot file %q: %w", path, err)
 		}
 		refreshed, err := root.Lstat(path)
