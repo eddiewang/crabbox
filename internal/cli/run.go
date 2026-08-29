@@ -4055,6 +4055,9 @@ func (a App) stop(ctx context.Context, args []string) error {
 		ExpectedProviderIdentity: expectedIdentity,
 	})
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
 		if backendCoordinator(backend) != nil && !*forceRecovery {
 			if isCoordinatorProviderIdentityError(err) {
 				return err

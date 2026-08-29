@@ -9,6 +9,8 @@
 ### Fixed
 
 - Simplified WSL2 SSH execution into one verified, privately blinded SFTP envelope with a derived fixed-control startup/work/completion budget, LF helpers on Windows builds, identity-checked cleanup, and no replay after publication uncertainty; SFTP is now required, replacing the v0.47.0 stdin fallback (enable it and verify Doctor's `wsl2-sftp` probe before upgrading). Thanks @vincentkoc.
+- Exposed resolved Incus settings in `config show --json`, with endpoint credential redaction and no daemon access.
+- Bounded coordinator lease reads, doctor probes, and HTTP heartbeats to 30 seconds, and stop's preliminary lookup to ten seconds, preserving provisioning budgets, provider-scoped release, caller cancellation, and cleanup evidence.
 - Retained scoped direct-AWS fixed-lease cleanup receipts for canonical stop replay after inventory disappears, with fresh account, region, identity, and inventory checks; older compact tombstones remain unchanged and fail closed.
 - Kept automatic egress client tickets off SSH, remote shell, and helper process arguments with a foreground bounded-input handoff to the detached client, preventing SSH teardown from truncating ticket delivery.
 - Kept secret SSH usernames out of VNC/WebVNC and pond tunnel arguments and daemon state, retained private configs through attached teardown or authenticated detached listener readiness, and preserved pond child environment filtering and overrides.
@@ -41,6 +43,7 @@
 - Restored Ubuntu ARM64 local-container browser provisioning with signed native Mozilla Firefox packages instead of Snap transition packages, while preserving working browsers and advancing past broken distro candidates. Thanks @coygeek.
 - Reported bounded, secret-safe remote Git seed failure phases and categories across ordinary sync, local Actions hydration, and native Windows, while preserving file sync and Git coherence behavior. Thanks @coygeek.
 - Made Machine0 doctor check the same SSH-key prerequisites as new creation and reject missing legacy key pairs when no default is selected, without mutating keys or blocking existing fixed-lease replay. Thanks @coygeek.
+- Cleaned exact-owned interrupted Azure public-IP and NIC provisioning prefixes while restoring ordered SKU fallback and preserving immutable-identity cleanup fences. Thanks @excelsier and @vincentkoc.
 
 ## 0.47.0 - 2026-08-28
 
