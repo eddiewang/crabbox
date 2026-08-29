@@ -3199,7 +3199,7 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 		t.Skip("POSIX SSH runtime integration")
 	}
 	for _, mode := range []string{
-		"success", "file-origin", "runtime-state", "classified-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "local-fingerprint-reuse", "remote-fingerprint-reuse", "unsafe-metadata",
+		"success", "file-origin", "runtime-state", "classified-fallback", "snapshot-prepare-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "local-fingerprint-reuse", "remote-fingerprint-reuse", "unsafe-metadata",
 		"symlinked-workdir", "symlinked-git", "symlinked-git-config", "symlinked-git-objects", "linked-worktree",
 		"checkout-file-obstruction", "post-reset-cache", "post-reset-mass-deletion", "late-local-edit", "workload-cleanup", "rsync-failure", "empty-overlay-finalize",
 	} {
@@ -3512,6 +3512,37 @@ done < "$tmp"
 			t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
 			t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
 			t.Setenv("TMPDIR", snapshotParent)
+			snapshotGitLog := filepath.Join(testRoot, "snapshot-git.log")
+			if mode == "snapshot-prepare-fallback" {
+				previousGitExecutable := gitOverlayGitExecutable
+				failingGitExecutable := filepath.Join(binDir, "snapshot-git")
+				fallbackFile := filepath.Join(fixture.root, "snapshot-fallback.txt")
+				counter := filepath.Join(testRoot, "snapshot-git.count")
+				script := fmt.Sprintf(`#!/bin/sh
+count=0
+if [ -f %s ]; then count="$(cat %s)"; fi
+count=$((count + 1))
+printf '%%s\n' "$count" > %s
+printf '%%s\n' "$*" >> %s
+if [ "$count" -le 5 ]; then exec %s "$@"; fi
+printf 'snapshot fallback live edit\n' > %s
+exit 99
+`,
+					shellQuote(counter),
+					shellQuote(counter),
+					shellQuote(counter),
+					shellQuote(snapshotGitLog),
+					shellQuote(previousGitExecutable),
+					shellQuote(fallbackFile),
+				)
+				if err := os.WriteFile(failingGitExecutable, []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				gitOverlayGitExecutable = failingGitExecutable
+				t.Cleanup(func() {
+					gitOverlayGitExecutable = previousGitExecutable
+				})
+			}
 			t.Cleanup(func() {
 				matches, err := filepath.Glob(filepath.Join(snapshotParent, "crabbox-git-overlay-*"))
 				if err != nil || len(matches) != 0 {
@@ -3662,13 +3693,15 @@ done < "$tmp"
 						t.Fatalf("overlay reconciliation did not repair remote drift: %q", content)
 					}
 				}
-			case "classified-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "linked-worktree", "checkout-file-obstruction", "post-reset-cache":
+			case "classified-fallback", "snapshot-prepare-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "linked-worktree", "checkout-file-obstruction", "post-reset-cache":
 				transfer, err := os.ReadFile(rsyncLog)
 				if err != nil || !bytes.Contains(transfer, []byte("clean.txt\x00")) {
 					t.Fatalf("fallback omitted full manifest: data=%q err=%v", transfer, err)
 				}
 				wantReason := "checkout_failed"
-				if mode == "private-origin" {
+				if mode == "snapshot-prepare-fallback" {
+					wantReason = "invalid_head"
+				} else if mode == "private-origin" {
 					wantReason = "origin_auth_required"
 				} else if mode == "origin-unavailable" {
 					wantReason = "origin_unavailable"
@@ -3693,12 +3726,12 @@ done < "$tmp"
 				}
 				if mode == "checkout-file-obstruction" || mode == "post-reset-cache" {
 					assertGitOverlayRecoveryCoherent(t, workdir, repo)
-				} else if mode != "private-origin" && mode != "origin-unavailable" && mode != "missing-origin" {
+				} else if mode != "snapshot-prepare-fallback" && mode != "private-origin" && mode != "origin-unavailable" && mode != "missing-origin" {
 					if _, err := os.Stat(filepath.Join(meta, "git-hydrate-base")); err != nil {
 						t.Fatalf("unmodified fallback lost ordinary Git hydration metadata: %v", err)
 					}
 				}
-				if mode == "private-origin" || mode == "origin-unavailable" || mode == "missing-origin" {
+				if mode == "snapshot-prepare-fallback" || mode == "private-origin" || mode == "origin-unavailable" || mode == "missing-origin" {
 					for _, name := range []string{"sync-fingerprint", "git-hydrate-base"} {
 						if _, err := os.Stat(filepath.Join(meta, name)); !os.IsNotExist(err) {
 							t.Fatalf("hardened manifest retained %s: %v", name, err)
@@ -3742,6 +3775,38 @@ done < "$tmp"
 					source, err := os.ReadFile(rsyncSourceLog)
 					if err != nil || strings.TrimSpace(string(source)) != repo.Root {
 						t.Fatalf("fallback rsync source=%q want=%q err=%v", source, repo.Root, err)
+					}
+				}
+				if mode == "snapshot-prepare-fallback" {
+					transfer, err := os.ReadFile(rsyncLog)
+					if err != nil || !bytes.Contains(transfer, []byte("snapshot-fallback.txt\x00")) {
+						t.Fatalf("snapshot fallback did not rebuild live manifest: data=%q err=%v", transfer, err)
+					}
+					if content, err := os.ReadFile(filepath.Join(workdir, "snapshot-fallback.txt")); err != nil || string(content) != "snapshot fallback live edit\n" {
+						t.Fatalf("snapshot fallback live file=%q err=%v", content, err)
+					}
+					source, err := os.ReadFile(rsyncSourceLog)
+					if err != nil || strings.TrimSpace(string(source)) != repo.Root {
+						t.Fatalf("snapshot fallback rsync source=%q want=%q err=%v", source, repo.Root, err)
+					}
+					invocations, err := os.ReadFile(snapshotGitLog)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got := len(bytes.Split(bytes.TrimSpace(invocations), []byte{'\n'})); got != 7 {
+						t.Fatalf("snapshot Git invocations=%d want=7\n%s", got, invocations)
+					}
+					if !bytes.Contains(invocations, []byte("rev-parse --verify HEAD^{commit}")) {
+						t.Fatalf("snapshot Git failure did not exercise checkout capture:\n%s", invocations)
+					}
+					sshCommands, err := os.ReadFile(sshLog)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, forbidden := range []string{".overlay-git.", "git clone ", "git fetch ", "git ls-remote ", "refs/remotes/origin/"} {
+						if bytes.Contains(sshCommands, []byte(forbidden)) {
+							t.Fatalf("snapshot fallback ran forbidden Git path %q:\n%s", forbidden, sshCommands)
+						}
 					}
 				}
 			case "late-local-edit":

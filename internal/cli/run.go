@@ -1735,13 +1735,33 @@ retrySync:
 				})
 			})
 			if err != nil {
-				return recordFailure(exit(6, "create immutable git overlay snapshot: %v", err))
+				if overlaySnapshot.Root != "" {
+					return recordFailure(exit(6, "create immutable git overlay snapshot: %v", err))
+				}
+				overlayDecision.Enabled = false
+				overlayDecision.Reason = gitOverlayLocalFallbackReason(err)
+				plainManifestMode = true
+				coherence = gitCoherencePlan{}
+				err = nil
+				excludes, err = syncExcludes(repo.Root, cfg)
+				if err != nil {
+					return recordFailure(err)
+				}
+				manifest, err = syncManifestFilteredRules(repo.Root, excludes, syncIncludes(cfg))
+				if err != nil {
+					return recordFailure(exit(6, "rebuild full sync file list after git overlay snapshot fallback: %v", err))
+				}
+				if err := checkSyncPreflight(manifest, cfg, *forceSyncLarge, a.Stderr); err != nil {
+					return recordFailure(err)
+				}
 			}
-			manifest = overlaySnapshot.Manifest
-			excludes = overlaySnapshot.Excludes
-			syncSourceRoot = overlaySnapshot.Root
-			if err := checkSyncPreflight(manifest, cfg, *forceSyncLarge, a.Stderr); err != nil {
-				return recordFailure(err)
+			if overlayDecision.Enabled {
+				manifest = overlaySnapshot.Manifest
+				excludes = overlaySnapshot.Excludes
+				syncSourceRoot = overlaySnapshot.Root
+				if err := checkSyncPreflight(manifest, cfg, *forceSyncLarge, a.Stderr); err != nil {
+					return recordFailure(err)
+				}
 			}
 		}
 		if overlayDecision.Requested && !overlayDecision.Enabled {
