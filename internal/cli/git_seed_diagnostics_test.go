@@ -146,7 +146,7 @@ func TestGitSeedCaptureLimitPreservesExecutionAndRetry(t *testing.T) {
 	}
 }
 
-func TestActionsSeedDiagnosticContinuesThroughSync(t *testing.T) {
+func TestActionsSeedDiagnosticFailsSafely(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX process fixture for Actions hydration")
 	}
@@ -181,16 +181,16 @@ cat >/dev/null
 	repo := Repo{Root: f.source, Name: "repo", RemoteURL: f.origin, Head: f.b, BaseRef: "main"}
 	var stderr bytes.Buffer
 	app := App{Stdout: io.Discard, Stderr: &stderr}
-	err := app.syncLocalActionsWorkspace(context.Background(), cfg, repo, SSHTarget{User: "builder", Host: "fixture.invalid", Port: "22", FallbackPorts: []string{}, TargetOS: targetLinux}, "/work/repo")
-	if err != nil {
-		t.Fatalf("sync: %v\n%s", err, stderr.String())
+	_, err := app.syncLocalActionsWorkspace(context.Background(), cfg, repo, SSHTarget{User: "builder", Host: "fixture.invalid", Port: "22", FallbackPorts: []string{}, TargetOS: targetLinux}, "/work/repo", false)
+	if err == nil || !strings.Contains(err.Error(), "remote git seed failed") {
+		t.Fatalf("sync error=%v\n%s", err, stderr.String())
 	}
-	warning := "warning: remote git seed failed: phase=clone reason=repository/ref exit=128; continuing with file sync; Git metadata was not seeded or verified"
+	warning := "warning: remote git seed failed: phase=clone reason=repository/ref exit=128; aborting before file sync; Git metadata was not seeded or verified"
 	if strings.Count(stderr.String(), warning) != 1 || strings.Contains(stderr.String(), "secret-private-endpoint") {
 		t.Fatalf("unsafe or missing diagnostic: %q", stderr.String())
 	}
 	data, err := os.ReadFile(calls)
-	if err != nil || string(data) != "seed\nrsync\nfinalize\n" {
+	if err != nil || string(data) != "seed\n" {
 		t.Fatalf("production transition order=%q err=%v", data, err)
 	}
 }

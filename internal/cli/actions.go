@@ -726,7 +726,7 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 				coherence = gitCoherencePlan{}
 				fmt.Fprintf(a.Stderr, "git origin fallback reason=%s; using plain manifest sync\n", reason)
 			} else {
-				warnRemoteGitSeedFailure(a.Stderr, out, err)
+				reportRemoteGitSeedFailure(a.Stderr, out, err, "aborting before file sync")
 				return plainManifest, exit(6, "remote git seed failed: %v", err)
 			}
 		}
