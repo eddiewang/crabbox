@@ -778,7 +778,7 @@ func remoteWorkspaceOwnerPOSIXWitness(key, token, remote string, preserveInput .
 
 func remoteWorkspaceOwnerPOSIXWitnessScript(key, token, remote string, preserveInput ...bool) string {
 	inputSetup := ""
-	inputRedirect := ""
+	inputRedirect := " </dev/null"
 	if len(preserveInput) > 0 && preserveInput[0] {
 		inputSetup = `(umask 077; cat >"$run_dir/input") || { rm -rf "$run_dir"; exit 74; }
 `
@@ -810,6 +810,30 @@ recorded_pid=$(sed -n '1p' "$child" 2>/dev/null || true)
 recorded_identity=$(sed -n '2p' "$child" 2>/dev/null || true)
 [ "$recorded_pid" = "$child_pid" ] && [ "$recorded_identity" = "$child_identity" ] || exit 74
 rm -f "$child"`
+	gateFunction := `run_owner_gate() {
+	if command -v flock >/dev/null 2>&1; then
+		flock -x -w 5 "$gate" /bin/sh -c "$1"
+	elif command -v lockf >/dev/null 2>&1; then
+		lockf -t 5 "$gate" /bin/sh -c "$1"
+	else
+		return 74
+	fi
+}
+`
+	// A foreground shell records its own identity before exec. Backgrounding it
+	// would make POSIX shells ignore INT/QUIT across exec into the workload.
+	launchBody := `set -eu
+trap '' HUP
+child_pid=$$
+child_identity=$(ps -o lstart= -p "$child_pid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | cut -c1-96)
+[ -n "$child_identity" ] || exit 74
+printf '%s\n%s\n' "$child_pid" "$child_identity" >"$run_dir/identity"
+export child_pid child_identity
+` + gateFunction + `run_owner_gate ` + shellQuote(installBody) + ` || exit $?
+touch "$run_dir/installed"
+umask "$command_umask"
+exec sh -c "$payload"
+`
 	return `set -u
 command_umask=$(umask)
 umask 077
@@ -821,33 +845,17 @@ state="$root/$key.owner"
 child="$root/$key.child"
 gate="$root/$key.gate"
 run_dir="$root/$key.run.$token"
-start="$run_dir/start"
-run_owner_gate() {
-	if command -v flock >/dev/null 2>&1; then
-		flock -x -w 5 "$gate" /bin/sh -c "$1"
-	elif command -v lockf >/dev/null 2>&1; then
-		lockf -t 5 "$gate" /bin/sh -c "$1"
-	else
-		return 74
-	fi
-}
-rm -rf "$run_dir"
+` + gateFunction + `rm -rf "$run_dir"
 mkdir -m 700 "$run_dir" || exit 74
-` + inputSetup + `(trap '' HUP; while [ ! -f "$start" ]; do sleep 0.05; done; umask "$command_umask"; exec sh -c "$payload"` + inputRedirect + `) &
-child_pid=$!
-child_identity=$(ps -o lstart= -p "$child_pid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | cut -c1-96)
-if [ -z "$child_identity" ] || ! kill -0 "$child_pid" 2>/dev/null; then kill "$child_pid" 2>/dev/null || true; rm -rf "$run_dir"; exit 74; fi
-export state child token child_pid child_identity
+` + inputSetup + `export state child gate token payload run_dir command_umask
 set +e
-run_owner_gate ` + shellQuote(installBody) + `
-gate_status=$?
-set -e
-if [ "$gate_status" -ne 0 ]; then kill "$child_pid" 2>/dev/null || true; rm -rf "$run_dir"; exit "$gate_status"; fi
-touch "$start"
-set +e
-wait "$child_pid"
+/bin/sh -c ` + shellQuote(launchBody) + inputRedirect + `
 code=$?
 set -e
+if [ ! -f "$run_dir/installed" ]; then rm -rf "$run_dir"; exit "$code"; fi
+child_pid=$(sed -n '1p' "$run_dir/identity" 2>/dev/null || true)
+child_identity=$(sed -n '2p' "$run_dir/identity" 2>/dev/null || true)
+export child_pid child_identity
 set +e
 run_owner_gate ` + shellQuote(clearBody) + `
 clear_status=$?

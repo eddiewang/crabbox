@@ -497,7 +497,7 @@ func TestWorkspaceOwnerProtocolGeneration(t *testing.T) {
 		t.Fatalf("POSIX child witness must use the portable launcher: %q", posixWitnessTransport[:min(len(posixWitnessTransport), 80)])
 	}
 	posixWitness := remoteWorkspaceOwnerPOSIXWitnessScript(key, token, "printf ok")
-	for _, want := range []string{"child_identity=$(ps -o lstart=", "owner_expiry=$(sed -n", "owner_expiry", "date +%s", "mv \"$child_tmp\" \"$child\"", "touch \"$start\"", "wait \"$child_pid\"", "rm -f \"$child\""} {
+	for _, want := range []string{"child_identity=$(ps -o lstart=", "owner_expiry=$(sed -n", "owner_expiry", "date +%s", "mv \"$child_tmp\" \"$child\"", "child_pid=$$", "exec sh -c \"$payload\"", "rm -f \"$child\""} {
 		if !strings.Contains(posixWitness, want) {
 			t.Fatalf("POSIX child witness missing %q:\n%s", want, posixWitness)
 		}
@@ -1355,6 +1355,24 @@ func TestWorkspaceOwnerPOSIXTransportIsLoginShellIndependent(t *testing.T) {
 			for _, entry := range entries {
 				if strings.Contains(entry.Name(), ".launcher.") || strings.Contains(entry.Name(), ".run.") || strings.HasSuffix(entry.Name(), ".child") {
 					t.Errorf("nonzero transport left temporary owner state %q", entry.Name())
+				}
+			}
+			for _, sig := range []struct {
+				name string
+				code int
+			}{{"INT", 130}, {"QUIT", 131}} {
+				for attempt := range 2 {
+					// The recorded process must be the payload itself, including reuse.
+					payload := `test "$(sed -n '1p' ` + shellQuote(filepath.Join(ownerRoot, key+".child")) + `)" = "$$" || exit 99; kill -` + sig.name + ` $$; echo survived`
+					cmd := command(remoteWorkspaceOwnerPOSIXWitness(key, token, payload))
+					cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+					out, err := cmd.CombinedOutput()
+					if exitCode(err) != sig.code || strings.Contains(string(out), "survived") {
+						t.Fatalf("%s attempt=%d: out=%q err=%v; want exit %d", sig.name, attempt, out, err, sig.code)
+					}
+					if _, err := os.Stat(filepath.Join(ownerRoot, key+".child")); !os.IsNotExist(err) {
+						t.Fatalf("signaled payload left child witness: %v", err)
+					}
 				}
 			}
 			request.Action = workspaceOwnerRelease

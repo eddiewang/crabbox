@@ -35,7 +35,8 @@ The trailing command after `--` is sent to the box verbatim as argv. Use
 snippets, pipes, or shell expansion.
 
 On POSIX and WSL2 SSH targets, private command staging does not change the
-remote caller's umask for user work. Commands keep the target shell's creation
+remote caller's umask and interrupt signal dispositions for user work, including
+kept and reused leases. Commands keep the target shell's creation
 policy; Crabbox's staged scripts, input, and workspace-owner state remain private.
 
 ## Remote workspace root
