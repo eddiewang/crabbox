@@ -89,6 +89,117 @@ PowerShell (`pwsh`) as DefaultShell. Preparation binds the observed shell kind
 to the fresh route nonce; PowerShell executes the verified script directly to
 preserve raw stderr and the workload exit code. Unknown shell kinds fail closed.
 
+### Architecture assertions and observations
+
+All three provider names accept `amd64` and `arm64` for all four targets.
+`--arch`, `CRABBOX_ARCH`, or a nonempty YAML `architecture` is an explicit
+assertion, including `amd64`. The omitted `amd64` configuration default is
+not an assertion. For example:
+
+```sh
+crabbox run --provider ssh --target macos --arch arm64 \
+  --static-host mac.example.com -- xcodebuild test
+```
+
+Acquisition and prepared reuse (including `run --id` and cached leases) check
+known repository ownership before SSH readiness or architecture probes. An
+explicitly approved host override does not bypass the owner of an existing lease
+ID. Prepared reuse of claimed targets, including cached leases, also verifies the
+exact stored claim snapshot and static target identity before opening SSH.
+Architecture is measured after readiness and before updating the claim or allowing
+sync, hydration, or workload execution.
+The probe uses the resolved SSH user, working port, and existing trust/credential
+transport. It never chooses emulation or forces `arch -arm64`. Explicit assertions
+require fresh, supported matching evidence; missing, malformed, contradictory, or
+translated evidence fails closed.
+
+Linux uses `uname -m` for the SSH execution environment. WSL2 runs that probe
+**inside WSL**, through the existing Windows-to-WSL wrapper, which stages a
+temporary script. macOS combines `uname` with hardware and Rosetta `sysctl`
+queries. Native Windows combines `IsWow64Process2` native-machine evidence with
+the current PowerShell process's `RuntimeInformation.ProcessArchitecture`.
+An unknown WOW64 process-machine value alone is not proof of native execution.
+Unavailable APIs or process queries remain unknown; no environment variable or
+older `.NET OSArchitecture` value substitutes for native-host evidence.
+
+Without an assertion, supported measured architecture is published even when it
+differs from the configured default. Unknown measurements produce a bounded
+warning and permit unconstrained use. SSH authentication, identity, transport,
+timeout, and cancellation errors still fail. Translated launchers expose host,
+process, and translation fields; they cannot satisfy an explicit native assertion.
+These observations describe the probe/SSH environment, not bare-metal provenance
+on POSIX or the architecture of every later executable. An ARM shell does not
+prove that Node or another workload binary is native.
+
+Lease metadata contains normalized `architecture` (or `unknown`),
+`architecture_source`, `architecture_scope`, `architecture_version`, and
+`architecture_observed_at` (Unix milliseconds), with host/process/translation
+fields where available.
+`ServerType.Architecture` is populated only for supported measured architecture.
+Opaque route bindings prevent evidence from being attached to a different
+endpoint, user, or target after an override. No raw probe output is persisted.
+Offline `List`/non-prepared `Resolve` returns only **historical** timestamped
+evidence, or unknown for legacy/unmatched claims; it does not contact the host.
+Execution always refreshes this evidence. Touch preserves it without making it
+fresh again.
+
+Prepared resolution returns fresh evidence with the original exact claim snapshot;
+it does not change the persisted claim or the adapter's cache. `run` publishes
+the evidence through its repository-aware claim transaction before work. A
+different repository must use `--reclaim` before preparation can open SSH;
+reclaim permits probing but adopts the claim only after successful architecture
+validation. Rejected preparation leaves the claim, timestamps, and cache unchanged.
+The snapshot is checked again after probing and during guarded publication so
+a concurrent replacement or removal cannot be overwritten. Acquisition still
+publishes its evidence directly through the guarded repository claim transaction.
+Pond/admin preparation with no repository context does not infer an owner or
+adopt a claim: a caller that persists the returned endpoint must use its existing
+guarded publication step. Until then, offline lookup and Touch retain the
+previously published evidence.
+
+`config show` remains offline: its architecture is a configured/effective value,
+not observed architecture or proof of supported runtime behavior. The JSON
+`architectureExplicit` boolean (text: `architecture_explicit`) distinguishes an
+explicit assertion from the default. Observations never rewrite that configuration.
+
+### Upgrading existing static-host configuration
+
+Older static SSH versions accepted configured values such as `architecture: amd64`
+or `CRABBOX_ARCH=amd64` without checking the host. These values are now strict
+assertions, including `amd64` inherited from user configuration or the environment.
+Together with `--arch`, they must match fresh evidence on acquisition and prepared
+reuse. An unchanged configuration can therefore fail after upgrading if the SSH
+environment has a different architecture, runs under translation, or cannot provide
+the required evidence. There is no compatibility fallback for explicit values.
+
+For automatic discovery, remove `architecture` from every applicable user and
+repository config, including any config selected by a profile or wrapper through
+`CRABBOX_CONFIG`. Unset `CRABBOX_ARCH` and remove exports that set it again in shell
+profiles or CI. Also stop passing `--arch` in commands or wrappers. Check the
+effective config from the same directory and environment used for execution:
+
+```sh
+unset CRABBOX_ARCH
+crabbox config path
+crabbox config show --json
+```
+
+Verify `architectureExplicit` is `false` (text output: `architecture_explicit=false`).
+The displayed `architecture` may still be the offline default `amd64`; fresh SSH
+evidence determines the discovered architecture. A blank YAML value does not clear
+an inherited assertion, and an empty or unset `CRABBOX_ARCH` does not clear YAML.
+Normally user config loads first, then `crabbox.yaml`, then `.crabbox.yaml`, then
+nonempty environment overrides. `CRABBOX_CONFIG` selects a single file instead of
+the normal user/repository files. Remove the value from its contributing sources;
+see [config show](../commands/config.md#config-show) for the merged view.
+
+If a strict constraint is intended, keep an explicit supported value (`amd64` or
+`arm64`) matching the actual SSH environment, and ensure it can provide matching,
+non-translated evidence. Changing the assertion does not select an emulator or
+change the host. The probe describes the SSH environment only: it does not prove
+that every workload binary, such as Node, runs natively. Discovery also leaves SSH
+trust, endpoint identity, and repository claim/reclaim checks unchanged.
+
 ## Configuration
 
 The static target lives under the `static:` block. SSH credentials fall back to

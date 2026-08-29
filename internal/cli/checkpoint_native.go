@@ -497,6 +497,7 @@ func nativeCheckpointDeleteID(record checkpointRecord) string {
 
 func nativeCheckpointResourceRequest(record checkpointRecord) NativeCheckpointResourceRequest {
 	return NativeCheckpointResourceRequest{
+		LoadConfig: loadConfig,
 		Image: NativeCheckpointImage{
 			ID:           record.Native.ImageID,
 			Name:         record.Native.Name,

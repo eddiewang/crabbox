@@ -2,6 +2,8 @@
 # and input bytes never enter argv or the helper's environment.
 set -u
 mode=$1 directory=$2 nonce=$3 command_size=$4 payload_size=$5 idle_ms=$6 grace_ms=$7
+caller_mask=${8:-$(umask)}
+umask "$caller_mask" 2>/dev/null || exit 74
 umask 077
 trap '' HUP
 
@@ -55,7 +57,7 @@ case $mode in
 run)
     # setsid and ignored HUP preserve the supervisor after Windows loses its
     # launcher. It directly parents both members of the guarded pipeline.
-    exec setsid --wait bash -c "$CBX_HELPER" sh supervise "$directory" "$nonce" "$command_size" "$payload_size" "$idle_ms" "$grace_ms"
+    exec setsid --wait bash -c "$CBX_HELPER" sh supervise "$directory" "$nonce" "$command_size" "$payload_size" "$idle_ms" "$grace_ms" "$caller_mask"
     ;;
 guard)
     trap '' TERM
@@ -69,7 +71,7 @@ guard)
 workload)
     trap ':' TERM
     while [ ! -e "$directory/.armed" ]; do sleep .1; done
-    bash "$directory/command" <"$directory/input" &
+    (umask "$caller_mask"; exec bash "$directory/command" <"$directory/input") &
     child=$!
     while :; do
         code=0
@@ -129,14 +131,14 @@ if [ "$failed" = 1 ]; then remove_evidence || :; exit 74; fi
 head -c "$command_size" "$directory/frame" >"$directory/command" || exit 74
 dd if="$directory/frame" of="$directory/input" bs=65536 skip="$command_size" count="$payload_size" iflag=skip_bytes,count_bytes status=none || exit 74
 rm "$directory/frame"
-bash -c "$CBX_HELPER" sh watch "$directory" "$nonce" 0 0 0 0 </dev/null &
+bash -c "$CBX_HELPER" sh watch "$directory" "$nonce" 0 0 0 0 "$caller_mask" </dev/null &
 watcher=$!
 exec 3<&-
 mkfifo -m 600 "$directory/guard-wait" || exit 74
 exec 6<>"$directory/guard-wait"
 set -m
-bash -c "$CBX_HELPER" sh guard "$directory" "$nonce" 0 0 0 0 </dev/null |
-    bash -c "$CBX_HELPER" sh workload "$directory" "$nonce" 0 0 0 0 <"$directory/input" 6>&- &
+bash -c "$CBX_HELPER" sh guard "$directory" "$nonce" 0 0 0 0 "$caller_mask" </dev/null |
+    bash -c "$CBX_HELPER" sh workload "$directory" "$nonce" 0 0 0 0 "$caller_mask" <"$directory/input" 6>&- &
 leader=$!
 owned_guard=$(jobs -p %%)
 set +m

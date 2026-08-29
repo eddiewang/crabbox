@@ -253,13 +253,9 @@ func waitDaytonaStopped(ctx context.Context, client daytonaAPI, id string) error
 }
 
 func daytonaCheckpointConfig(req core.NativeCheckpointResourceRequest) (Config, error) {
-	cfg := req.Config
-	if cfg.Provider == "" {
-		var err error
-		cfg, err = core.LoadConfig()
-		if err != nil {
-			return cfg, err
-		}
+	cfg, err := req.LoadConfig()
+	if err != nil {
+		return cfg, err
 	}
 	cfg.Provider, cfg.Coordinator = daytonaProvider, ""
 	if req.Image.Provider != daytonaProvider || req.Image.Kind != core.CheckpointKindDaytona || !req.Image.Direct || req.Image.ID == "" || req.Image.Name == "" || req.Metadata["organization"] == "" || !checkpointIDPattern.MatchString(req.Metadata["checkpoint"]) || req.Metadata["source"] == "" {
@@ -342,7 +338,7 @@ func (Provider) DeleteNativeCheckpoint(ctx context.Context, req core.NativeCheck
 }
 
 func (Provider) ApplyNativeCheckpointForkConfig(req core.NativeCheckpointForkRequest) error {
-	resource := core.NativeCheckpointResourceRequest{Config: *req.Config, Image: core.NativeCheckpointImage{ID: req.Record.ImageID, Name: req.Record.Name, Provider: daytonaProvider, Kind: req.Record.Kind, Direct: req.Record.Direct}, Metadata: req.Record.Metadata}
+	resource := core.NativeCheckpointResourceRequest{LoadConfig: func() (Config, error) { return *req.Config, nil }, Image: core.NativeCheckpointImage{ID: req.Record.ImageID, Name: req.Record.Name, Provider: daytonaProvider, Kind: req.Record.Kind, Direct: req.Record.Direct}, Metadata: req.Record.Metadata}
 	cfg, err := daytonaCheckpointConfig(resource)
 	if err != nil {
 		return err

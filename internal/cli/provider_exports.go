@@ -228,6 +228,10 @@ func IsArchitectureExplicit(cfg Config) bool {
 	return cfg.architectureExplicit
 }
 
+func IsWindowsModeExplicit(cfg Config) bool {
+	return cfg.explicitWindowsMode != "" || cfg.windowsModeFlagExplicit
+}
+
 func MarkArchitectureExplicit(cfg *Config) {
 	cfg.architectureExplicit = true
 }
@@ -246,6 +250,13 @@ func RemoveLeaseClaimIfUnchanged(leaseID string, expected LeaseClaim) error {
 
 func VerifyLeaseClaimUnchanged(leaseID string, expected LeaseClaim) error {
 	return verifyLeaseClaimUnchanged(leaseID, expected)
+}
+
+// CheckLeaseClaimRepositoryOwner checks the publication owner policy without
+// changing the claim. Preparation without repository context should skip this
+// check; publication retains its own empty-root rules.
+func CheckLeaseClaimRepositoryOwner(leaseID string, existing LeaseClaim, repoRoot string, reclaim bool) error {
+	return checkLeaseClaimRepositoryOwner(leaseID, existing, repoRoot, reclaim)
 }
 
 // RemoveLeaseClaimIfUnchangedAfter holds the claim lock across action and
