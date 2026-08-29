@@ -626,6 +626,16 @@ func (testGCPProvider) RegisterFlags(*flag.FlagSet, Config) any { return noProvi
 func (testGCPProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
 	return nil
 }
+func (testGCPProvider) ReadyPoolImageIdentityMatchesLease(req ProviderReadyPoolImageIdentityRequest) bool {
+	image := req.Lease.Image
+	return req.Identity.Provider == "gcp" &&
+		req.Lease.Provider == "gcp" &&
+		image != nil &&
+		image.Provider == "gcp" &&
+		req.Lease.Project != "" &&
+		strings.TrimSpace(req.Lease.Project) == req.Lease.Project &&
+		image.ID == req.Identity.ID
+}
 func (testGCPProvider) ServerTypeForConfig(cfg Config) string {
 	candidates := gcpMachineTypeCandidatesForConfig(cfg)
 	if len(candidates) == 0 {
@@ -691,6 +701,16 @@ func (testAWSProvider) Spec() ProviderSpec {
 func (testAWSProvider) RegisterFlags(*flag.FlagSet, Config) any { return noProviderFlags{} }
 func (testAWSProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
 	return nil
+}
+func (testAWSProvider) ReadyPoolImageIdentityMatchesLease(req ProviderReadyPoolImageIdentityRequest) bool {
+	image := req.Lease.Image
+	return req.Identity.Provider == "aws" &&
+		req.Lease.Provider == "aws" &&
+		image != nil &&
+		image.Provider == "aws" &&
+		image.ID == req.Identity.ID &&
+		image.Region == req.Identity.Scope &&
+		req.Lease.Region == req.Identity.Scope
 }
 func (testAWSProvider) ConfigureSSHTarget(target *SSHTarget, readyCommand string) {
 	if target.TargetOS == targetLinux {

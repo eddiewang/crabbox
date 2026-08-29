@@ -139,6 +139,8 @@ import {
   gcpMachineImageNotFound,
   gcpProviderLabelValue,
   gcpSnapshotNotFound,
+  gcpReadyPoolImageScope,
+  gcpReadyPoolImageScopeSupported,
 } from "./gcp";
 import {
   githubMembershipPolicy,
@@ -25502,6 +25504,32 @@ export class GCPProvider implements CloudProvider {
   private get client(): GCPClient {
     this.clientValue ??= new GCPClient(this.env, this.zone, this.project);
     return this.clientValue;
+  }
+
+  readyPoolImageIdentity(lease: LeaseRecord): ReadyPoolImageIdentity | undefined {
+    const image = lease.image;
+    const providerProject = lease.providerProject;
+    if (
+      lease.provider !== "gcp" ||
+      !image ||
+      image.provider !== "gcp" ||
+      !providerProject ||
+      providerProject.trim() !== providerProject ||
+      !/^[0-9]+$/.test(image.id)
+    ) {
+      return undefined;
+    }
+    const scope = gcpReadyPoolImageScope(image.sourceID, image.kind);
+    if (!scope) return undefined;
+    return { provider: "gcp", scope, id: image.id };
+  }
+
+  supportsReadyPoolImageIdentity(identity: ReadyPoolImageIdentity): boolean {
+    return (
+      identity.provider === "gcp" &&
+      /^[0-9]+$/.test(identity.id) &&
+      gcpReadyPoolImageScopeSupported(identity.scope)
+    );
   }
 
   restrictedLeaseRequestFields(input: LeaseRequest): string[] {

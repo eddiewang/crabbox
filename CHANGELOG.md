@@ -2,6 +2,10 @@
 
 ## 0.48.2 (Unreleased)
 
+### Added
+
+- Added typed GCP ready-pool cohorts bound to immutable boot-image or disk-snapshot provenance while allowing capacity fallback across zones.
+
 ### Fixed
 
 - Bound typed ready-pool capacity to canonical provider identities, migrated desired state to fixed-size v2 keys without legacy-reader exposure, and routed returns to fail-closed drain cleanup when provider or lease identity evidence changes.
