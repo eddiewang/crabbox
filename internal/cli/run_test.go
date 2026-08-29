@@ -5218,19 +5218,11 @@ func TestWindowsWSL2RemoteCapabilityPreflightUsesBoundedWrapper(t *testing.T) {
 	nonce := strings.Repeat("a", 32)
 	var staged []byte
 	var launcher string
-	oldStage := stageWSLSpool
-	stageWSLSpool = func(spool *wslStageSpool, _ context.Context, target *SSHTarget, _ wslStageTiming, _, _ string, _ io.Writer) (string, error) {
-		reader, err := spool.input.reset()
-		if err != nil {
-			return "", err
-		}
-		staged, err = io.ReadAll(reader)
+	captureWSLStage(t, nonce, func(spool *wslStageSpool, target *SSHTarget, _ wslStageTiming, data []byte) {
+		staged = data
 		target.NoControlMaster = true
-		spool.shell = wslStageCMD
 		launcher = wslStageLauncherCommand(nonce, spool.size, spool.digest(), wslStageCMD)
-		return nonce, err
-	}
-	t.Cleanup(func() { stageWSLSpool = oldStage })
+	})
 	cfg := defaultConfig()
 	cfg.Run.PreflightTools = []string{"node"}
 	target := SSHTarget{

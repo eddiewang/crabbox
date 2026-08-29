@@ -820,6 +820,25 @@ func decodeWSLStage(t *testing.T, data []byte) (owner, helper, command string, p
 	return
 }
 
+func captureWSLStage(t *testing.T, nonce string, inspect func(*wslStageSpool, *SSHTarget, wslStageTiming, []byte)) {
+	t.Helper()
+	previous := stageWSLSpool
+	t.Cleanup(func() { stageWSLSpool = previous })
+	stageWSLSpool = func(spool *wslStageSpool, _ context.Context, target *SSHTarget, timing wslStageTiming, _, _ string, _ io.Writer) (string, error) {
+		reader, err := spool.input.reset()
+		if err != nil {
+			return "", err
+		}
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return "", err
+		}
+		spool.shell = wslStageCMD
+		inspect(spool, target, timing, data)
+		return nonce, nil
+	}
+}
+
 func TestWSL2StagedTransportBuildsExactPrivateSpool(t *testing.T) {
 	remote := strings.Repeat("# large command\n", 2048) + "printf 'exact'"
 	payload := bytes.Repeat([]byte{0, 1, 2, 255}, 2<<20)
@@ -933,19 +952,6 @@ func TestWSLHelperBootstrapPreservesExactBytes(t *testing.T) {
 				t.Fatalf("bootstrap bytes=%x err=%v", got, err)
 			}
 		})
-	}
-}
-
-func TestPrepareSSHTransportDisablesMuxForAllWSL2(t *testing.T) {
-	for _, target := range []SSHTarget{{TargetOS: targetWindows, WindowsMode: windowsModeWSL2}, {TargetOS: targetLinux}} {
-		transport, err := prepareSSHTransport(target, "true", nil, 0, sshCommandLimit{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer transport.close()
-		if (transport.stage != nil) != isWindowsWSL2Target(target) {
-			t.Fatal("wrong prepared route")
-		}
 	}
 }
 

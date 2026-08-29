@@ -909,36 +909,25 @@ func TestWorkspaceOwnerNativeWindowsProtocolStreamsScriptsOverStdin(t *testing.T
 func TestWorkspaceOwnerWSL2StagesThenExecutesOnceWithoutStdin(t *testing.T) {
 	dir := installWorkspaceOwnerRecordingSSH(t)
 	nonce := strings.Repeat("a", 32)
-	oldStage := stageWSLSpool
 	staged := 0
 	var launchers []string
 	wantTiming := sshTransportTiming(sshCommandLimit{execution: workspaceOwnerRemoteTimeout, control: true})
-	stageWSLSpool = func(spool *wslStageSpool, _ context.Context, target *SSHTarget, timing wslStageTiming, _, _ string, _ io.Writer) (string, error) {
-		spool.shell = wslStageCMD
+	captureWSLStage(t, nonce, func(spool *wslStageSpool, target *SSHTarget, timing wslStageTiming, data []byte) {
 		staged++
 		if timing != wantTiming || !target.NoControlMaster {
 			t.Fatalf("timing=%+v no-mux=%t", timing, target.NoControlMaster)
 		}
-		reader, err := spool.input.reset()
-		if err != nil {
-			return "", err
-		}
-		data, err := io.ReadAll(reader)
-		if err != nil || len(data) != int(spool.size) || string(data[:8]) != "CBXFLAT2" {
-			t.Fatalf("invalid staged owner spool bytes=%d err=%v", len(data), err)
+		if len(data) != int(spool.size) || string(data[:8]) != "CBXFLAT2" {
+			t.Fatalf("invalid staged owner spool bytes=%d", len(data))
 		}
 		if spool.size > 1<<20 || wslStageBudget(timing.stage, timing.idle, spool.size) != sshTransportTiming(sshCommandLimit{execution: workspaceOwnerRemoteTimeout, control: true}).stage {
 			t.Fatalf("owner spool exceeds its accounted upload phase: bytes=%d budget=%s", spool.size, wslStageBudget(timing.stage, timing.idle, spool.size))
 		}
-		if binary.LittleEndian.Uint64(data[32:]) != uint64(workspaceOwnerRemoteTimeout.Milliseconds()) {
-			t.Fatal("control execution limit missing")
+		if binary.LittleEndian.Uint64(data[32:]) != uint64(timing.operation.Milliseconds()) || timing.operation != 38*time.Second {
+			t.Fatal("derived control operation guard missing")
 		}
-
-		spool.shell = wslStageCMD
 		launchers = append(launchers, wslStageLauncherCommand(nonce, spool.size, spool.digest(), wslStageCMD))
-		return nonce, nil
-	}
-	t.Cleanup(func() { stageWSLSpool = oldStage })
+	})
 
 	target := SSHTarget{User: "crabbox", Host: "127.0.0.1", Port: "22", TargetOS: targetWindows, WindowsMode: windowsModeWSL2}
 	key, token := workspaceOwnerKey("cbx_wsl2_staged_protocol"), strings.Repeat("6", 64)
@@ -1028,16 +1017,20 @@ func TestWorkspaceOwnerWANBudgetContract(t *testing.T) {
 				t.Fatalf("route allocation=%+v", stage)
 			}
 			call := sshTransportCallBudget(target, sshControlMetadataLimit, sshCommandLimit{execution: workspaceOwnerRemoteTimeout, control: true})
+			if timing.execute != 110*time.Second || timing.reserve != 131*time.Second || call != time.Duration(131*test.routes+132)*time.Second {
+				t.Fatalf("control allocation: timing=%+v call=%s", timing, call)
+			}
 			lifecycle := time.Duration(test.routes)*candidate + timing.execute + wslStageCleanupTimeout + sshCommandWaitDelay
 			if call <= lifecycle || call != stage.total+timing.reserve {
 				t.Fatalf("call=%s lifecycle=%s", call, lifecycle)
 			}
 			owner := &workspaceOwner{transport: sshWorkspaceOwnerTransport{target: target}}
-			if owner.callTimeout() != call || owner.quiesceTimeout() <= 2*call {
+			if owner.callTimeout() != call || owner.quiesceTimeout() != 2*call+time.Second {
 				t.Fatal("owner caller lost dynamic route allocation")
 			}
 			ttl := workspaceOwnerRenewInterval + call + workspaceOwnerRenewMargin
-			if ttl <= workspaceOwnerRenewInterval+lifecycle {
+			wait := ttl + workspaceOwnerPollInterval + call + workspaceOwnerRenewMargin
+			if ttl != call+11*time.Second || wait != 2*call+13*time.Second || ttl <= workspaceOwnerRenewInterval+lifecycle {
 				t.Fatal("renewal exceeds TTL")
 			}
 		})

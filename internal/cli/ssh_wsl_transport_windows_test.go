@@ -79,14 +79,22 @@ func runFakeWSLStageLauncher(mode string) {
 	}
 	switch role {
 	case "run":
-		if mode == "delayed-read" {
-			time.Sleep(3 * time.Second)
+		if mode == "delayed-read" || mode == "delayed-control-completion" {
+			delay := 3 * time.Second
+			if mode == "delayed-control-completion" {
+				delay = 11 * time.Second
+			}
+			time.Sleep(delay)
 		}
 		if mode != "main-no-read" {
 			_ = readFakeWSLStageInput()
 		}
 		if mode == "delayed-read" {
 			os.Exit(23)
+		}
+		if mode == "delayed-control-completion" {
+			time.Sleep(wsl2SignalGrace)
+			os.Exit(0)
 		}
 		_ = os.WriteFile(logPath+".main.pid", []byte(strconv.Itoa(os.Getpid())), 0o600)
 		log("main-started")
@@ -883,15 +891,18 @@ func runWSLStageRootScript(t *testing.T, script string) ([]byte, error) {
 }
 
 func TestWSLStageFrameworkInputPreamble(t *testing.T) {
-	testWSLStageFrameworkInput(t, false)
+	testWSLStageFrameworkInput(t, "")
 }
 
 func TestWSLStageDelayedInitialHandoff(t *testing.T) {
-	testWSLStageFrameworkInput(t, true)
+	for _, mode := range []string{"delayed-read", "delayed-control-completion"} {
+		t.Run(mode, func(t *testing.T) { testWSLStageFrameworkInput(t, mode) })
+	}
 }
 
-func testWSLStageFrameworkInput(t *testing.T, delayed bool) {
+func testWSLStageFrameworkInput(t *testing.T, mode string) {
 	t.Helper()
+	delayed := mode != ""
 	bin := installFakeWSLStageExecutable(t)
 	for _, bom := range []bool{false, true} {
 		for _, cleanup := range []bool{false, true} {
@@ -905,15 +916,20 @@ func testWSLStageFrameworkInput(t *testing.T, delayed bool) {
 				if cleanup {
 					t.Setenv(fakeWSLStageLauncherMode, "main-delay")
 				} else if delayed {
-					t.Setenv(fakeWSLStageLauncherMode, "delayed-read")
+					t.Setenv(fakeWSLStageLauncherMode, mode)
 				}
-				_, raw := newTestWSLStageSpool(t, []byte{0, 255, 13, 10})
+				limit := sshCommandLimit{}
+				if delayed {
+					limit = sshCommandLimit{execution: sshControlExecutionLimit, control: true}
+				}
+				spool, raw := newTestWSLStageSpoolWithLimit(t, []byte{0, 255, 13, 10}, limit)
 				owner, helper, command, payload := decodeWSLStage(t, raw)
 				if cleanup {
 					binary.LittleEndian.PutUint64(raw[32:], 1500)
 				} else if delayed {
-					binary.LittleEndian.PutUint64(raw[32:], uint64(sshControlExecutionLimit.Milliseconds()))
-					binary.LittleEndian.PutUint32(raw[40:], uint32(sshTransportTiming(sshCommandLimit{control: true}).idle.Milliseconds()))
+					if binary.LittleEndian.Uint64(raw[32:]) != uint64(spool.timing.operation.Milliseconds()) {
+						t.Fatal("native fixture lost generated operation guard")
+					}
 				}
 				frame := append(append([]byte(helper), []byte(command)...), payload...)
 				path := filepath.Join(t.TempDir(), "frame")
@@ -937,7 +953,11 @@ try {
 				// Encoding changes belong only to this disposable test console.
 				process.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_CONSOLE, HideWindow: true}
 				output, err := process.CombinedOutput()
-				if !cleanup && exitCode(err) != 23 || cleanup && (err == nil || !bytes.Contains(output, []byte("WSL2 command timed out"))) {
+				wantCode := 23
+				if mode == "delayed-control-completion" {
+					wantCode = 0
+				}
+				if !cleanup && exitCode(err) != wantCode || cleanup && (err == nil || !bytes.Contains(output, []byte("WSL2 command timed out"))) {
 					t.Fatalf("Framework owner exit=%d output=%q err=%v", exitCode(err), output, err)
 				}
 				preamble := []byte(nil)

@@ -410,8 +410,13 @@ func TestWSLSFTPDiagnosticsRedactSecretAuthenticationWithoutChangingClassificati
 
 func newTestWSLStageSpool(t *testing.T, payload []byte) (*wslStageSpool, []byte) {
 	t.Helper()
+	return newTestWSLStageSpoolWithLimit(t, payload, sshCommandLimit{})
+}
+
+func newTestWSLStageSpoolWithLimit(t *testing.T, payload []byte, limit sshCommandLimit) (*wslStageSpool, []byte) {
+	t.Helper()
 	remote := "printf stage"
-	spool, err := newWSLStageSpool(remote, payload, nil, int64(len(payload)), sshCommandLimit{})
+	spool, err := newWSLStageSpool(remote, payload, nil, int64(len(payload)), limit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,61 +551,6 @@ func TestWSLStageBlindingStaysOutOfPublicTransportMetadata(t *testing.T) {
 	}
 }
 
-func TestUploadToSFTPPublishesExactPrivateStage(t *testing.T) {
-	root := t.TempDir()
-	installWSLStageDiscardFixture(t, root)
-	client := newLoopbackSFTPClient(t, root)
-	spool, want := newTestWSLStageSpool(t, []byte{0, 1, 2, 255})
-	_, cancel := context.WithCancelCause(t.Context())
-	defer cancel(nil)
-	nonce := strings.Repeat("a", 32)
-	if _, err := uploadToSFTP(client, spool, nonce, time.Second, cancel); err != nil {
-		t.Fatal(err)
-	}
-	stageRoot := filepath.Join(root, ".crabbox", "wsl-stage")
-	ready := filepath.Join(stageRoot, nonce+".ready")
-	got, err := os.ReadFile(ready)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatal("published WSL2 stage bytes changed")
-	}
-	if _, err := os.Stat(filepath.Join(stageRoot, nonce+".part")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("partial stage survived: %v", err)
-	}
-	if runtime.GOOS != "windows" {
-		rootInfo, _ := os.Stat(stageRoot)
-		if rootInfo.Mode().Perm() != 0o700 {
-			t.Fatalf("stage root is not private: mode=%o", rootInfo.Mode().Perm())
-		}
-	}
-}
-
-func TestUploadToSFTPPublishesEightMiBWithExactDigest(t *testing.T) {
-	root := t.TempDir()
-	installWSLStageDiscardFixture(t, root)
-	client := newLoopbackSFTPClient(t, root)
-	payload := bytes.Repeat([]byte{0xa5}, 8<<20)
-	spool, want := newTestWSLStageSpool(t, payload)
-	ctx, cancel := context.WithCancelCause(t.Context())
-	defer cancel(nil)
-	nonce := strings.Repeat("8", 32)
-	if _, err := uploadToSFTP(client, spool, nonce, time.Second, cancel); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(filepath.Join(root, ".crabbox", "wsl-stage", nonce+".ready"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) || sha256.Sum256(got) != spool.digest() {
-		t.Fatal("published 8 MiB WSL2 stage bytes or digest changed")
-	}
-	if cause := context.Cause(ctx); cause != nil {
-		t.Fatalf("unexpected transfer cancellation: %v", cause)
-	}
-}
-
 func TestUploadToSFTPRequiresPreparedPrivateRoot(t *testing.T) {
 	root := t.TempDir()
 	installWSLStageDiscardFixture(t, root)
@@ -659,26 +609,6 @@ func TestUploadToSFTPRejectsDifferentSubsystemDirectoryBeforeSensitiveWrite(t *t
 				t.Fatalf("SFTP verifier removed route proof: %v", statErr)
 			}
 		})
-	}
-}
-
-func TestUploadToSFTPDoesNotRequireWindowsUnsupportedSetstat(t *testing.T) {
-	root := t.TempDir()
-	installWSLStageDiscardFixture(t, root)
-	client := newLoopbackSFTPClientWithServerConn(t, root, func(conn net.Conn) net.Conn {
-		return &wslSFTPRequestConn{Conn: conn}
-	})
-	spool, expected := newTestWSLStageSpool(t, []byte("private staged payload"))
-	_, cancel := context.WithCancelCause(t.Context())
-	defer cancel(nil)
-	nonce := strings.Repeat("7", 32)
-	ownership, err := uploadToSFTP(client, spool, nonce, time.Second, cancel)
-	if err != nil || ownership != wslStagePublished {
-		t.Fatalf("Windows-compatible staging required chmod/setstat: ownership=%d err=%v", ownership, err)
-	}
-	ready, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(wslStageRoot), nonce+".ready"))
-	if err != nil || !bytes.Equal(ready, expected) {
-		t.Fatalf("Windows-compatible staging changed its private bytes: bytes=%d err=%v", len(ready), err)
 	}
 }
 
@@ -1913,13 +1843,18 @@ func TestWSLStagePreservesOwnerExecutionAndCleanupReserve(t *testing.T) {
 		reserve     time.Duration
 		consume     time.Duration
 		wantStaging bool
+		canceled    bool
 	}{
 		{name: "reject before staging", deadline: 40 * time.Millisecond, reserve: 80 * time.Millisecond},
 		{name: "reject after staging consumed reserve", deadline: 120 * time.Millisecond, reserve: 80 * time.Millisecond, consume: 55 * time.Millisecond, wantStaging: true},
+		{name: "canceled before staging without reserve", deadline: time.Second, canceled: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), test.deadline)
 			defer cancel()
+			if test.canceled {
+				cancel()
+			}
 			spool.timing.reserve = test.reserve
 			oldStage := stageWSLSpool
 			staged := false
@@ -1931,7 +1866,13 @@ func TestWSLStagePreservesOwnerExecutionAndCleanupReserve(t *testing.T) {
 			}
 			t.Cleanup(func() { stageWSLSpool = oldStage })
 			err := spool.run(ctx, &target, "10", "3", io.Discard, io.Discard)
-			if err == nil || !strings.Contains(err.Error(), "execution and cleanup deadline") || staged != test.wantStaging {
+			wrongError := err == nil
+			if test.canceled {
+				wrongError = !errors.Is(err, context.Canceled)
+			} else if err != nil {
+				wrongError = !strings.Contains(err.Error(), "execution and cleanup deadline")
+			}
+			if wrongError || staged != test.wantStaging {
 				t.Fatalf("staged=%t want=%t error=%v", staged, test.wantStaging, err)
 			}
 		})
@@ -2063,28 +2004,6 @@ func TestWSLStagePartialCleanupBindsExactLocalPrefix(t *testing.T) {
 	}
 }
 
-func TestWSLStageUploadNeverSweepsUnknownOldFiles(t *testing.T) {
-	root := t.TempDir()
-	client := newLoopbackSFTPClient(t, root)
-	spool, _ := newTestWSLStageSpool(t, nil)
-	path := filepath.Join(root, filepath.FromSlash(wslStageRoot), strings.Repeat("e", 32)+".part")
-	if err := os.WriteFile(path, []byte("unknown"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-72 * time.Hour)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatal(err)
-	}
-	_, cancel := context.WithCancelCause(t.Context())
-	defer cancel(nil)
-	if _, err := uploadToSFTP(client, spool, strings.Repeat("f", 32), time.Second, cancel); err != nil {
-		t.Fatal(err)
-	}
-	if data, err := os.ReadFile(path); err != nil || string(data) != "unknown" {
-		t.Fatal("unknown old partial removed")
-	}
-}
-
 func TestWSLStageUnacknowledgedCreateNeverAcquiresCleanupAuthority(t *testing.T) {
 	root := t.TempDir()
 	nonce := strings.Repeat("a", 32)
@@ -2168,6 +2087,45 @@ func TestWSLStagePartialObservationCancellationClosesPipes(t *testing.T) {
 	}
 }
 
+const wslHandoffFixture = `Add-Type -TypeDefinition '
+public class HandoffFixture {
+    public long ElapsedMilliseconds;
+    public int Delay, ExitDelay, ExitCode, CleanupDelay, CleanupCode;
+    public bool Late, CleanupLate, HasExited;
+    public System.Collections.Generic.List<int> ExitWaits = new System.Collections.Generic.List<int>();
+    public bool WaitForExit(int ceiling) {
+        ExitWaits.Add(ceiling);
+        ElapsedMilliseconds += Late ? ExitDelay : System.Math.Min(ExitDelay, ceiling);
+        HasExited = Late || ExitDelay <= ceiling;
+        ExitDelay = 0;
+        return HasExited;
+    }
+    public void WaitForExit() { WaitForExit(int.MaxValue); }
+    public void Restart() {
+        ElapsedMilliseconds = 0; ExitDelay = CleanupDelay;
+        ExitCode = CleanupCode; Late = CleanupLate;
+    }
+    public void Dispose() { }
+    public void Kill() { HasExited = true; }
+    public System.IO.FileStream BaseStream;
+    public System.IO.MemoryStream Wire = new System.IO.MemoryStream();
+    public System.Collections.Generic.List<int> Ceilings = new System.Collections.Generic.List<int>();
+    private byte[] pending;
+    public HandoffFixture FlushAsync() { pending = null; return this; }
+    public HandoffFixture WriteAsync(byte[] bytes, int offset, int count) {
+        pending = new byte[count]; System.Array.Copy(bytes, offset, pending, 0, count); return this;
+    }
+    public bool Wait(int ceiling) {
+        Ceilings.Add(ceiling); ElapsedMilliseconds += System.Math.Min(Delay, ceiling);
+        int delay = Delay; Delay = 0;
+        if (delay > ceiling) return false;
+        if (pending != null) Wire.Write(pending, 0, pending.Length);
+        return true;
+    }
+    public HandoffFixture GetAwaiter() { return this; }
+    public void GetResult() { }
+}'`
+
 func TestWSLStageInitialHandoffBudgets(t *testing.T) {
 	t.Run("embedded programs use LF", func(t *testing.T) {
 		for name, program := range map[string]string{
@@ -2220,27 +2178,7 @@ func TestWSLStageInitialHandoffBudgets(t *testing.T) {
 			// Exercise the generated functions with a deterministic clock/task;
 			// Windows fixtures separately exercise the real anonymous pipe reader.
 			idle := sshTransportTiming(sshCommandLimit{control: test.execution > 0}).idle.Milliseconds()
-			script := `Add-Type -TypeDefinition '
-public class HandoffFixture {
-    public long ElapsedMilliseconds;
-    public int Delay;
-    public System.IO.FileStream BaseStream;
-    public System.IO.MemoryStream Wire = new System.IO.MemoryStream();
-    public System.Collections.Generic.List<int> Ceilings = new System.Collections.Generic.List<int>();
-    private byte[] pending;
-    public HandoffFixture FlushAsync() { pending = null; return this; }
-    public HandoffFixture WriteAsync(byte[] bytes, int offset, int count) {
-        pending = new byte[count]; System.Array.Copy(bytes, offset, pending, 0, count); return this;
-    }
-    public bool Wait(int ceiling) {
-        Ceilings.Add(ceiling); ElapsedMilliseconds += System.Math.Min(Delay, ceiling);
-        if (Delay > ceiling) return false;
-        if (pending != null) Wire.Write(pending, 0, pending.Length);
-        return true;
-    }
-    public HandoffFixture GetAwaiter() { return this; }
-    public void GetResult() { }
-}'
+			script := wslHandoffFixture + `
 $file=[IO.File]::OpenRead(` + psQuote(path) + `)
 try {
   $descriptor=[IO.BinaryReader]::new($file).ReadBytes(` + fmt.Sprint(wslStageHeaderSize) + `)
@@ -2263,13 +2201,15 @@ try {
 @{ceilings=@($clock.Ceilings.ToArray());elapsed=$clock.ElapsedMilliseconds;reason=$reason;wire=[Convert]::ToBase64String($clock.Wire.ToArray())}|ConvertTo-Json -Compress
   } $file $descriptor 'handoff-fixture'
 } finally { $file.Dispose() }`
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, powerShell, "-NoProfile", "-NonInteractive", "-Command", "& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))")
 			cmd.Stdin = strings.NewReader(script)
+			diagnostic := &boundedWSLDiagnostics{remaining: wslSFTPDiagnosticLimit}
+			cmd.Stderr = diagnostic
 			out, err := cmd.Output()
 			if err != nil {
-				t.Fatalf("handoff fixture: %v", err)
+				t.Fatalf("handoff fixture: %v cause=%v stderr=%q", err, context.Cause(ctx), RedactDiagnosticSecrets(diagnostic.buffer.String()))
 			}
 			var got struct {
 				Ceilings []int
@@ -2286,6 +2226,114 @@ try {
 			}
 			if test.complete && !bytes.Equal(got.Wire, append([]byte(helper+command), payload...)) {
 				t.Fatal("initial handoff changed helper/frame bytes")
+			}
+		})
+	}
+	t.Run("completion", func(t *testing.T) { testWSLStageOwnerCompletionBudgets(t, powerShell) })
+}
+
+func testWSLStageOwnerCompletionBudgets(t *testing.T, powerShell string) {
+	t.Helper()
+	for _, test := range []struct {
+		name                        string
+		finite                      bool
+		delay, code                 int
+		late                        bool
+		cleanupDelay, cleanupCode   int
+		cleanupLate, cleanupFailure bool
+		wantCode                    int
+		wantFailure                 bool
+	}{
+		{name: "control handoff plus normal grace", delay: 5000},
+		{name: "ordinary finite deadline unchanged", finite: true, delay: 5000, wantFailure: true},
+		{name: "late zero rejected", delay: 38000, late: true, wantFailure: true},
+		{name: "late nonzero preserved", delay: 38000, late: true, code: 23, wantCode: 23},
+		{name: "timeout survives timely cleanup", delay: 38000, cleanupDelay: 5000, wantFailure: true},
+		{name: "late cleanup zero rejected", delay: 38000, cleanupDelay: 10001, cleanupLate: true, cleanupFailure: true, wantFailure: true},
+		{name: "cleanup refusal stays failure", delay: 38000, cleanupCode: 23, cleanupFailure: true, wantFailure: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, raw := newTestWSLStageSpoolWithLimit(t, []byte{0, 255, 13, 10}, sshCommandLimit{execution: sshControlExecutionLimit, control: !test.finite})
+			owner, helper, command, payload := decodeWSLStage(t, raw)
+			path := filepath.Join(t.TempDir(), "envelope")
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			// Keep the generated owner, including Remaining, WaitForExit and
+			// cleanup. Only the clock and external launcher/pipe are modeled.
+			script := owner
+			for call, replacement := range map[string]string{
+				"[Diagnostics.Stopwatch]::StartNew()":       "$fixture",
+				"$process = Start-Linux 'run'":              "$process = $fixture",
+				"$writer = Open-LinuxInput $process":        "$writer = $fixture",
+				"$cleanup = Start-Linux 'cleanup'":          "$cleanup = $fixture",
+				"$cleanupWriter = Open-LinuxInput $cleanup": "$cleanupWriter = $fixture",
+				"exit $code": "$script:result = $code",
+			} {
+				if !strings.Contains(script, call) {
+					t.Fatal("owner fixture boundary missing")
+				}
+				script = strings.Replace(script, call, replacement, 1)
+			}
+			script = wslHandoffFixture + fmt.Sprintf(`
+$fixture=[HandoffFixture]::new();$fixture.Delay=11000
+$fixture.ExitDelay=%d;$fixture.ExitCode=%d;$fixture.Late=$%t
+$fixture.CleanupDelay=%d;$fixture.CleanupCode=%d;$fixture.CleanupLate=$%t
+`, test.delay, test.code, test.late, test.cleanupDelay, test.cleanupCode, test.cleanupLate) + `
+$file=[IO.File]::OpenRead(` + psQuote(path) + `)
+$reason='';$script:result=-1
+try {
+  $descriptor=[IO.BinaryReader]::new($file).ReadBytes(` + fmt.Sprint(wslStageHeaderSize) + `)
+  $file.Position+=` + fmt.Sprint(len(owner)) + `
+  & ([ScriptBlock]::Create(` + psQuote(script) + `)) $file $descriptor 'completion-fixture'
+} catch { $reason=$_.Exception.Message } finally { $file.Dispose() }
+@{code=$script:result;reason=$reason;waits=@($fixture.ExitWaits.ToArray());wire=[Convert]::ToBase64String($fixture.Wire.ToArray())}|ConvertTo-Json -Compress`
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, powerShell, "-NoProfile", "-NonInteractive", "-Command", "& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))")
+			cmd.Stdin = strings.NewReader(script)
+			diagnostic := &boundedWSLDiagnostics{remaining: wslSFTPDiagnosticLimit}
+			cmd.Stderr = diagnostic
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("completion fixture: %v cause=%v stderr=%q", err, context.Cause(ctx), RedactDiagnosticSecrets(diagnostic.buffer.String()))
+			}
+			var got struct {
+				Code   int
+				Reason string
+				Waits  []int
+				Wire   []byte
+			}
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			wantReason := ""
+			if test.wantFailure {
+				wantReason = fmt.Sprintf("WSL2 command timed out phase=execute expected=%d read=%d written=%d", len(command)+len(payload), len(command)+len(payload), len(command)+len(payload))
+			}
+			if got.Reason != wantReason || !test.wantFailure && got.Code != test.wantCode {
+				t.Fatalf("code=%d reason=%q want code=%d reason=%q", got.Code, got.Reason, test.wantCode, wantReason)
+			}
+			wantDiagnostic := ""
+			if test.cleanupFailure {
+				wantDiagnostic = "WSL2 command cleanup failed"
+			}
+			if strings.TrimSpace(diagnostic.buffer.String()) != wantDiagnostic {
+				t.Fatalf("cleanup diagnostic=%q want=%q", diagnostic.buffer.String(), wantDiagnostic)
+			}
+			wantWait := 27000
+			if test.finite {
+				wantWait = 1000
+			}
+			if len(got.Waits) == 0 || got.Waits[0] != wantWait {
+				t.Fatalf("execution waits=%v want first=%d", got.Waits, wantWait)
+			}
+			wantWire := append([]byte(helper+command), payload...)
+			if test.wantFailure {
+				wantWire = append(wantWire, []byte(helper)...)
+			}
+			if !bytes.Equal(got.Wire, wantWire) {
+				t.Fatal("owner changed the finite frame or replayed command/input during cleanup")
 			}
 		})
 	}
@@ -2413,28 +2461,76 @@ func TestWSLStagePowerShellDefaultShellPreservesNativeStreamsAndExit(t *testing.
 	}
 }
 
-func TestWSLStageUploadReadsOnlyRootProofBeforeSensitiveWrite(t *testing.T) {
-	root, nonce := t.TempDir(), strings.Repeat("c", 32)
-	var requests *wslSFTPRequestConn
-	client := newLoopbackSFTPClientWithServerConn(t, root, func(conn net.Conn) net.Conn { requests = &wslSFTPRequestConn{Conn: conn}; return requests })
-	proof := filepath.Join(root, filepath.FromSlash(wslStageRoot), "."+nonce+".proof")
-	if err := os.WriteFile(proof, []byte(nonce), 0600); err != nil {
-		t.Fatal(err)
-	}
-	spool, raw := newTestWSLStageSpool(t, bytes.Repeat([]byte{0, 255, 13, 10}, 2<<20))
-	spool.routeProof = nonce
-	_, cancel := context.WithCancelCause(t.Context())
-	defer cancel(nil)
-	owned, err := uploadToSFTP(client, spool, nonce, time.Second, cancel)
-	if err != nil || owned != wslStagePublished {
-		t.Fatalf("upload=%d %v", owned, err)
-	}
-	if requests.readsBeforeWrite.Load() == 0 || requests.readsAfterWrite.Load() != 0 {
-		t.Fatalf("root reads=%d content reads=%d", requests.readsBeforeWrite.Load(), requests.readsAfterWrite.Load())
-	}
-	got, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(wslStageRoot), nonce+".ready"))
-	if err != nil || !bytes.Equal(got, raw) {
-		t.Fatalf("published binary input changed: %v", err)
+func TestWSLStageUploadPublicationContract(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "empty"},
+		{name: "small_binary", payload: []byte{0, 1, 2, 255}},
+		{name: "8_MiB_binary", payload: bytes.Repeat([]byte{0, 255, 13, 10}, 2<<20)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			nonce, err := randomHex(16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var requests *wslSFTPRequestConn
+			client := newLoopbackSFTPClientWithServerConn(t, root, func(conn net.Conn) net.Conn {
+				requests = &wslSFTPRequestConn{Conn: conn}
+				return requests
+			})
+			stageRoot := filepath.Join(root, filepath.FromSlash(wslStageRoot))
+			proof := filepath.Join(stageRoot, "."+nonce+".proof")
+			if err := os.WriteFile(proof, []byte(nonce), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			foreignPart := filepath.Join(stageRoot, strings.Repeat("e", 32)+".part")
+			if err := os.WriteFile(foreignPart, []byte("unknown"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			old := time.Now().Add(-72 * time.Hour)
+			if err := os.Chtimes(foreignPart, old, old); err != nil {
+				t.Fatal(err)
+			}
+			spool, want := newTestWSLStageSpool(t, test.payload)
+			spool.routeProof = nonce
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			owned, err := uploadToSFTP(client, spool, nonce, time.Second, cancel)
+			if err != nil || owned != wslStagePublished {
+				t.Fatalf("upload ownership=%d err=%v", owned, err)
+			}
+			if requests.readsBeforeWrite.Load() == 0 || requests.readsAfterWrite.Load() != 0 {
+				t.Fatalf("root reads=%d content reads=%d", requests.readsBeforeWrite.Load(), requests.readsAfterWrite.Load())
+			}
+			got, err := os.ReadFile(filepath.Join(stageRoot, nonce+".ready"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) || sha256.Sum256(got) != spool.digest() {
+				t.Fatal("published WSL2 stage bytes or digest changed")
+			}
+			if cause := context.Cause(ctx); cause != nil {
+				t.Fatalf("unexpected transfer cancellation: %v", cause)
+			}
+			if _, err := os.Stat(filepath.Join(stageRoot, nonce+".part")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("partial stage survived: %v", err)
+			}
+			if runtime.GOOS != "windows" {
+				rootInfo, err := os.Stat(stageRoot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rootInfo.Mode().Perm() != 0o700 {
+					t.Fatalf("stage root is not private: mode=%o", rootInfo.Mode().Perm())
+				}
+			}
+			if data, err := os.ReadFile(foreignPart); err != nil || string(data) != "unknown" {
+				t.Fatalf("unknown old partial removed or changed: %v", err)
+			}
+		})
 	}
 }
 
@@ -2520,5 +2616,68 @@ func TestWSLStagePublishedCorruptionIsNotReplayedOrDeleted(t *testing.T) {
 	got, err := os.ReadFile(ready)
 	if err != nil || !bytes.Equal(got, corrupted) {
 		t.Fatalf("corrupt replacement deleted/changed: %v", err)
+	}
+}
+
+func TestSSHTransportRejectsLateZeroExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local POSIX output-drain fixture")
+	}
+	for _, staged := range []bool{false, true} {
+		for _, code := range []int{0, 23} {
+			t.Run(fmt.Sprintf("staged=%t/exit=%d", staged, code), func(t *testing.T) {
+				dir := t.TempDir()
+				// The descendant writes only after the SSH leader has been reaped.
+				// Cancellation during output drain therefore cannot kill the leader
+				// and mask the late-success guard with a process failure.
+				script := `#!/bin/sh
+parent=$$
+(
+  attempts=0
+  while kill -0 "$parent" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || exit 99
+    sleep 0.01
+  done
+  printf drained
+) &
+exit ` + fmt.Sprint(code) + "\n"
+				if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+				ctx, cancel := context.WithCancelCause(t.Context())
+				defer cancel(nil)
+				cause := errors.New("caller expired during output drain")
+				var output bytes.Buffer
+				stdout := writerFunc(func(p []byte) (int, error) { cancel(cause); return output.Write(p) })
+				target := SSHTarget{Host: "example.test", Port: "22", FallbackPorts: []string{}, NoControlMaster: true}
+				var err error
+				cleanups := 0
+				cleanupFailure := errors.New("owned cleanup unconfirmed")
+				if staged {
+					spool, _ := newTestWSLStageSpoolWithLimit(t, nil, sshCommandLimit{execution: sshControlExecutionLimit})
+					captureWSLStage(t, strings.Repeat("a", 32), func(*wslStageSpool, *SSHTarget, wslStageTiming, []byte) {})
+					previous := cleanupPublishedWSLStage
+					t.Cleanup(func() { cleanupPublishedWSLStage = previous })
+					cleanupPublishedWSLStage = func(context.Context, SSHTarget, string, *wslStageSpool, time.Duration, time.Duration, string) error {
+						cleanups++
+						return cleanupFailure
+					}
+					err = spool.run(ctx, &target, "10", "3", stdout, io.Discard)
+				} else {
+					err = executePreparedSSH(ctx, &target, "true", nil, 0, sshCommandLimit{execution: sshControlExecutionLimit}, "10", "3", stdout, io.Discard)
+				}
+				if output.String() != "drained" || !errors.Is(context.Cause(ctx), cause) {
+					t.Fatalf("drain boundary not reached: output=%q cause=%v", output.String(), context.Cause(ctx))
+				}
+				if code == 0 && !errors.Is(err, cause) || code != 0 && exitCode(err) != code {
+					t.Fatalf("late exit=%d error=%v", code, err)
+				}
+				if staged && (cleanups != 1 || !errors.Is(err, cleanupFailure)) {
+					t.Fatalf("cleanup calls=%d error=%v", cleanups, err)
+				}
+			})
+		}
 	}
 }

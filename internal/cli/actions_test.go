@@ -1418,26 +1418,13 @@ exit 0
 	t.Setenv("CRABBOX_FAKE_SSH_LOG", logPath)
 	t.Setenv("CRABBOX_FAKE_HYDRATED", hydratedPath)
 	t.Setenv("CRABBOX_FAKE_STAGED_COMMAND", stagedCommandPath)
-	oldStage := stageWSLSpool
-	stageWSLSpool = func(spool *wslStageSpool, _ context.Context, target *SSHTarget, _ wslStageTiming, _, _ string, _ io.Writer) (string, error) {
-		spool.shell = wslStageCMD
-		reader, err := spool.input.reset()
-		if err != nil {
-			return "", err
-		}
-		raw, err := io.ReadAll(reader)
-		if err != nil {
-			return "", err
-		}
+	captureWSLStage(t, strings.Repeat("a", 32), func(_ *wslStageSpool, target *SSHTarget, _ wslStageTiming, raw []byte) {
 		_, _, command, _ := decodeWSLStage(t, raw)
 		if err := os.WriteFile(stagedCommandPath, []byte(command), 0o600); err != nil {
-			return "", err
+			t.Fatal(err)
 		}
-
 		target.NoControlMaster = true
-		return strings.Repeat("a", 32), nil
-	}
-	t.Cleanup(func() { stageWSLSpool = oldStage })
+	})
 	cfg := defaultConfig()
 	cfg.TargetOS = targetWindows
 	cfg.WindowsMode = windowsModeWSL2

@@ -712,7 +712,11 @@ func executePreparedSSH(ctx context.Context, target *SSHTarget, command string, 
 		ctx, cancel = context.WithTimeout(ctx, sshTransportCallBudget(*target, bytes, limit))
 		defer cancel()
 	}
-	return transport.run(ctx, target, connectTimeout, attempts, stdout, stderr)
+	err = transport.run(ctx, target, connectTimeout, attempts, stdout, stderr)
+	if err == nil {
+		err = context.Cause(ctx)
+	}
+	return err
 }
 
 func runSSHQuietWithOptionsResolvePort(ctx context.Context, target *SSHTarget, remote, connectTimeout, connectionAttempts string) error {

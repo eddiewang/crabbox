@@ -149,26 +149,37 @@ func assertWSLLinuxAbsent(t *testing.T, f *wslLinuxFixture) {
 }
 
 func TestWorkspaceOwnerWSL2WatchdogAllowsCompletedFrameExecution(t *testing.T) {
-	command := "printf stdout; printf stderr >&2; cat; sleep 1; exit 23\n"
-	payload := []byte{0, 1, 255, 13, 10}
-	f := startWSLLinuxFixture(t, command, payload, len(command), wslLinuxHelper, 100)
-	guard, _ := f.guard(t)
-	if err := syscall.Kill(guard, syscall.SIGTERM); err != nil {
-		t.Fatal(err)
+	for _, test := range []struct {
+		name  string
+		grace time.Duration
+		code  int
+	}{
+		{"short grace nonzero exit", 100 * time.Millisecond, 23},
+		{"production grace success", wsl2SignalGrace, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := "printf stdout; printf stderr >&2; cat; sleep 1; exit " + strconv.Itoa(test.code) + "\n"
+			payload := []byte{0, 1, 255, 13, 10}
+			f := startWSLLinuxFixture(t, command, payload, len(command), wslLinuxHelper, int(test.grace.Milliseconds()))
+			guard, _ := f.guard(t)
+			if err := syscall.Kill(guard, syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			if _, _, state, err := wslLinuxProcess(guard); err != nil || state == "Z" {
+				t.Fatalf("guard did not survive TERM: %v", err)
+			}
+			// Deliberately keep the sole control writer open through workload exit.
+			f.wait(t, test.code)
+			if !bytes.Contains(f.output.Bytes(), append([]byte("stdout"), payload...)) && !bytes.Contains(f.output.Bytes(), payload) {
+				t.Fatal("finite binary input changed")
+			}
+			if !strings.Contains(f.output.String(), "stderr") {
+				t.Fatal("stderr lost")
+			}
+			assertWSLLinuxAbsent(t, f)
+		})
 	}
-	time.Sleep(50 * time.Millisecond)
-	if _, _, state, err := wslLinuxProcess(guard); err != nil || state == "Z" {
-		t.Fatalf("guard did not survive TERM: %v", err)
-	}
-	// Deliberately keep the sole control writer open through workload exit.
-	f.wait(t, 23)
-	if !bytes.Contains(f.output.Bytes(), append([]byte("stdout"), payload...)) && !bytes.Contains(f.output.Bytes(), payload) {
-		t.Fatal("finite binary input changed")
-	}
-	if !strings.Contains(f.output.String(), "stderr") {
-		t.Fatal("stderr lost")
-	}
-	assertWSLLinuxAbsent(t, f)
 }
 
 func TestWSL2OrdinaryShortFrameWatchdogCleansState(t *testing.T) {

@@ -78,7 +78,7 @@ var wslStageEntropy io.Reader = rand.Reader
 
 func IsWSLSFTPUnavailable(err error) bool { return errors.Is(err, errWSLSFTPUnavailable) }
 
-type wslStageTiming struct{ stage, prepare, cleanup, execute, idle, reserve time.Duration }
+type wslStageTiming struct{ stage, prepare, cleanup, operation, execute, idle, reserve time.Duration }
 
 type wslStageBudgets struct {
 	ports                                        []string
@@ -126,14 +126,20 @@ const sshControlMetadataLimit = 1 << 20
 const sshControlExecutionLimit = 12 * time.Second
 
 func sshTransportTiming(limit sshCommandLimit) wslStageTiming {
-	timing := wslStageTiming{stage: wslStageTimeout, idle: wslStageIdleTimeout}
+	timing := wslStageTiming{stage: wslStageTimeout, idle: wslStageIdleTimeout, operation: limit.execution}
+	if limit.control && limit.execution > 0 {
+		// Fixed owner scripts share one finite native clock for startup, work,
+		// TERM grace, post-KILL absence polling, and completion. Never reset it.
+		timing.operation = addWSLStageDurations(wslStageIdleTimeout, limit.execution, 2*wsl2SignalGrace, wslStageCompletionMargin)
+	}
 	if limit.execution > 0 {
-		timing.execute = sshTransportPreparationTimeout + limit.execution + 2*wsl2LauncherGrace + wsl2FallbackCleanupTimeout
+		timing.execute = addWSLStageDurations(sshTransportPreparationTimeout, timing.operation, 2*wsl2LauncherGrace, wsl2FallbackCleanupTimeout)
 	}
 	if limit.control {
-		timing.stage = sshTransportPreparationTimeout + limit.execution
+		// Upload still uses the raw work allowance, not the native guard.
+		timing.stage = addWSLStageDurations(sshTransportPreparationTimeout, limit.execution)
 		timing.idle = 2 * time.Second
-		timing.reserve = timing.execute + wslStageCleanupTimeout + sshCommandWaitDelay + wslStageCompletionMargin
+		timing.reserve = addWSLStageDurations(timing.execute, wslStageCleanupTimeout, sshCommandWaitDelay, wslStageCompletionMargin)
 	}
 	return timing
 }
@@ -155,7 +161,7 @@ func sshTransportCallBudget(target SSHTarget, size int64, limit sshCommandLimit)
 		return total
 	}
 	timing := sshTransportTiming(limit)
-	completion := timing.execute + wslStageCleanupTimeout + sshCommandWaitDelay + wslStageCompletionMargin
+	completion := addWSLStageDurations(timing.execute, wslStageCleanupTimeout, sshCommandWaitDelay, wslStageCompletionMargin)
 	return addWSLStageDurations(wslStageRouteBudgets(target, timing, size).total, completion)
 }
 
@@ -313,14 +319,15 @@ func newWSLStageSpool(command string, payload []byte, source io.ReadSeeker, payl
 	if _, err := source.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
+	timing := sshTransportTiming(limit)
 	var descriptor [wslStageHeaderSize]byte
 	copy(descriptor[:], "CBXFLAT2")
 	binary.LittleEndian.PutUint32(descriptor[8:], uint32(len(owner)))
 	binary.LittleEndian.PutUint32(descriptor[12:], uint32(len(wslLinuxHelper)))
 	binary.LittleEndian.PutUint64(descriptor[16:], uint64(len(command)))
 	binary.LittleEndian.PutUint64(descriptor[24:], uint64(payloadSize))
-	binary.LittleEndian.PutUint64(descriptor[32:], uint64(limit.execution.Milliseconds()))
-	binary.LittleEndian.PutUint32(descriptor[40:], uint32(sshTransportTiming(limit).idle.Milliseconds()))
+	binary.LittleEndian.PutUint64(descriptor[32:], uint64(timing.operation.Milliseconds()))
+	binary.LittleEndian.PutUint32(descriptor[40:], uint32(timing.idle.Milliseconds()))
 	binary.LittleEndian.PutUint32(descriptor[44:], uint32(wsl2SignalGrace.Milliseconds()))
 	// Keep hidden entropy before all program/user bytes, including in partial
 	// digests. Generate once, before any spool file, and retain it across retries.
@@ -336,7 +343,7 @@ func newWSLStageSpool(command string, payload []byte, source io.ReadSeeker, payl
 	if err != nil {
 		return nil, err
 	}
-	spool := &wslStageSpool{input: input, size: total, timing: sshTransportTiming(limit)}
+	spool := &wslStageSpool{input: input, size: total, timing: timing}
 	spool.expected, err = spool.prefixDigest(total)
 	if err != nil {
 		_ = spool.close()
@@ -390,6 +397,9 @@ func (s *wslStageSpool) run(ctx context.Context, target *SSHTarget, connectTimeo
 	}
 	defer cancel()
 	err = runSSHCommand(sshCommandContext(execCtx, *target, sshArgsNoInputWithOptions(*target, command, connectTimeout, attempts)...), stdout, stderr)
+	if err == nil {
+		err = context.Cause(execCtx)
+	}
 	if err != nil && (shouldRetrySSHPort(err) || errors.Is(context.Cause(execCtx), context.DeadlineExceeded)) {
 		return exit(7, "WSL2 staged command result is ambiguous: %v", err)
 	}
@@ -397,6 +407,9 @@ func (s *wslStageSpool) run(ctx context.Context, target *SSHTarget, connectTimeo
 }
 
 func requireWSLStageExecutionReserve(ctx context.Context, reserve time.Duration) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
 	if reserve <= 0 {
 		return nil
 	}

@@ -1316,21 +1316,12 @@ func TestDirectSSHWebVNCWSL2StagesLargeCommandBeforeZeroInputExecute(t *testing.
 	remote := strings.Repeat("large-webvnc-command\n", 2000)
 	nonce := strings.Repeat("e", 32)
 	var launcher string
-	oldStage := stageWSLSpool
-	stageWSLSpool = func(spool *wslStageSpool, _ context.Context, _ *SSHTarget, _ wslStageTiming, _, _ string, _ io.Writer) (string, error) {
-		reader, err := spool.input.reset()
-		if err != nil {
-			return "", err
+	captureWSLStage(t, nonce, func(spool *wslStageSpool, _ *SSHTarget, _ wslStageTiming, data []byte) {
+		if !bytes.Contains(data, []byte(remote)) {
+			t.Fatalf("staged WebVNC bytes=%d missing command", len(data))
 		}
-		data, err := io.ReadAll(reader)
-		if err != nil || !bytes.Contains(data, []byte(remote)) {
-			t.Fatalf("staged WebVNC bytes=%d err=%v", len(data), err)
-		}
-		spool.shell = wslStageCMD
 		launcher = wslStageLauncherCommand(nonce, spool.size, spool.digest(), wslStageCMD)
-		return nonce, nil
-	}
-	t.Cleanup(func() { stageWSLSpool = oldStage })
+	})
 	target := SSHTarget{User: "crabbox", Host: "windows.test", Port: "22", TargetOS: targetWindows, WindowsMode: windowsModeWSL2}
 	out, err := runDirectSSHWebVNCRemoteCombinedOutput(context.Background(), target, remote)
 	if err != nil {

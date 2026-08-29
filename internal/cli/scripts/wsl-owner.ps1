@@ -102,6 +102,8 @@ try {
         if (!$process.WaitForExit((Remaining ([int]::MaxValue)))) { throw 'WSL2 command timed out' }
     } else { $process.WaitForExit() }
     $code = $process.ExitCode
+    # A late zero exit cannot turn an expired original operation into success.
+    if ($code -eq 0) { $null = Remaining ([int]::MaxValue) }
 } catch {
     $reason = $_.Exception.Message
     if ($reason -notin @('WSL2 command timed out','WSL2 pipe transfer made no progress','WSL2 envelope ended early')) {
@@ -129,6 +131,7 @@ if ($failure) {
         $cleanupWriter.Dispose()
         if (!$cleanup.WaitForExit((Remaining 10000))) { throw 'cleanup timeout' }
         if ($cleanup.ExitCode -ne 0) { throw 'cleanup refused' }
+        $null = Remaining 10000
     } catch {
         $confirmed = !$cleanup -or (Stop-Exact $cleanup)
         if ($confirmed) { [Console]::Error.WriteLine('WSL2 command cleanup failed') }
