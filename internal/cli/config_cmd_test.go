@@ -12,6 +12,52 @@ import (
 	"time"
 )
 
+type configArchitectureTestProvider struct {
+	architectureCapabilityTestProvider
+}
+
+func (configArchitectureTestProvider) Name() string { return "config-architecture-test" }
+func (configArchitectureTestProvider) DescribeImplicitArchitecture(Config) string {
+	return "native"
+}
+
+func TestConfigShowUsesProviderImplicitArchitecture(t *testing.T) {
+	provider := configArchitectureTestProvider{}
+	RegisterProvider(provider)
+	t.Cleanup(func() { delete(providerRegistry, provider.Name()) })
+	for _, tc := range []struct {
+		name, provider, architecture, want string
+		explicit                           bool
+	}{
+		{"implicit", provider.Name(), ArchitectureAMD64, "native", false},
+		{"explicit amd64", provider.Name(), ArchitectureAMD64, ArchitectureAMD64, true},
+		{"explicit arm64", provider.Name(), ArchitectureARM64, ArchitectureARM64, true},
+		{"no descriptor", "unknown-config-provider", ArchitectureAMD64, ArchitectureAMD64, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Provider, cfg.Architecture, cfg.architectureExplicit = tc.provider, tc.architecture, tc.explicit
+			if got := configShowView(cfg)["architecture"]; got != tc.want {
+				t.Fatalf("JSON architecture=%q want %q", got, tc.want)
+			}
+			if got := configShowView(cfg)["architectureExplicit"]; got != tc.explicit {
+				t.Fatalf("JSON architectureExplicit=%v want %t", got, tc.explicit)
+			}
+			var text bytes.Buffer
+			writeConfigShowText(&text, cfg)
+			if !strings.Contains(text.String(), " arch="+tc.want+" ") {
+				t.Fatalf("text architecture missing %q", tc.want)
+			}
+			if !strings.Contains(text.String(), fmt.Sprintf(" architecture_explicit=%t ", tc.explicit)) {
+				t.Fatalf("text explicit-architecture marker changed: %s", text.String())
+			}
+			if got := effectiveArchitectureForConfig(cfg); got != tc.architecture {
+				t.Fatalf("diagnostics changed execution architecture=%q", got)
+			}
+		})
+	}
+}
+
 func TestConfigCommandsReportSelectedPath(t *testing.T) {
 	for _, name := range []string{"default", "absolute", "relative", "missing", "symlink"} {
 		t.Run(name, func(t *testing.T) {

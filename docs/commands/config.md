@@ -55,13 +55,20 @@ the `environment` retain the canonical provider name and report selected=true. P
 `config show --provider <name>` reports `flag` because that command-scoped
 override wins the merge.
 
-`architecture` (text: `arch`) is the configured/effective architecture, not a host
-observation or proof that a provider/runtime supports it. `config show` is offline
-and does not acquire or probe a host. JSON `architectureExplicit` (text:
+`architecture` (text: `arch`) describes the configured architecture or the
+provider's implicit selection, not a host observation or proof of runtime
+support. `config show` is offline and does not acquire or probe a host.
+JSON `architectureExplicit` (text:
 `architecture_explicit`) is true for a nonempty YAML `architecture` or
 `CRABBOX_ARCH`, and false for the omitted default. Execution commands also treat
 an explicit `--arch`, including `--arch amd64`, as an assertion; their flags are
 not part of `config show` output.
+
+For `local-container`, an omitted architecture is reported as `arch=native`
+(JSON: `"architecture":"native"`). This describes the runtime's native selection,
+not a resolved daemon architecture; config inspection does not probe Docker or
+Podman. Explicit `amd64` or `arm64` selections remain unchanged. `native` is a
+diagnostic value, not a new accepted `--arch` or configuration input.
 
 Static SSH now checks these assertions against fresh host evidence, including
 inherited `amd64` values. See [Upgrading existing static-host configuration](../providers/ssh.md#upgrading-existing-static-host-configuration)

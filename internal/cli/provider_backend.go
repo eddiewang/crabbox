@@ -50,6 +50,12 @@ type ProviderArchitectureCapability interface {
 	SupportsArchitecture(cfg Config, architecture string) bool
 }
 
+// ProviderConfigArchitectureDescriber describes an omitted architecture for
+// config diagnostics only. It must not probe the runtime or change execution.
+type ProviderConfigArchitectureDescriber interface {
+	DescribeImplicitArchitecture(cfg Config) string
+}
+
 // ProviderClaimScoper contributes opaque routing identity to local claims.
 // Core persists and compares the value without interpreting provider fields.
 // The adapter must preserve its historical normalization, including whitespace.
@@ -359,6 +365,13 @@ type ReleaseLeaseConnectionCleanupPolicy interface {
 	ReleaseLeaseConnectionCleanupSafe() bool
 }
 
+// ReleaseLeaseWorkspacePolicy keeps run-owned authority available for a guarded
+// close after successful lease release. The captured SSH route must still reach
+// the workspace; retaining disk on a stopped host is not sufficient.
+type ReleaseLeaseWorkspacePolicy interface {
+	PreservesSSHWorkspaceAfterRelease() bool
+}
+
 // ReleaseLeaseTargetRefresher opts a provider into refreshing authorization
 // and connection metadata immediately before automatic lease cleanup.
 type ReleaseLeaseTargetRefresher interface {
@@ -420,6 +433,9 @@ type NativeCheckpointImage struct {
 }
 
 type NativeCheckpointCreateRequest struct {
+	// Persist durably records cleanup identity before a provider mutates remote resources.
+	// Providers requiring interruption recovery must stop if persistence fails.
+	Persist      func(NativeCheckpointCreateResult) error
 	Config       Config
 	Server       Server
 	Target       SSHTarget
@@ -449,6 +465,8 @@ type NativeCheckpointWorkdirRequest struct {
 }
 
 type NativeCheckpointResourceRequest struct {
+	// Persist records recovered identity before deletion; absent on read-only verification.
+	Persist func(NativeCheckpointCreateResult) error
 	// LoadConfig is required only when the provider needs current CLI settings.
 	LoadConfig func() (Config, error)
 	Image      NativeCheckpointImage
@@ -1748,6 +1766,8 @@ func renderServerList(stdout io.Writer, servers []Server) {
 	}
 }
 
+const bestEffortLeaseTouchTimeout = 20 * time.Second
+
 func (a App) touchLeaseTargetBestEffort(ctx context.Context, cfg Config, lease LeaseTarget, state string) Server {
 	backend, err := loadBackend(cfg, runtimeForApp(a))
 	if err != nil {
@@ -1762,7 +1782,9 @@ func (a App) touchLeaseTargetBestEffort(ctx context.Context, cfg Config, lease L
 	if state == "" {
 		state = blank(lease.Server.Labels["state"], "ready")
 	}
-	server, err := sshBackend.Touch(ctx, TouchRequest{Lease: lease, State: state, IdleTimeout: cfg.IdleTimeout})
+	touchCtx, cancel := context.WithTimeout(ctx, bestEffortLeaseTouchTimeout)
+	defer cancel()
+	server, err := sshBackend.Touch(touchCtx, TouchRequest{Lease: lease, State: state, IdleTimeout: cfg.IdleTimeout})
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "warning: touch failed for %s: %v\n", lease.LeaseID, err)
 		return lease.Server

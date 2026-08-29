@@ -30,7 +30,7 @@ import (
 const (
 	webVNCDaemonPortReservationEnv   = "CRABBOX_WEBVNC_PORT_RESERVATION"
 	webVNCDaemonPortReservationFDEnv = "CRABBOX_WEBVNC_PORT_RESERVATION_FD"
-	webVNCDaemonCredentialMaxBytes   = 4 << 10
+	webVNCDaemonCredentialMaxBytes   = credentialInputMaxBytes
 	webVNCDaemonCredentialStdinFlag  = "internal-external-desktop-password-stdin"
 )
 
@@ -1903,18 +1903,17 @@ func writeWebVNCDaemonSupervisorGate(w io.Writer, credential string) error {
 }
 
 func readWebVNCDaemonCredentialStdin(r io.Reader) (string, error) {
-	data, err := io.ReadAll(io.LimitReader(r, webVNCDaemonCredentialMaxBytes+1))
-	if err != nil {
+	value, err := readCredentialInput(r)
+	switch err {
+	case errCredentialInputTooLarge:
+		return "", exit(2, "external desktop credential exceeds %d bytes", webVNCDaemonCredentialMaxBytes)
+	case errCredentialInputEmpty:
+		return "", exit(2, "external desktop credential is empty")
+	case nil:
+		return value, nil
+	default:
 		return "", exit(2, "read external desktop credential: %v", err)
 	}
-	if len(data) > webVNCDaemonCredentialMaxBytes {
-		return "", exit(2, "external desktop credential exceeds %d bytes", webVNCDaemonCredentialMaxBytes)
-	}
-	value := string(data)
-	if strings.TrimSpace(value) == "" {
-		return "", exit(2, "external desktop credential is empty")
-	}
-	return value, nil
 }
 
 func readWebVNCDaemonSupervisorGate(r io.Reader) (string, error) {
@@ -2631,6 +2630,10 @@ type vncForegroundTunnel struct {
 	childEnvDenylist []string
 	mu               sync.Mutex
 	err              error
+	session          *sshTransportSession
+	target           SSHTarget
+	stopOnce         sync.Once
+	stopErr          error
 }
 
 func vncForegroundTunnelContext(ctx context.Context, tunnel *vncForegroundTunnel, proxyDone <-chan error) (context.Context, context.CancelCauseFunc) {
@@ -2681,14 +2684,18 @@ func (t *vncForegroundTunnel) ExitError() error {
 	if err == nil {
 		err = errors.New("VNC SSH tunnel exited")
 	}
-	if text := strings.TrimSpace(t.output.String()); text != "" {
+	if text := strings.TrimSpace(redactSSHTransportDiagnostic(t.target, t.output.String())); text != "" {
 		return fmt.Errorf("%w: %s", err, text)
 	}
 	return err
 }
 
 func startVNCForegroundTunnel(ctx context.Context, target SSHTarget, localPort, remoteHost, remotePort string) (*vncForegroundTunnel, error) {
-	cmd := sshCommandContext(ctx, target, vncTunnelArgs(target, localPort, remoteHost, remotePort)...)
+	args, session, err := vncTunnelInvocation(ctx, target, localPort, remoteHost, remotePort)
+	if err != nil {
+		return nil, err
+	}
+	cmd := sshCommandContext(ctx, target, args...)
 	// ProxyCommand descendants must share the tunnel's owned process tree so
 	// cancellation cannot leave credential-bearing SSH helpers behind.
 	configureDaemonCommand(cmd)
@@ -2696,11 +2703,17 @@ func startVNCForegroundTunnel(ctx context.Context, target SSHTarget, localPort, 
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return nil, errors.Join(err, session.Close())
 	}
-	tunnel := &vncForegroundTunnel{cmd: cmd, done: make(chan struct{}), output: &output, childEnvDenylist: append([]string(nil), target.ChildEnvDenylist...)}
+	tunnel := &vncForegroundTunnel{cmd: cmd, done: make(chan struct{}), output: &output, childEnvDenylist: append([]string(nil), target.ChildEnvDenylist...), session: session, target: target}
 	go func() {
 		err := cmd.Wait()
+		// A reaped leader can leave proxy descendants alive. Retain their config
+		// until the existing platform tree teardown has completed as well.
+		err = errors.Join(err, tunnel.stopTree())
+		if tunnel.stopErr == nil {
+			err = errors.Join(err, tunnel.session.Close())
+		}
 		tunnel.mu.Lock()
 		tunnel.err = err
 		tunnel.mu.Unlock()
@@ -3766,6 +3779,12 @@ func reverseVNCKeyByte(value byte) byte {
 }
 
 func vncTunnelCommandTo(target SSHTarget, localPort, remoteHost, remotePort string) string {
+	if target.AuthSecret {
+		target.User = "<token>"
+		if target.ProxyCommand != "" {
+			target.ProxyCommand = "<provider-proxy>"
+		}
+	}
 	return strings.Join(shellWords(append([]string{"ssh"}, vncTunnelArgs(target, localPort, remoteHost, remotePort)...)), " ")
 }
 
@@ -4837,12 +4856,16 @@ func stopProcess(tunnel *vncForegroundTunnel) {
 	if tunnel == nil || tunnel.cmd == nil || tunnel.cmd.Process == nil {
 		return
 	}
-	pid := tunnel.cmd.Process.Pid
-	if err := terminateWebVNCDaemonProcessTree(pid); err != nil {
-		_ = stopDaemonProcess(tunnel.cmd.Process, pid)
-	}
-	select {
-	case <-tunnel.Done():
-	case <-time.After(2 * time.Second):
-	}
+	_ = tunnel.stopTree()
+	<-tunnel.Done()
+}
+
+func (t *vncForegroundTunnel) stopTree() error {
+	t.stopOnce.Do(func() {
+		t.stopErr = terminateWebVNCDaemonProcessTree(t.PID())
+		if t.stopErr != nil {
+			_ = stopDaemonProcess(t.cmd.Process, t.PID())
+		}
+	})
+	return t.stopErr
 }

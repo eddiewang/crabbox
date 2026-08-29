@@ -85,6 +85,11 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 		if !ok || !capable.SupportsRequestedLeaseID() {
 			return exit(2, "provider=%s does not support fixed idempotent lease IDs", backend.Spec().Name)
 		}
+		unlock, err := lockFixedLeaseAcquisition(ctx, strings.TrimSpace(*requestedLeaseID))
+		if err != nil {
+			return err
+		}
+		defer unlock()
 	}
 	options := leaseOptionsFromConfig(cfg)
 	if delegated, ok := backend.(DelegatedRunBackend); ok {
@@ -120,9 +125,12 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 		return err
 	}
 	server, target, leaseID := lease.Server, lease.SSH, lease.LeaseID
+	// A fixed acquisition may adopt another caller's successful lease. Its known
+	// identity remains replayable after orchestration failure, just like a fork.
+	retainOnFailure := strings.TrimSpace(*requestedLeaseID) != "" || controllerOwnsCleanup.Load()
 	applyResolvedServerConfig(&cfg, server)
 	if err := a.claimLeaseTargetForRepoAndRegister(ctx, leaseID, serverSlug(server), cfg, &server, target, repo.Root, *reclaim); err != nil {
-		a.releaseWarmupLeaseAfterFailure(ctx, sshBackend, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator}, controllerOwnsCleanup.Load())
+		a.releaseWarmupLeaseAfterFailure(ctx, sshBackend, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator}, retainOnFailure)
 		return err
 	}
 	if observe != nil {
@@ -138,7 +146,7 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 		}
 	}
 	if resolved, err := resolveNetworkTarget(ctx, cfg, server, target); err != nil {
-		a.releaseWarmupLeaseAfterFailure(ctx, sshBackend, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator}, controllerOwnsCleanup.Load())
+		a.releaseWarmupLeaseAfterFailure(ctx, sshBackend, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator}, retainOnFailure)
 		return err
 	} else {
 		target = resolved.Target
@@ -181,8 +189,8 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 	return nil
 }
 
-func (a App) releaseWarmupLeaseAfterFailure(ctx context.Context, backend SSHLeaseBackend, cfg Config, lease LeaseTarget, controllerOwnsCleanup bool) {
-	if controllerOwnsCleanup {
+func (a App) releaseWarmupLeaseAfterFailure(ctx context.Context, backend SSHLeaseBackend, cfg Config, lease LeaseTarget, retain bool) {
+	if retain {
 		return
 	}
 	a.releaseBackendLeaseBestEffort(ctx, backend, cfg, lease)
@@ -1107,8 +1115,11 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		cleanup.Err = releaseApp.releaseBackendLeaseBestEffort(context.Background(), sshBackend, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: coord})
 		cleanup.Stopped = cleanup.Err == nil
 		if cleanup.Err == nil {
-			// Destructive cleanup owns the quiesced owner once the lease is gone.
-			lifecycleOwner = nil
+			policy, ok := sshBackend.(ReleaseLeaseWorkspacePolicy)
+			if !ok || !policy.PreservesSSHWorkspaceAfterRelease() {
+				// Destructive cleanup owns the quiesced owner once the lease is gone.
+				lifecycleOwner = nil
+			}
 			recorder.Event("lease.released", "released", "")
 		}
 		if !*timingJSON {
@@ -1779,8 +1790,8 @@ retrySync:
 		}
 		if !overlayDecision.Enabled && !plainManifestFallback && coherence.seedEnabled() {
 			stepStart = time.Now()
-			if _, err := runIdempotentSSHCombinedOutput(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
-				fmt.Fprintf(a.Stderr, "warning: remote git seed failed: %v\n", err)
+			if out, err := runIdempotentSSHCombinedOutputLimit(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay, gitSeedDiagnosticLimit); err != nil {
+				warnRemoteGitSeedFailure(a.Stderr, out, err)
 			}
 			timings.syncSteps.gitSeed += time.Since(stepStart)
 		}
@@ -2417,7 +2428,7 @@ afterSync:
 			Classification:        classification,
 			Phases:                timings.commandPhases,
 			Results:               results,
-		}, stdoutTail, stderrTail, *captureStdout, *captureStderr)
+		})
 		capture := FailureCaptureMetadata{
 			Provider:       cfg.Provider,
 			LeaseID:        leaseID,
