@@ -599,6 +599,41 @@ type sshCommandLimit struct {
 	control   bool
 }
 
+const sshMuxDescriptorFailure = "mux_client_request_session: send fds failed"
+
+type sshMuxFailureDetector struct {
+	log      []byte
+	overflow bool
+}
+
+func (d *sshMuxFailureDetector) Write(data []byte) (int, error) {
+	if len(d.log)+len(data) > 512 {
+		d.overflow = true
+	} else if !d.overflow {
+		d.log = append(d.log, data...)
+	}
+	return len(data), nil
+}
+
+func (d *sshMuxFailureDetector) failed() bool {
+	if d.overflow {
+		return false
+	}
+	lines := strings.Split(strings.TrimSuffix(strings.ReplaceAll(string(d.log), "\r\n", "\n"), "\n"), "\n")
+	// Even a local OpenSSH log can embed server-supplied disconnect text.
+	// Require the complete two-line failure, with no surrounding log records.
+	if len(lines) != 2 || lines[1] != sshMuxDescriptorFailure {
+		return false
+	}
+	for fd := 0; fd < 3; fd++ {
+		prefix := fmt.Sprintf("mm_send_fd: sendmsg(%d): ", fd)
+		if strings.HasPrefix(lines[0], prefix) && len(lines[0]) > len(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func prepareSSHTransport(target SSHTarget, command string, input io.ReadSeeker, size int64, limit sshCommandLimit) (sshTransportPreparation, error) {
 	if size < 0 || limit.execution < 0 || limit.control && (int64(len(command))+size > sshControlMetadataLimit || limit.execution <= 0) {
 		return sshTransportPreparation{}, errors.New("command exceeds finite transport limits")
@@ -623,17 +658,34 @@ func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, co
 	if err := resolveSSHPortNoInput(ctx, target, connectTimeout, connectionAttempts, stderr); err != nil {
 		return err
 	}
-	args := sshArgsNoInputWithOptions(*target, p.command, connectTimeout, connectionAttempts)
-	if p.direct != nil {
-		args = sshArgsWithOptions(*target, p.command, connectTimeout, connectionAttempts)
+	multiplexed := runtime.GOOS != "windows" && !target.AuthSecret && !target.NoControlMaster
+	for attempt := 0; ; attempt++ {
+		probe := *target
+		if attempt == 2 {
+			probe.NoControlMaster = true
+		}
+		muxFailure, err := p.runOnce(ctx, probe, connectTimeout, connectionAttempts, stdout, stderr, multiplexed && attempt < 2)
+		if err == nil || ctx.Err() != nil || exitCode(err) != 255 || !muxFailure || attempt == 2 {
+			return err
+		}
 	}
-	cmd := sshCommandContext(ctx, *target, args...)
+}
+
+func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget, connectTimeout, connectionAttempts string, stdout, stderr io.Writer, captureLocalDiagnostics bool) (muxFailure bool, err error) {
+	args := sshArgsNoInputWithOptions(target, p.command, connectTimeout, connectionAttempts)
+	if p.direct != nil {
+		args = sshArgsWithOptions(target, p.command, connectTimeout, connectionAttempts)
+	}
+	cmd := sshCommandContext(ctx, target, args...)
 	input, err := p.reset()
 	if err != nil {
-		return err
+		return false, err
 	}
 	cmd.Stdin = input
-	return runSSHCommand(cmd, stdout, stderr)
+	if captureLocalDiagnostics {
+		return runSSHCommandWithLocalDiagnostics(cmd, stdout, stderr)
+	}
+	return false, runSSHCommand(cmd, stdout, stderr)
 }
 
 func (p *sshTransportPreparation) reset() (io.Reader, error) {

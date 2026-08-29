@@ -3,11 +3,13 @@ package machine0
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
@@ -591,6 +593,57 @@ func TestAcquirePollsToRunningAndDefaultReleaseDestroys(t *testing.T) {
 	}
 }
 
+func TestAcquirePreservesConfiguredNativeSizeAcrossClassChanges(t *testing.T) {
+	repo := setupState(t)
+	for _, size := range []string{"large", "xl-nvme", "gpu-h100-1", "future-native-size"} {
+		cfg := core.BaseConfig()
+		cfg.Provider = providerName
+		cfg.Machine0.Size = size
+		cfg.Machine0.SizeExplicit = true
+		catalogSize := testSize()
+		catalogSize.Size = size // Synthetic catalog entry; no static class mapping required.
+		catalog, err := json.Marshal([]machineSize{catalogSize})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, class := range core.CanonicalProviderClasses() {
+			t.Run(size+"/"+class, func(t *testing.T) {
+				cfg.Class = class
+				core.MarkClassExplicit(&cfg)
+				if err := (Provider{}).ApplyConfigDefaults(&cfg); err != nil {
+					t.Fatal(err)
+				}
+				// Exercise the real client argv, but stop at the intercepted create command.
+				runner := &recordingRunner{sequence: []runnerResponse{
+					{result: core.LocalCommandResult{Stdout: `[]`}},
+					{result: core.LocalCommandResult{Stdout: string(catalog)}},
+					{result: core.LocalCommandResult{Stdout: `[]`}},
+					{err: errors.New("create intercepted")},
+				}}
+				b, err := (Provider{}).Configure(cfg, Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard})
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = b.(*backend).Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: repo}})
+				if err == nil || !strings.Contains(err.Error(), "create intercepted") {
+					t.Fatalf("Acquire error=%v, want intercepted create", err)
+				}
+				if len(runner.calls) != 4 {
+					t.Fatalf("calls=%#v", runner.calls)
+				}
+				args := runner.calls[3].Args
+				if len(args) < 2 || args[0] != "new" {
+					t.Fatalf("create args=%q", args)
+				}
+				want := []string{"--size", size, "--region", "eu", "--image", "ubuntu-24-04-loaded"}
+				if !reflect.DeepEqual(args[2:], want) {
+					t.Fatalf("create args=%q want selectors=%q", args, want)
+				}
+			})
+		}
+	}
+}
+
 func TestAcquireTerminalStateRollsBackWithDiagnostic(t *testing.T) {
 	repo := setupState(t)
 	api := &fakeAPI{sizes: []machineSize{testSize()}, getSequence: []machine{{ID: "vm-123", Name: "crabbox-blue", Status: "ERRORED", LastErrorMessage: "regional capacity unavailable"}}}
@@ -993,6 +1046,10 @@ func TestResolveRefreshesChangedIPAndPrefersReturnedUsername(t *testing.T) {
 	api.machine.IP = "203.0.113.99"
 	api.machine.DefaultSSHUsername = "nix"
 	api.machine.Distribution = "nixos"
+	b.cfg.Class = "beast"
+	core.MarkClassExplicit(&b.cfg)
+	b.cfg.Machine0.Size, b.cfg.Machine0.SizeExplicit = "gpu-h100-1", true
+	b.cfg.Machine0.Region, b.cfg.Machine0.Image, b.cfg.Machine0.Key = "us-east", "other-image", "other-key"
 	api.listCalls = 0
 	api.getFn = func(_ context.Context, name string) (machine, error) {
 		if name != lease.Server.Name {
@@ -1012,6 +1069,12 @@ func TestResolveRefreshesChangedIPAndPrefersReturnedUsername(t *testing.T) {
 	}
 	if resolved.Server.Labels["work_root"] != "/home/nix/crabbox" {
 		t.Fatalf("resolved work_root=%q", resolved.Server.Labels["work_root"])
+	}
+	if resolved.Server.ServerType.Name != "large" || resolved.Server.Labels["region"] != "eu" || resolved.SSH.Key != lease.SSH.Key {
+		t.Fatalf("creation selectors changed the observed machine: %#v", resolved)
+	}
+	if len(api.created) != 1 || len(api.removed)+len(api.started)+len(api.stopped)+len(api.suspended) != 0 {
+		t.Fatalf("reuse mutated lifecycle: created=%v removed=%v started=%v stopped=%v suspended=%v", api.created, api.removed, api.started, api.stopped, api.suspended)
 	}
 	claim, ok, err := resolveClaim(lease.LeaseID)
 	if err != nil || !ok || claim.Labels["work_root"] != "/home/nix/crabbox" {
@@ -1961,7 +2024,6 @@ func TestCheckpointImageRequiresExactVersionAndRemoteOwnershipMetadata(t *testin
 	}}
 	b := testBackendWithAPI(api)
 	req := core.NativeCheckpointResourceRequest{
-		Config:   b.cfg,
 		Image:    core.NativeCheckpointImage{Provider: providerName, Kind: core.CheckpointKindMachine0, Direct: true, ResourceID: "img-1"},
 		Metadata: map[string]string{metadataImageName: "baseline", metadataImageID: "img-1", metadataImageVersion: "2", metadataSourceMachine: "vm-123", "crabbox_checkpoint": "chk_123", "crabbox_lease": "cbx_123"},
 	}
@@ -1986,8 +2048,7 @@ func TestWholeImageCheckpointDeleteRefusesUnrelatedLaterVersions(t *testing.T) {
 	}}
 	b := testBackendWithAPI(api)
 	req := core.NativeCheckpointResourceRequest{
-		Config: b.cfg,
-		Image:  core.NativeCheckpointImage{Provider: providerName, Kind: core.CheckpointKindMachine0, Direct: true, ResourceID: "img-1"},
+		Image: core.NativeCheckpointImage{Provider: providerName, Kind: core.CheckpointKindMachine0, Direct: true, ResourceID: "img-1"},
 		Metadata: map[string]string{
 			metadataImageName: "baseline", metadataImageID: "img-1", metadataImageVersion: "1", metadataCreatedImage: "true", metadataSourceMachine: "vm-123", "crabbox_checkpoint": "chk_123", "crabbox_lease": "cbx_123",
 		},

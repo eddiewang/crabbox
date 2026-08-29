@@ -125,7 +125,7 @@ func snapshotLeaseClaims() (leaseClaimsSnapshot, error) {
 			}
 			continue
 		}
-		claim, exists, err := readLeaseClaimSnapshotLockedWithPresence(leaseID)
+		claim, exists, err := readLeaseClaimRuntimeSnapshotWithPresence(leaseID)
 		if err != nil {
 			snapshot.invalid[leaseID] = err
 			continue
@@ -140,8 +140,8 @@ func snapshotLeaseClaims() (leaseClaimsSnapshot, error) {
 type leaseClaimSnapshotReader func(path, leaseID string, expected os.FileInfo) (leaseClaim, bool, error)
 
 // snapshotLeaseClaimsReadOnly is the public inventory reader. It intentionally
-// bypasses claim locks so scanning a readable store never creates lock state or
-// requires write access. Runtime paths continue to use snapshotLeaseClaims.
+// bounds file size and rejects files changed during the scan. Runtime paths use
+// snapshotLeaseClaims, which accepts complete atomic publications without that limit.
 func snapshotLeaseClaimsReadOnly() (leaseClaimsSnapshot, error) {
 	snapshot, err := snapshotLeaseClaimsReadOnlyWithReader(readLeaseClaimSnapshotWithPresence)
 	if err != nil {
@@ -349,6 +349,13 @@ func claimLeaseForRepoProviderScopePondDetails(leaseID, slug, provider, provider
 	return claimLeaseForRepoProviderScopePondDetailsMetadata(leaseID, slug, provider, providerScope, pond, staticDetails, repoRoot, idleTimeout, reclaim, claimMetadata{})
 }
 
+func checkLeaseClaimRepositoryOwner(leaseID string, existing leaseClaim, repoRoot string, reclaim bool) error {
+	if existing.LeaseID != "" && existing.RepoRoot != "" && existing.RepoRoot != repoRoot && !reclaim {
+		return exit(2, "lease %s is claimed by repo %s; use --reclaim to claim it for %s", leaseID, existing.RepoRoot, repoRoot)
+	}
+	return nil
+}
+
 func claimLeaseForRepoProviderScopePondDetailsMetadata(leaseID, slug, provider, providerScope, pond string, staticDetails staticClaimDetails, repoRoot string, idleTimeout time.Duration, reclaim bool, metadata claimMetadata) error {
 	if leaseID == "" || (repoRoot == "" && !metadata.allowEmptyRepoRoot) {
 		return nil
@@ -378,8 +385,8 @@ func claimLeaseForRepoProviderScopePondDetailsMetadata(leaseID, slug, provider, 
 				}
 				metadata.server = server
 			}
-			if existing.LeaseID != "" && existing.RepoRoot != "" && existing.RepoRoot != repoRoot && !reclaim {
-				return exit(2, "lease %s is claimed by repo %s; use --reclaim to claim it for %s", leaseID, existing.RepoRoot, repoRoot)
+			if err := checkLeaseClaimRepositoryOwner(leaseID, *existing, repoRoot, reclaim); err != nil {
+				return err
 			}
 			if existing.ClaimedAt == "" || reclaim || existing.RepoRoot != repoRoot {
 				existing.ClaimedAt = now
@@ -1670,6 +1677,8 @@ func readLeaseClaim(leaseID string) (leaseClaim, error) {
 	return claim, err
 }
 
+// Published claim files are immutable snapshots. Reads never take the operation
+// lock; guarded actions must reread and validate their snapshot under that lock.
 func readLeaseClaimWithPresence(leaseID string) (leaseClaim, bool, error) {
 	path, err := leaseClaimPath(leaseID)
 	if err != nil {
@@ -1679,13 +1688,7 @@ func readLeaseClaimWithPresence(leaseID string) (leaseClaim, bool, error) {
 		}
 		return leaseClaim{}, false, err
 	}
-	var claim leaseClaim
-	var exists bool
-	err = withLeaseClaimLock(path, func() error {
-		var readErr error
-		claim, exists, readErr = readLeaseClaimPathWithPresence(path)
-		return readErr
-	})
+	claim, exists, err := readLeaseClaimPathWithPresence(path)
 	if err != nil {
 		return leaseClaim{}, exists, err
 	}
@@ -1695,7 +1698,7 @@ func readLeaseClaimWithPresence(leaseID string) (leaseClaim, bool, error) {
 	return claim, exists, nil
 }
 
-func readLeaseClaimSnapshotLockedWithPresence(leaseID string) (leaseClaim, bool, error) {
+func readLeaseClaimRuntimeSnapshotWithPresence(leaseID string) (leaseClaim, bool, error) {
 	path, err := leaseClaimPath(leaseID)
 	if err != nil {
 		var invalid invalidLeaseClaimIDError
@@ -1704,32 +1707,21 @@ func readLeaseClaimSnapshotLockedWithPresence(leaseID string) (leaseClaim, bool,
 		}
 		return leaseClaim{}, false, err
 	}
-	var claim leaseClaim
-	var exists bool
-	err = withLeaseClaimLock(path, func() error {
-		info, statErr := os.Lstat(path)
-		if errors.Is(statErr, os.ErrNotExist) {
-			return nil
-		}
-		if statErr != nil {
-			exists = true
-			return leaseClaimSnapshotReadError(leaseID, "inspect", statErr)
-		}
-		exists = true
-		if !info.Mode().IsRegular() {
-			return &leaseClaimFileError{
-				code: "non_regular_file",
-				err:  exit(2, "claim file %s is not a regular file", leaseID),
-			}
-		}
-		var readErr error
-		claim, exists, readErr = readLeaseClaimPathWithPresence(path)
-		return readErr
-	})
-	if err != nil {
-		return leaseClaim{}, exists, err
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return leaseClaim{}, false, nil
 	}
-	if err := validateLeaseClaimFileIdentity(leaseID, claim, exists); err != nil {
+	if err != nil {
+		return leaseClaim{}, true, leaseClaimSnapshotReadError(leaseID, "inspect", err)
+	}
+	if !info.Mode().IsRegular() {
+		return leaseClaim{}, true, &leaseClaimFileError{
+			code: "non_regular_file",
+			err:  exit(2, "claim file %s is not a regular file", leaseID),
+		}
+	}
+	claim, exists, err := readLeaseClaimWithPresence(leaseID)
+	if err != nil {
 		return leaseClaim{}, exists, err
 	}
 	if exists && claim.LeaseID == "" {
@@ -1742,7 +1734,7 @@ func readLeaseClaimSnapshotLockedWithPresence(leaseID string) (leaseClaim, bool,
 }
 
 func readLeaseClaimSnapshotWithPresence(path, leaseID string, expected os.FileInfo) (leaseClaim, bool, error) {
-	file, err := os.Open(path)
+	file, err := openArtifactReadOnly(path)
 	if err != nil {
 		return leaseClaim{}, true, leaseClaimSnapshotReadError(leaseID, "open", err)
 	}
@@ -1842,9 +1834,22 @@ func leaseClaimExists(leaseID string) (bool, error) {
 }
 
 func readLeaseClaimPathWithPresence(path string) (leaseClaim, bool, error) {
-	data, err := os.ReadFile(path)
+	// Share deletion on Windows; open nonblocking on Unix so a FIFO cannot hang.
+	file, err := openArtifactReadOnly(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return leaseClaim{}, false, nil
+	}
+	var data []byte
+	if err == nil {
+		defer file.Close()
+		var info os.FileInfo
+		info, err = file.Stat()
+		if err == nil && !info.Mode().IsRegular() {
+			err = errors.New("claim path is not a regular file")
+		}
+		if err == nil {
+			data, err = io.ReadAll(file)
+		}
 	}
 	if err != nil {
 		return leaseClaim{}, true, &leaseClaimFileError{

@@ -42,8 +42,10 @@ type ProviderSSHTargetConfigurer interface {
 	ConfigureSSHTarget(target *SSHTarget, readyCommand string)
 }
 
-// ProviderArchitectureCapability lets a provider admit architecture requests
-// whose runtime feasibility is validated inside the provider adapter.
+// ProviderArchitectureCapability owns admission of the complete target/mode/
+// architecture tuple (including amd64), within ProviderSpec.Targets. Providers
+// without this capability retain core's managed architecture restrictions.
+// Runtime feasibility and explicit assertions are validated by the adapter.
 type ProviderArchitectureCapability interface {
 	SupportsArchitecture(cfg Config, architecture string) bool
 }
@@ -265,6 +267,18 @@ type TailscaleMetadataBackend interface {
 	UpdateTailscaleMetadata(ctx context.Context, lease LeaseTarget, meta TailscaleMetadata) (Server, error)
 }
 
+// RunOptionsValidator optionally checks run flags before a caller acquires a
+// lease, including during dry-run planning. Validation must be side-effect-free:
+// no external I/O or lease-state access, and no dependency on a resolved lease.
+// Providers implement it for admission before Configure; their backend must
+// reuse the same policy at Run entry. No backend creation, processes, credential
+// lookup, or state writes are allowed. Planned reuse has ReuseLease=true and an
+// empty ID; a nonempty ID also implies reuse. Runtime-only fields such as Repo,
+// RunID, and Env may be absent during prewarm admission.
+type RunOptionsValidator interface {
+	ValidateRunOptions(RunRequest) error
+}
+
 type DelegatedRunBackend interface {
 	Backend
 	Warmup(ctx context.Context, req WarmupRequest) error
@@ -387,6 +401,12 @@ type NativeCheckpointProvider interface {
 	NativeCheckpointCapability(req NativeCheckpointRequest) (NativeCheckpointCapability, bool)
 }
 
+// NativeCheckpointSourcePolicyProvider lets API-native capture resolve a source
+// without starting it or minting transport credentials before stop consent.
+type NativeCheckpointSourcePolicyProvider interface {
+	NativeCheckpointSourceStatusOnly(Config) bool
+}
+
 type NativeCheckpointImage struct {
 	ID           string
 	Name         string
@@ -429,9 +449,10 @@ type NativeCheckpointWorkdirRequest struct {
 }
 
 type NativeCheckpointResourceRequest struct {
-	Config   Config
-	Image    NativeCheckpointImage
-	Metadata map[string]string
+	// LoadConfig is required only when the provider needs current CLI settings.
+	LoadConfig func() (Config, error)
+	Image      NativeCheckpointImage
+	Metadata   map[string]string
 }
 
 type NativeCheckpointVerifyResult struct {
@@ -955,11 +976,13 @@ type ListRequest struct {
 type RunRequest struct {
 	Repo                  Repo
 	ID                    string
+	ReuseLease            bool // Planned reuse without an ID; a nonempty ID also implies reuse.
 	RunID                 string
 	Options               LeaseOptions
 	Keep                  bool
 	Reclaim               bool
 	NoSync                bool
+	NoHydrate             bool
 	SyncOnly              bool
 	DebugSync             bool
 	ShellMode             bool
@@ -1640,6 +1663,7 @@ func featureSetHas(features FeatureSet, feature Feature) bool {
 }
 
 func rejectDelegatedSyncOptionsForSpec(spec ProviderSpec, req RunRequest) error {
+	// NoSync is adapter-owned: SDK/CLI transports can skip sync without archive sync.
 	provider := spec.Name
 	archiveSync := featureSetHas(spec.Features, FeatureArchiveSync)
 	moduleRun := featureSetHas(spec.Features, FeatureModuleRun)
