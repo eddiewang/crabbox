@@ -269,7 +269,7 @@ func TestRepoNameFromRootAndRemoteFallsBackToRemoteBasename(t *testing.T) {
 
 func TestParseGitTrackedPaths(t *testing.T) {
 	raw := []byte(
-		"H 100644 aaaa 0\tspace name.txt\x00" +
+		"h 100644 aaaa 0\tspace name.txt\x00" +
 			"S 120000 bbbb 0\ttab\tname\n.txt\x00" +
 			"M 100644 cccc 1\tconflict.txt\x00" +
 			"M 100755 dddd 2\tconflict.txt\x00" +
@@ -282,7 +282,7 @@ func TestParseGitTrackedPaths(t *testing.T) {
 	if len(got) != 5 {
 		t.Fatalf("tracked=%#v", got)
 	}
-	if got[0].name != "space name.txt" || got[0].mode != "100644" || got[0].stage != 0 || got[0].skipWorktree {
+	if got[0].name != "space name.txt" || got[0].mode != "100644" || got[0].stage != 0 || got[0].skipWorktree || !got[0].assumeUnchanged {
 		t.Fatalf("regular=%#v", got[0])
 	}
 	if got[1].name != "tab\tname\n.txt" || got[1].mode != "120000" || got[1].stage != 0 || !got[1].skipWorktree {

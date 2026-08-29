@@ -371,6 +371,20 @@ func TestGitOverlayDecisionRejectsSparseGitlinksConflictsAndTransforms(t *testin
 	}
 }
 
+func TestGitOverlayDecisionRejectsAssumeUnchangedIndex(t *testing.T) {
+	fixture := newGitOverlayFixture(t)
+	runGit(t, fixture.root, "update-index", "--assume-unchanged", "clean.txt")
+	mustWriteTestFile(t, filepath.Join(fixture.root, "clean.txt"), "hidden local edit\n")
+	manifest, _ := fixture.manifest(t)
+	if slices.Contains(manifest.Changed, "clean.txt") {
+		t.Fatalf("assume-unchanged edit unexpectedly entered changed paths: %v", manifest.Changed)
+	}
+	decision := decideGitOverlay(fixture.cfg, fixture.repo, SSHTarget{TargetOS: targetLinux}, manifest, fixture.plan, false, false, false)
+	if decision.Enabled || decision.Reason != "assume_unchanged_index" {
+		t.Fatalf("decision=%#v", decision)
+	}
+}
+
 func TestGitOverlayOriginAcceptsOnlyAnonymousSupportedTransports(t *testing.T) {
 	tests := []struct {
 		origin      string
@@ -409,7 +423,9 @@ func TestGitOverlayOriginAcceptsOnlyAnonymousSupportedTransports(t *testing.T) {
 
 func TestGitOverlayBoundaryViolationsFailClosedWithoutRejectingLegacyFallback(t *testing.T) {
 	for _, reason := range []string{
-		"unsafe_remote_root", "symlink_remote_root", "symlink_git_directory", "symlink_git_config", "symlink_git_objects", "unsafe_overlay_metadata", "unsafe_runtime_state",
+		"unsafe_remote_root", "symlink_remote_root", "symlink_remote_parent", "symlink_git_directory", "symlink_git_config", "symlink_git_objects",
+		"symlink_git_info", "symlink_git_attributes", "symlink_git_exclude", "symlink_git_objects_info", "symlink_git_alternates",
+		"unsafe_git_metadata", "unsafe_overlay_metadata", "unsafe_runtime_state",
 	} {
 		if !gitOverlayBoundaryViolation(reason) {
 			t.Errorf("boundary violation %q remained eligible for legacy sync", reason)
@@ -421,6 +437,191 @@ func TestGitOverlayBoundaryViolationsFailClosedWithoutRejectingLegacyFallback(t 
 		if gitOverlayBoundaryViolation(reason) {
 			t.Errorf("conservative overlay fallback %q incorrectly failed closed", reason)
 		}
+	}
+}
+
+func TestRemotePrepareGitOverlayRejectsHiddenIndexBeforeMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX Git overlay integration")
+	}
+	fixture := newGitOverlayFixture(t)
+	repo, coherence := fixture.repo, fixture.plan
+	for _, test := range []struct {
+		name    string
+		flag    string
+		reason  string
+		present bool
+	}{
+		{name: "skip stale", flag: "--skip-worktree", reason: "skip_worktree_index", present: true},
+		{name: "skip deleted", flag: "--skip-worktree", reason: "skip_worktree_index"},
+		{name: "assume stale", flag: "--assume-unchanged", reason: "assume_unchanged_index", present: true},
+		{name: "assume deleted", flag: "--assume-unchanged", reason: "assume_unchanged_index"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workdir := filepath.Join(t.TempDir(), "workdir")
+			if out, err := exec.Command("git", "clone", "--quiet", repo.RemoteURL, workdir).CombinedOutput(); err != nil {
+				t.Fatalf("clone remote workspace: %v\n%s", err, out)
+			}
+			runGit(t, workdir, "update-index", test.flag, "clean.txt")
+			cleanPath := filepath.Join(workdir, "clean.txt")
+			if test.present {
+				mustWriteTestFile(t, cleanPath, "hidden remote edit\n")
+			} else if err := os.Remove(cleanPath); err != nil {
+				t.Fatal(err)
+			}
+
+			out, err := runOverlayCommand(t, remotePrepareGitOverlay(workdir, coherence), nil)
+			reason, fallback, mutated := gitOverlayFallbackOutcome(string(out), err)
+			if !fallback || mutated || reason != test.reason {
+				t.Fatalf("reason=%q fallback=%t mutated=%t err=%v out=%q", reason, fallback, mutated, err, out)
+			}
+			if test.present {
+				got, readErr := os.ReadFile(cleanPath)
+				if readErr != nil || string(got) != "hidden remote edit\n" {
+					t.Fatalf("hidden file changed before fallback: data=%q err=%v", got, readErr)
+				}
+			} else if _, statErr := os.Stat(cleanPath); !os.IsNotExist(statErr) {
+				t.Fatalf("missing hidden file was recreated before fallback: %v", statErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(workdir, ".git", "crabbox", "sync-manifest")); !os.IsNotExist(statErr) {
+				t.Fatalf("overlay wrote its baseline before hidden-index fallback: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestRemotePrepareGitOverlayRejectsSymlinkedParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlink integration")
+	}
+	fixture := newGitOverlayFixture(t)
+	root, coherence := fixture.root, fixture.plan
+	outside := t.TempDir()
+	mustWriteTestFile(t, filepath.Join(outside, "sentinel.txt"), "keep\n")
+	parent := filepath.Join(root, "lease")
+	if err := os.Symlink(outside, parent); err != nil {
+		t.Fatal(err)
+	}
+	workdir := filepath.Join(parent, "repo")
+
+	out, err := runOverlayCommand(t, remotePrepareGitOverlay(workdir, coherence), nil)
+	reason, fallback := gitOverlayFallbackResult(string(out), err)
+	if !fallback || reason != "symlink_remote_parent" {
+		t.Fatalf("reason=%q fallback=%t err=%v out=%q", reason, fallback, err, out)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(outside, "sentinel.txt")); readErr != nil || string(got) != "keep\n" {
+		t.Fatalf("outside sentinel changed: data=%q err=%v", got, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "repo")); !os.IsNotExist(statErr) {
+		t.Fatalf("overlay created workspace through symlinked parent: %v", statErr)
+	}
+}
+
+func TestRemotePrepareGitOverlayRejectsSymlinkedGitMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlink integration")
+	}
+	fixture := newGitOverlayFixture(t)
+	repo, coherence := fixture.repo, fixture.plan
+	for _, test := range []struct {
+		name   string
+		reason string
+		path   string
+		dir    bool
+	}{
+		{name: "info", reason: "symlink_git_info", path: ".git/info", dir: true},
+		{name: "attributes", reason: "symlink_git_attributes", path: ".git/info/attributes"},
+		{name: "exclude", reason: "symlink_git_exclude", path: ".git/info/exclude"},
+		{name: "objects info", reason: "symlink_git_objects_info", path: ".git/objects/info", dir: true},
+		{name: "alternates", reason: "symlink_git_alternates", path: ".git/objects/info/alternates"},
+		{name: "deep refs", reason: "unsafe_git_metadata", path: ".git/refs/crabbox", dir: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workdir := filepath.Join(t.TempDir(), "workdir")
+			if out, err := exec.Command("git", "clone", "--quiet", repo.RemoteURL, workdir).CombinedOutput(); err != nil {
+				t.Fatalf("clone remote workspace: %v\n%s", err, out)
+			}
+			outside := t.TempDir()
+			sentinel := filepath.Join(outside, "sentinel")
+			mustWriteTestFile(t, sentinel, "keep\n")
+			link := filepath.Join(workdir, filepath.FromSlash(test.path))
+			if err := os.RemoveAll(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			target := sentinel
+			if test.dir {
+				target = outside
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+
+			out, err := runOverlayCommand(t, remotePrepareGitOverlay(workdir, coherence), nil)
+			reason, fallback := gitOverlayFallbackResult(string(out), err)
+			if !fallback || reason != test.reason {
+				t.Fatalf("reason=%q fallback=%t err=%v out=%q", reason, fallback, err, out)
+			}
+			if got, readErr := os.ReadFile(sentinel); readErr != nil || string(got) != "keep\n" {
+				t.Fatalf("outside sentinel changed: data=%q err=%v", got, readErr)
+			}
+		})
+	}
+}
+
+func TestRemotePrepareGitOverlayRejectsHostileLocalGitCommandsBeforeFetch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX Git overlay integration")
+	}
+	fixture := newGitOverlayFixture(t)
+	repo, coherence := fixture.repo, fixture.plan
+	for _, key := range []string{"core.alternateRefsCommand", "core.fsmonitor"} {
+		t.Run(key, func(t *testing.T) {
+			workdir := filepath.Join(t.TempDir(), "workdir")
+			if out, err := exec.Command("git", "clone", "--quiet", repo.RemoteURL, workdir).CombinedOutput(); err != nil {
+				t.Fatalf("clone remote workspace: %v\n%s", err, out)
+			}
+			marker := filepath.Join(t.TempDir(), "hostile-command-ran")
+			command := filepath.Join(t.TempDir(), "hostile.sh")
+			if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf attacked >"+shellQuote(marker)+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, workdir, "config", key, command)
+
+			out, err := runOverlayCommand(t, remotePrepareGitOverlay(workdir, coherence), nil)
+			reason, fallback, mutated := gitOverlayFallbackOutcome(string(out), err)
+			if !fallback || mutated || reason != "unsafe_git_workspace" {
+				t.Fatalf("reason=%q fallback=%t mutated=%t err=%v out=%q", reason, fallback, mutated, err, out)
+			}
+			if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+				t.Fatalf("hostile %s command executed: %v", key, statErr)
+			}
+		})
+	}
+}
+
+func TestRemotePrepareGitOverlayUsesTrustedTemporaryPaths(t *testing.T) {
+	command := remotePrepareGitOverlay("/tmp/crabbox-overlay/workdir", gitCoherencePlan{
+		RemoteURL: "https://example.test/repo.git",
+		Target:    strings.Repeat("a", 40),
+		Tree:      strings.Repeat("b", 40),
+		Branch:    "main",
+	})
+	for _, want := range []string{
+		`baseline_tmp="$(/usr/bin/mktemp "$checkout_root/.git/crabbox/sync-manifest.overlay.XXXXXX")"`,
+		`cache_lookup_path="$cache_path"`,
+		`check-ignore --no-index -v -z --stdin`,
+		`if ! /usr/bin/find -P "$metadata_path" -type l -print -quit > "$git_runtime_root/git-metadata-symlinks"; then return 1; fi`,
+		`[ ! -s "$git_runtime_root/git-metadata-symlinks" ] || return 1`,
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("overlay command missing %q", want)
+		}
+	}
+	if strings.Contains(command, "sync-manifest.overlay.$$") {
+		t.Fatal("overlay baseline manifest remains predictable")
 	}
 }
 
