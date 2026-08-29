@@ -5,6 +5,7 @@
 ### Fixed
 
 - Bound typed ready-pool capacity to canonical provider identities, migrated desired state to fixed-size v2 keys without legacy-reader exposure, and routed returns to fail-closed drain cleanup when provider or lease identity evidence changes.
+- Verified GCP boot images and disk snapshots by immutable resource ID before provisioning, rejected machine images for typed provenance, and deleted created instances whose boot-disk source could not be proven.
 
 ## 0.48.1 - 2026-09-01
 

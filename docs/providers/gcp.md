@@ -404,6 +404,11 @@ never count as successful deletion. Provider labels remain within GCP's
 63-character value limit even when the coordinator checkpoint identifier is
 long; a bounded ownership digest links those labels to the full durable ID.
 
+Machine images remain valid checkpoint fork/restore sources, but Compute Engine
+does not expose exact created-disk source evidence for them. They therefore
+cannot supply typed ready-pool immutable provenance; use a boot image or disk
+snapshot when that identity is required.
+
 Generic `crabbox image delete <image-id> --provider gcp` refuses an image owned
 by a managed checkpoint; use `checkpoint delete <id>` instead. GCP does not yet
 have the AWS-style `image promote` bake pipeline. Direct and historical images
