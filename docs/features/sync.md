@@ -234,16 +234,17 @@ userinfo, warns without printing the URL, and uses the normal file sync instead.
 This prevents credentials stored in local Git remotes from reaching lease
 command arguments or the seeded worktree's Git configuration.
 
-If seeding fails, ordinary runs, local Actions hydration, and native Windows
-sync warn with a fixed phase, advisory failure category, and command exit
-status. Categories distinguish missing Git, authentication/access, DNS,
-connectivity, TLS, repository/ref, and verification failures when recognizable.
-Raw Git/SSH output, URLs, paths, and credential-helper messages are never
-replayed in this warning. Capture is limited to 16 KiB in memory; oversized or
-unrecognized output produces an `unknown` diagnosis instead of guessing.
-Crabbox continues with file sync, but this does not guarantee that later Git
-coherence checks or the workload will succeed. Existing Git metadata may still
-be present; the failed seed has not established that it is current or usable.
+If seeding fails because the origin requires authentication or is unreachable
+due to DNS, connectivity, or TLS transport errors, local Actions hydration
+warns with a fixed phase, advisory failure category, and command exit status,
+then falls back to the full, plain manifest sync. Missing repositories or refs,
+ancestry, tree, or integrity verification failures, and HTTP 5xx or other
+server failures remain fatal and abort before file sync. Raw Git/SSH output,
+URLs, paths, and credential-helper messages are never replayed in warnings.
+Capture is limited to 16 KiB in memory; oversized or unrecognized output
+produces an `unknown` diagnosis instead of guessing. Existing Git metadata may
+still be present; a failed seed has not established that it is current or
+usable.
 
 ### Opt-in Git overlay
 
