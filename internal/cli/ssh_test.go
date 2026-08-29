@@ -4656,6 +4656,25 @@ func TestRemoteGitOriginTransportClassification(t *testing.T) {
 	}
 }
 
+func newGitTransportFailureHTTPServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("HTTP test server does not support connection hijacking")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack HTTP test connection: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
 func TestRemoteGitSeedClassifiesRuntimeOriginFailures(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX Git seed integration")
@@ -4682,9 +4701,8 @@ func TestRemoteGitSeedClassifiesRuntimeOriginFailures(t *testing.T) {
 				defer server.Close()
 				remote = server.URL + "/repo.git"
 			case "HTTP transport":
-				server = httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+				server = newGitTransportFailureHTTPServer(t)
 				remote = server.URL + "/repo.git"
-				server.Close()
 			}
 			workdir := filepath.Join(t.TempDir(), "work")
 			plan := gitCoherencePlan{RemoteURL: remote, Target: strings.Repeat("a", 40), Tree: strings.Repeat("b", 40), Branch: "main"}
@@ -4744,9 +4762,8 @@ func TestRemoteFinalizeRuntimeOriginFallbackRetriesCommittedManifest(t *testing.
 				defer server.Close()
 				plan.RemoteURL = server.URL + "/repo.git"
 			case "HTTP transport":
-				server = httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+				server = newGitTransportFailureHTTPServer(t)
 				plan.RemoteURL = server.URL + "/repo.git"
-				server.Close()
 			case "missing branch":
 				plan.Branch = "absent"
 			case "tree verification":
