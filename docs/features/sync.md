@@ -76,6 +76,9 @@ Git-ignored output, dependency folders, `.git`, and common local caches stay out
 of the transfer. This keeps a first sync close to what CI would see while still
 letting you test uncommitted local edits.
 
+Filesystem Git origins are resolved on the runner during Git seeding and must
+be readable from that runner; otherwise Crabbox falls back to a full manifest sync.
+
 ### Jujutsu workspaces
 
 Crabbox currently supports Jujutsu workspaces only when they are colocated with
@@ -266,8 +269,9 @@ origins, private origins, unsafe Git configuration, and unavailable runner
 prerequisites fall back to the complete ordinary file manifest. Git commands
 never receive forwarded credentials, credential helpers, hooks, global Git
 configuration, external transports, or repository-defined filters.
-Anonymous HTTP authentication failures safely fall back; genuine DNS, TLS,
-firewall, and other eligible-origin transport failures remain fatal.
+Anonymous HTTP authentication failures and eligible-origin DNS, TLS, firewall,
+connection, and fetch failures safely fall back to the complete ordinary file
+manifest.
 
 Only dependency caches ignored by verified `.gitignore` files from the exact
 target tree may survive overlay preparation: `node_modules`, `.pnpm-store`,

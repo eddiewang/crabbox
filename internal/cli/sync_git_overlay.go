@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	gitOverlayFallbackExitCode = 78
-	gitOverlayFallbackMarker   = "CRABBOX_GIT_OVERLAY_FALLBACK:"
-	gitOverlayMutationMarker   = "CRABBOX_GIT_OVERLAY_WORKSPACE_MUTATED"
+	gitOriginRuntimeFallbackExitCode = 78
+	gitOriginRuntimeFallbackMarker   = "CRABBOX_GIT_ORIGIN_FALLBACK:"
+	gitOverlayFallbackExitCode       = 78
+	gitOverlayFallbackMarker         = "CRABBOX_GIT_OVERLAY_FALLBACK:"
+	gitOverlayMutationMarker         = "CRABBOX_GIT_OVERLAY_WORKSPACE_MUTATED"
 )
 
 var gitOverlayTransformAttributes = []string{
@@ -30,11 +32,20 @@ type gitOverlayDecision struct {
 	Reason    string
 }
 
+type gitOriginDisposition uint8
+
+const (
+	gitOriginAbsent gitOriginDisposition = iota
+	gitOriginRemoteAttemptSafe
+	gitOriginNonForwardable
+)
+
 func decideGitOverlay(cfg Config, repo Repo, target SSHTarget, manifest SyncManifest, coherence gitCoherencePlan, credentialBlocked, fullResync, hydratedByActions bool) gitOverlayDecision {
 	decision := gitOverlayDecision{Requested: cfg.Sync.GitOverlay}
 	if !decision.Requested {
 		return decision
 	}
+	originDisposition := classifyGitOrigin(repo.RemoteURL)
 	switch {
 	case target.TargetOS != targetLinux || isWindowsNativeTarget(target) || isWindowsWSL2Target(target):
 		decision.Reason = "unsupported_target"
@@ -50,7 +61,9 @@ func decideGitOverlay(cfg Config, repo Repo, target SSHTarget, manifest SyncMani
 		decision.Reason = "include_whitelist"
 	case credentialBlocked || gitRemoteURLHasCredentials(repo.RemoteURL):
 		decision.Reason = "credential_origin"
-	case !gitOverlayOriginTransportSupported(repo.RemoteURL) || !gitOverlayOriginTransportSupported(coherence.RemoteURL):
+	case originDisposition == gitOriginAbsent:
+		decision.Reason = "missing_origin"
+	case originDisposition != gitOriginRemoteAttemptSafe || !gitOverlayOriginTransportSupported(coherence.RemoteURL):
 		decision.Reason = "unsupported_origin_transport"
 	case !coherence.enabled():
 		decision.Reason = "unseedable_head"
@@ -65,25 +78,38 @@ func decideGitOverlay(cfg Config, repo Repo, target SSHTarget, manifest SyncMani
 }
 
 func gitOverlayOriginTransportSupported(remoteURL string) bool {
+	return classifyGitOrigin(remoteURL) == gitOriginRemoteAttemptSafe
+}
+
+func classifyGitOrigin(remoteURL string) gitOriginDisposition {
 	raw := strings.TrimSpace(remoteURL)
-	if raw == "" || gitRemoteURLHasCredentials(raw) {
-		return false
+	if raw == "" {
+		return gitOriginAbsent
+	}
+	if gitRemoteURLHasCredentials(raw) || strings.ContainsAny(raw, "?#") {
+		return gitOriginNonForwardable
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return false
+	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" {
+		return gitOriginNonForwardable
 	}
 	if parsed.Scheme != "" {
 		switch strings.ToLower(parsed.Scheme) {
 		case "http", "https":
-			return parsed.Host != ""
+			if parsed.Host != "" {
+				return gitOriginRemoteAttemptSafe
+			}
 		case "file":
-			return parsed.Host == "" || strings.EqualFold(parsed.Host, "localhost")
-		default:
-			return false
+			if parsed.Path != "" && (parsed.Host == "" || strings.EqualFold(parsed.Host, "localhost")) {
+				return gitOriginRemoteAttemptSafe
+			}
 		}
+		return gitOriginNonForwardable
 	}
-	return !strings.Contains(raw, ":") && !strings.HasPrefix(raw, "-")
+	if parsed.Host != "" || strings.HasPrefix(raw, "//") || strings.Contains(raw, ":") || strings.HasPrefix(raw, "-") {
+		return gitOriginNonForwardable
+	}
+	return gitOriginRemoteAttemptSafe
 }
 
 func validateGitOverlayManifest(repo Repo, manifest SyncManifest) error {
@@ -345,6 +371,21 @@ func gitOverlayFallbackResult(output string, err error) (string, bool) {
 	return reason, fallback
 }
 
+func gitOriginRuntimeFallbackResult(output string, err error) (string, bool) {
+	if err == nil || exitCode(err) != gitOriginRuntimeFallbackExitCode {
+		return "", false
+	}
+	for _, line := range strings.Split(output, "\n") {
+		switch strings.TrimSpace(line) {
+		case gitOriginRuntimeFallbackMarker + "origin_unavailable":
+			return "origin_unavailable", true
+		case gitOriginRuntimeFallbackMarker + "origin_auth_required":
+			return "origin_auth_required", true
+		}
+	}
+	return "", false
+}
+
 func gitOverlayFallbackOutcome(output string, err error) (string, bool, bool) {
 	if err == nil || exitCode(err) != gitOverlayFallbackExitCode {
 		return "", false, false
@@ -450,7 +491,7 @@ overlay_runtime_state_safe() {
 }
 
 func remoteGitOverlayShellCommand(script string) string {
-	return "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /bin/bash --noprofile --norc -c " + shellQuote(script)
+	return "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C BASH_ENV=/dev/null ENV=/dev/null /bin/bash --noprofile --norc -c " + shellQuote(script)
 }
 
 func remotePrepareGitOverlay(workdir string, plan gitCoherencePlan) string {
@@ -509,7 +550,7 @@ if [ "$transport_status" -ne 0 ]; then
   if /usr/bin/grep -Eiq 'authentication (failed|required)|could not read Username|unable to get password|terminal prompts disabled|access denied|permission denied|HTTP.*(401|403)|requested URL returned error: (401|403)|repository not found' "$git_runtime_root/transport-error"; then
     overlay_fallback origin_auth_required
   fi
-  case "$expected_origin" in http://*|https://*) /bin/cat "$git_runtime_root/transport-error" >&2; exit "$transport_status" ;; *) overlay_fallback origin_unavailable ;; esac
+  overlay_fallback origin_unavailable
 fi
 if ! /usr/bin/grep -Eq 'packet:.*< fetch=.*filter' "$git_runtime_root/packets"; then
   overlay_fallback filtered_history_unsupported
@@ -558,8 +599,7 @@ if [ "$transport_status" -ne 0 ]; then
   if /usr/bin/grep -Eiq 'authentication (failed|required)|could not read Username|unable to get password|terminal prompts disabled|access denied|permission denied|HTTP.*(401|403)|requested URL returned error: (401|403)|repository not found' "$git_runtime_root/transport-error"; then
     overlay_fallback origin_auth_required
   fi
-  /bin/cat "$git_runtime_root/transport-error" >&2
-  exit "$transport_status"
+  overlay_fallback origin_unavailable
 fi
 if /usr/bin/grep -Eiq 'filtering not recognized|filtering not supported|server does not support filter' "$git_runtime_root/transport-error"; then
   overlay_fallback filtered_history_unsupported
