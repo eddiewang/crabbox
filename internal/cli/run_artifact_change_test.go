@@ -206,6 +206,94 @@ func TestRunArtifactChangeWithFailureDownloadsE2E(t *testing.T) {
 	runArtifactChangeE2E(t, true)
 }
 
+func TestRunArtifactChangeTimingSnapshotOnDownloadFailure(t *testing.T) {
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	t.Chdir(dir)
+	remoteRoot := filepath.Join(dir, "remote")
+	workdir := filepath.Join(remoteRoot, "cbx_env_profile_test", filepath.Base(dir))
+	if err := os.MkdirAll(workdir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "proof"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshPath := filepath.Join(dir, "ssh")
+	installWorkspaceOwnerAwareSSH(t, sshPath, `#!/bin/sh
+cmd=""
+for arg do cmd="$arg"; done
+case "$cmd" in
+  *"base64 <"*) sleep 0.02; printf 'post-command download failed\n' >&2; exit 8 ;;
+  mkdir\ -p*|cd\ *|bash\ -lc*|/bin/bash\ -lc*) exec sh -c "$cmd" ;;
+esac
+exit 0
+`)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "config.yaml"))
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", port)
+	t.Setenv("CRABBOX_WORK_ROOT", remoteRoot)
+	runEnvProfileTestReleaseHook = func() error { return nil }
+	t.Cleanup(func() { runEnvProfileTestReleaseHook = nil })
+
+	var stdout, stderr bytes.Buffer
+	err = (App{Stdout: &stdout, Stderr: &stderr}).runCommand(context.Background(), []string{
+		"--provider", "run-env-profile-test",
+		"--no-sync",
+		"--stop-after", "always",
+		"--timing-json",
+		"--require-artifact-change", "proof",
+		"--download", "proof=" + filepath.Join(dir, "proof.out"),
+		"--", "sh", "-c", "printf new > proof",
+	})
+	if exitCodeForError(err, 0) != 7 {
+		t.Fatalf("err=%v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	}
+	var report timingReport
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if strings.HasPrefix(line, `{"provider"`) {
+			if err := json.Unmarshal([]byte(line), &report); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(report.ArtifactChanges) != 1 || report.ArtifactChanges[0].Path != "proof" || report.ArtifactChanges[0].Status != "changed" {
+		t.Fatalf("artifact changes=%+v stderr=%s", report.ArtifactChanges, stderr.String())
+	}
+	var phaseTotal int64
+	artifactPhaseMs := int64(0)
+	for _, phase := range report.RunnerPhases {
+		phaseTotal += phase.Ms
+		if phase.Name == "artifacts" {
+			artifactPhaseMs += phase.Ms
+		}
+	}
+	if artifactPhaseMs <= 0 {
+		t.Fatalf("artifacts phase=%d phases=%+v", artifactPhaseMs, report.RunnerPhases)
+	}
+	if phaseTotal != report.RunnerTotalMs {
+		t.Fatalf("phase total=%d runner total=%d phases=%+v", phaseTotal, report.RunnerTotalMs, report.RunnerPhases)
+	}
+}
+
 func runArtifactChangeE2E(t *testing.T, failureDownloads bool) {
 	t.Helper()
 	for _, tc := range []struct {
