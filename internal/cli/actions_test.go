@@ -1583,6 +1583,7 @@ case "$remote" in
 esac
 printf '%s\n---\n' "$decoded" >> "$CRABBOX_FAKE_SSH_LOG"
 case "$decoded" in
+  *"nohup sh -c"*) : > "$CRABBOX_FAKE_HYDRATED"; printf '123\n'; exit 0 ;;
   *"origin_git clone"*)
     case "$CRABBOX_FAKE_ORIGIN_FALLBACK" in
       seed)
@@ -1706,8 +1707,7 @@ exit 0
 				runGit(t, root, "update-ref", "refs/remotes/origin/main", gitOutput(root, "rev-parse", "HEAD"))
 			}
 			cfg := defaultConfig()
-			cfg.TargetOS = targetWindows
-			cfg.WindowsMode = windowsModeWSL2
+			cfg.TargetOS = targetLinux
 			cfg.WorkRoot = workRoot
 			if tt.deriveMode {
 				cfg.Actions.Workflow = ".github/workflows/hydrate.yml"
