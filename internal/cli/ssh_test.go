@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4656,23 +4657,52 @@ func TestRemoteGitOriginTransportClassification(t *testing.T) {
 	}
 }
 
-func newGitTransportFailureHTTPServer(t *testing.T) *httptest.Server {
+func newGitTransportFailureHTTPServer(t *testing.T) string {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hijacker, ok := w.(http.Hijacker)
-		if !ok {
-			t.Error("HTTP test server does not support connection hijacking")
-			return
+
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		acceptErr error
+		wait      sync.WaitGroup
+	)
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		for {
+			conn, err := listener.AcceptTCP()
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					acceptErr = err
+				}
+				return
+			}
+			if err := conn.SetLinger(0); err != nil {
+				acceptErr = fmt.Errorf("set transport failure linger: %w", err)
+				_ = conn.Close()
+				_ = listener.Close()
+				return
+			}
+			if err := conn.Close(); err != nil {
+				acceptErr = fmt.Errorf("reset transport failure connection: %w", err)
+				_ = listener.Close()
+				return
+			}
 		}
-		conn, _, err := hijacker.Hijack()
-		if err != nil {
-			t.Errorf("hijack HTTP test connection: %v", err)
-			return
+	}()
+	t.Cleanup(func() {
+		closeErr := listener.Close()
+		wait.Wait()
+		if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Errorf("close transport failure listener: %v", closeErr)
 		}
-		_ = conn.Close()
-	}))
-	t.Cleanup(server.Close)
-	return server
+		if acceptErr != nil {
+			t.Errorf("serve transport failure listener: %v", acceptErr)
+		}
+	})
+	return "http://" + listener.Addr().String()
 }
 
 func TestRemoteGitSeedClassifiesRuntimeOriginFailures(t *testing.T) {
@@ -4701,8 +4731,7 @@ func TestRemoteGitSeedClassifiesRuntimeOriginFailures(t *testing.T) {
 				defer server.Close()
 				remote = server.URL + "/repo.git"
 			case "HTTP transport":
-				server = newGitTransportFailureHTTPServer(t)
-				remote = server.URL + "/repo.git"
+				remote = newGitTransportFailureHTTPServer(t) + "/repo.git"
 			}
 			workdir := filepath.Join(t.TempDir(), "work")
 			plan := gitCoherencePlan{RemoteURL: remote, Target: strings.Repeat("a", 40), Tree: strings.Repeat("b", 40), Branch: "main"}
@@ -4762,8 +4791,7 @@ func TestRemoteFinalizeRuntimeOriginFallbackRetriesCommittedManifest(t *testing.
 				defer server.Close()
 				plan.RemoteURL = server.URL + "/repo.git"
 			case "HTTP transport":
-				server = newGitTransportFailureHTTPServer(t)
-				plan.RemoteURL = server.URL + "/repo.git"
+				plan.RemoteURL = newGitTransportFailureHTTPServer(t) + "/repo.git"
 			case "missing branch":
 				plan.Branch = "absent"
 			case "tree verification":
