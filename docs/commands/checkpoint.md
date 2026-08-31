@@ -144,6 +144,14 @@ Retention defaults to manual. Explicit expiry rejects direct, archive, recipe,
 and unsupported checkpoints before any resource mutation; an older coordinator
 returns an upgrade diagnostic instead of silently creating an unmanaged image.
 
+For brokered native checkpoints, `--wait` also follows a coordinator-retained
+capture while its provider result is being recovered. It observes the same
+checkpoint ID and never submits another capture. The wait timeout bounds both
+status requests and polling; cancellation or timeout leaves the owned checkpoint
+available for `crabbox checkpoint inspect <checkpoint-id> --verify`. With
+`--wait=false`, a pending creation response still reports an error and retains
+the checkpoint for inspection.
+
 **Strategy details**
 
 - `disk-snapshot` — EBS / Azure managed-OS-disk / GCP persistent-disk / direct

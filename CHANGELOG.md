@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Kept brokered native checkpoint creation waiting through exact coordinator-owned recovery, without repeating capture, while bounding status requests and preserving cancellation and terminal failures.
 - Fixed Parallels clone destinations to pass the configured parent directory to `prlctl --dst`, letting Parallels name and create the VM bundle beneath it.
 
 ## 0.48.0 - 2026-08-30
