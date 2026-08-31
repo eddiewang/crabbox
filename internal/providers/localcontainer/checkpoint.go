@@ -68,6 +68,7 @@ var checkpointLeaseLabelKeys = []string{
 	checkpointMetadataHost,
 	"docker_socket",
 	"expires_at",
+	"fixed_intent_sha256",
 	"host_work_root",
 	"idle_timeout",
 	"idle_timeout_secs",

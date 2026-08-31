@@ -3322,6 +3322,11 @@ func TestAcquirePendingClaimCannotAuthorizeReplacementContainer(t *testing.T) {
 
 func pendingAcquireBackend(t *testing.T) (*backend, *recordingRunner, *strings.Builder, *string, *string, *bool) {
 	t.Helper()
+	return pendingAcquireBackendWithImageFixedIntent(t, "")
+}
+
+func pendingAcquireBackendWithImageFixedIntent(t *testing.T, imageFixedIntent string) (*backend, *recordingRunner, *strings.Builder, *string, *string, *bool) {
+	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
@@ -3329,7 +3334,8 @@ func pendingAcquireBackend(t *testing.T) (*backend, *recordingRunner, *strings.B
 	var bootstrapDir string
 	var containerName string
 	var slug string
-	var fixedFingerprint string
+	// Docker inherits image labels unless the new container overrides them.
+	fixedFingerprint := imageFixedIntent
 	var containerImage string
 	var containerRuntimeImage string
 	var containerPond string
@@ -3497,7 +3503,7 @@ esac
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	b, runner, _, leaseID, _, _ := pendingAcquireBackend(t)
+	b, runner, _, leaseID, _, _ := pendingAcquireBackendWithImageFixedIntent(t, "source-fixed-intent")
 	originalRun := runner.run
 	var dockerRunArgs []string
 	runner.run = func(req core.LocalCommandRequest) (core.LocalCommandResult, error) {
@@ -3604,7 +3610,7 @@ esac
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	b, runner, _, _, _, _ := pendingAcquireBackend(t)
+	b, runner, _, _, _, _ := pendingAcquireBackendWithImageFixedIntent(t, "source-fixed-intent")
 	originalRun := runner.run
 	var dockerRunArgs []string
 	creates := 0
