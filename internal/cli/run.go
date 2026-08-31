@@ -164,7 +164,7 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 	}
 	fmt.Fprintf(a.Stdout, "leased %s slug=%s provider=%s server=%s type=%s ip=%s%s idle_timeout=%s expires=%s\n", leaseID, blank(serverSlug(server), "-"), cfg.Provider, server.DisplayID(), server.ServerType.Name, server.PublicNet.IPv4.IP, tailscaleSummary, cfg.IdleTimeout, blank(leaseLabelTimeDisplay(server.Labels["expires_at"]), server.Labels["expires_at"]))
 	fmt.Fprintf(a.Stdout, "ready ssh=%s@%s:%s network=%s workroot=%s\n", redactedSSHUser(cfg, server, target), target.Host, target.Port, network, cfg.WorkRoot)
-	a.startRegisteredWebVNCDaemonBestEffort(cfg, target, leaseID, *keep)
+	a.startRegisteredWebVNCDaemonBestEffort(ctx, cfg, target, leaseID, *keep)
 	if *actionsRunner {
 		ghRepo, err := resolveGitHubRepo(repo, cfg.Actions.Repo)
 		if err != nil {
@@ -1255,7 +1255,7 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		}
 		releaseUnreportedLease = false
 	}
-	a.startRegisteredWebVNCDaemonBestEffort(cfg, target, leaseID, acquired && *keep)
+	a.startRegisteredWebVNCDaemonBestEffort(ctx, cfg, target, leaseID, acquired && *keep)
 	if !useCoordinator && leaseID != "" {
 		if touched, touchErr := sshBackend.Touch(ctx, TouchRequest{Lease: LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, State: blank(server.Labels["state"], "ready"), IdleTimeout: cfg.IdleTimeout}); touchErr == nil {
 			server = touched
@@ -3578,7 +3578,7 @@ func releaseCoordinatorLeaseMutation(
 	return lastLease, lastErr
 }
 
-var coordinatorReleaseObservationTimeout = 5 * time.Minute
+var coordinatorReleaseCompletionTimeout = 5 * time.Minute
 
 var coordinatorReleaseObservationCadence = func(int) time.Duration {
 	return 2 * time.Second
@@ -3590,7 +3590,7 @@ func observeCoordinatorReleaseCompletion(
 	lease CoordinatorLease,
 	leaseID, expectedProvider string,
 ) (CoordinatorLease, error) {
-	timeout := coordinatorReleaseObservationTimeout
+	timeout := coordinatorReleaseCompletionTimeout
 	observeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for observation := 1; ; observation++ {
@@ -3715,7 +3715,7 @@ func (a App) releaseBackendLeaseBestEffort(ctx context.Context, backend SSHLease
 		return err
 	}
 	if !connectionCleanupSafe {
-		a.cleanupBackendLeaseLocalConnectionsBestEffort(lease.LeaseID)
+		a.cleanupBackendLeaseLocalConnectionsBestEffort(ctx, lease.LeaseID)
 	}
 	return nil
 }
@@ -3725,7 +3725,7 @@ func releaseLeaseConnectionCleanupSafe(backend SSHLeaseBackend) bool {
 	return !ok || policy.ReleaseLeaseConnectionCleanupSafe()
 }
 
-func (a App) cleanupBackendLeaseLocalConnectionsBestEffort(leaseIDs ...string) {
+func (a App) cleanupBackendLeaseLocalConnectionsBestEffort(ctx context.Context, leaseIDs ...string) {
 	seen := map[string]bool{}
 	for _, leaseID := range leaseIDs {
 		leaseID = strings.TrimSpace(leaseID)
@@ -3733,7 +3733,7 @@ func (a App) cleanupBackendLeaseLocalConnectionsBestEffort(leaseIDs ...string) {
 			continue
 		}
 		seen[leaseID] = true
-		if _, err := a.stopEgressHostDaemon(leaseID); err != nil {
+		if _, err := a.stopEgressHostDaemon(ctx, leaseID); err != nil {
 			fmt.Fprintf(a.Stderr, "warning: egress host daemon cleanup failed for %s: %v\n", leaseID, err)
 		}
 	}
@@ -3742,7 +3742,7 @@ func (a App) cleanupBackendLeaseLocalConnectionsBestEffort(leaseIDs ...string) {
 func (a App) cleanupBackendLeaseConnectionsBestEffort(ctx context.Context, lease LeaseTarget) {
 	// Keep mediated outbound connections alive while the guest winds down.
 	a.cleanupBackendLeaseRemoteConnectionsBestEffort(ctx, lease)
-	a.cleanupBackendLeaseLocalConnectionsBestEffort(lease.LeaseID)
+	a.cleanupBackendLeaseLocalConnectionsBestEffort(ctx, lease.LeaseID)
 }
 
 const remoteConnectionCleanupTimeout = 35 * time.Second
@@ -4203,6 +4203,13 @@ func (a App) stop(ctx context.Context, args []string) error {
 	if !ok {
 		return exit(2, "provider=%s does not support stop", backend.Spec().Name)
 	}
+	if backendCoordinator(backend) != nil {
+		// Inspection, claim acquisition, release and observation share one budget;
+		// starting a fresh observation window would outlive the stop operation.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, coordinatorReleaseCompletionTimeout)
+		defer cancel()
+	}
 	lease, err := sshBackend.Resolve(ctx, ResolveRequest{
 		Options:                  leaseOptionsFromConfig(cfg),
 		ID:                       *id,
@@ -4240,7 +4247,7 @@ func (a App) stop(ctx context.Context, args []string) error {
 	connectionCleanupSafe := releaseLeaseConnectionCleanupSafe(sshBackend)
 	if connectionCleanupSafe {
 		a.cleanupBackendLeaseRemoteConnectionsBestEffort(ctx, lease)
-		a.cleanupBackendLeaseLocalConnectionsBestEffort(*id, lease.LeaseID)
+		a.cleanupBackendLeaseLocalConnectionsBestEffort(ctx, *id, lease.LeaseID)
 	}
 	request := ReleaseLeaseRequest{
 		Lease:                    lease,
@@ -4254,11 +4261,11 @@ func (a App) stop(ctx context.Context, args []string) error {
 		return err
 	}
 	if !connectionCleanupSafe {
-		a.cleanupBackendLeaseLocalConnectionsBestEffort(*id, lease.LeaseID)
+		a.cleanupBackendLeaseLocalConnectionsBestEffort(ctx, *id, lease.LeaseID)
 	}
 	if isMacOSDesktopProvider(coordinatorCleanupCfg) && supportsDirectSSHWebVNC(cfg.Provider) {
 		for _, daemonID := range uniqueNonBlankStrings(*id, lease.LeaseID, serverSlug(lease.Server)) {
-			if _, stopErr := a.stopWebVNCDaemonIfRunning(daemonID); stopErr != nil {
+			if _, stopErr := a.stopWebVNCDaemonIfRunning(ctx, daemonID); stopErr != nil {
 				fmt.Fprintf(a.Stderr, "warning: could not stop macOS WebVNC daemon for %s: %v\n", daemonID, stopErr)
 			}
 		}

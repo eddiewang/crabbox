@@ -947,7 +947,7 @@ func (b *coordinatorLeaseBackend) ReleaseLease(ctx context.Context, req ReleaseL
 	if err != nil {
 		return err
 	}
-	return finalizeLeaseClaimIfUnchangedAfter(req.Lease.LeaseID, claim, exists, func() (bool, error) {
+	return finalizeLeaseClaimIfUnchangedAfterContext(ctx, req.Lease.LeaseID, claim, exists, func() (bool, error) {
 		authority := claim
 		if !exists {
 			authority.LeaseID = req.Lease.LeaseID

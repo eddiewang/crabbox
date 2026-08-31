@@ -827,14 +827,14 @@ func configureCoordinatorReleaseTestTiming(t *testing.T, timeout, cadence time.D
 	// short synthetic observation deadlines independent of process startup time.
 	t.Setenv("CRABBOX_OWNER", "test@example.com")
 	originalBackoff := coordinatorReleaseBackoff
-	originalTimeout := coordinatorReleaseObservationTimeout
+	originalTimeout := coordinatorReleaseCompletionTimeout
 	originalCadence := coordinatorReleaseObservationCadence
 	coordinatorReleaseBackoff = func(int) time.Duration { return 0 }
-	coordinatorReleaseObservationTimeout = timeout
+	coordinatorReleaseCompletionTimeout = timeout
 	coordinatorReleaseObservationCadence = func(int) time.Duration { return cadence }
 	t.Cleanup(func() {
 		coordinatorReleaseBackoff = originalBackoff
-		coordinatorReleaseObservationTimeout = originalTimeout
+		coordinatorReleaseCompletionTimeout = originalTimeout
 		coordinatorReleaseObservationCadence = originalCadence
 	})
 }
