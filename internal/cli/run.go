@@ -3590,23 +3590,22 @@ func observeCoordinatorReleaseCompletion(
 	lease CoordinatorLease,
 	leaseID, expectedProvider string,
 ) (CoordinatorLease, error) {
-	if retainedCoordinatorRelease(lease) || coordinatorProviderReleaseConfirmed(lease) {
-		return lease, nil
-	}
-	if coordinatorReleaseCleanupFailed(lease) {
-		return lease, coordinatorReleaseObservationError(leaseID, "reported a cleanup failure or scheduled retry")
-	}
-	if lease.State != "released" || lease.CleanupStartedAt == "" {
-		return lease, coordinatorReleaseObservationError(leaseID, "returned an unexpected non-final state")
-	}
-
 	timeout := coordinatorReleaseObservationTimeout
-	if timeout <= 0 {
-		return lease, coordinatorReleaseObservationError(leaseID, "is still pending")
-	}
 	observeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for observation := 1; ; observation++ {
+		if retainedCoordinatorRelease(lease) || coordinatorProviderReleaseConfirmed(lease) {
+			return lease, nil
+		}
+		if coordinatorReleaseCleanupFailed(lease) {
+			return lease, coordinatorReleaseObservationError(leaseID, "reported a cleanup failure or scheduled retry")
+		}
+		if !coordinatorReleaseCleanupPending(lease) {
+			return lease, coordinatorReleaseObservationError(leaseID, "returned an unexpected non-final state")
+		}
+		if timeout <= 0 {
+			return lease, coordinatorReleaseObservationError(leaseID, "is still pending")
+		}
 		if err := sleepContext(observeCtx, coordinatorReleaseObservationCadence(observation)); err != nil {
 			if cause := context.Cause(ctx); cause != nil {
 				return lease, errors.Join(cause, coordinatorReleaseObservationError(leaseID, "observation was canceled"))
@@ -3630,24 +3629,26 @@ func observeCoordinatorReleaseCompletion(
 			return lease, err
 		}
 		lease = observed
-		if retainedCoordinatorRelease(lease) || coordinatorProviderReleaseConfirmed(lease) {
-			return lease, nil
-		}
-		if coordinatorReleaseCleanupFailed(lease) {
-			return lease, coordinatorReleaseObservationError(leaseID, "reported a cleanup failure or scheduled retry")
-		}
-		if lease.State != "released" || lease.CleanupStartedAt == "" {
-			return lease, coordinatorReleaseObservationError(leaseID, "returned an unexpected non-final state")
-		}
 	}
 }
 
 func retainedCoordinatorRelease(lease CoordinatorLease) bool {
-	return lease.ReleaseDeletesServer != nil && !*lease.ReleaseDeletesServer
+	return lease.ReleaseDeletesServer != nil && !*lease.ReleaseDeletesServer &&
+		(lease.CleanupStatus == "" || lease.CleanupStatus == "retained" && lease.State == "released")
 }
 
 func coordinatorReleaseCleanupFailed(lease CoordinatorLease) bool {
+	if lease.CleanupStatus != "" {
+		return lease.CleanupStatus != "pending" && lease.CleanupStatus != "complete" && lease.CleanupStatus != "retained"
+	}
+	// Older brokers do not distinguish pending creation from cleanup failure.
 	return lease.CleanupError != "" || lease.CleanupRetryAt != ""
+}
+
+func coordinatorReleaseCleanupPending(lease CoordinatorLease) bool {
+	return lease.State == "released" &&
+		(lease.ReleaseDeletesServer == nil || *lease.ReleaseDeletesServer) &&
+		(lease.CleanupStatus == "pending" || lease.CleanupStatus == "" && lease.CleanupStartedAt != "")
 }
 
 func coordinatorReleaseObservationError(leaseID, state string) error {
@@ -3656,6 +3657,7 @@ func coordinatorReleaseObservationError(leaseID, state string) error {
 
 func coordinatorProviderReleaseConfirmed(lease CoordinatorLease) bool {
 	return lease.State == "released" &&
+		(lease.CleanupStatus == "" || lease.CleanupStatus == "complete") &&
 		lease.CleanupStartedAt == "" &&
 		lease.CleanupError == "" &&
 		lease.CleanupRetryAt == "" &&
