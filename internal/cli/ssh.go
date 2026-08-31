@@ -2510,6 +2510,7 @@ elif ! repair_origin; then
 	echo "remote sync finalize failed: Git origin repair failed" >&2; cleanup_finalize_lock; exit 67
 elif transport_error="$meta_dir/sync-fetch-error.$expected_token.$$"; ! origin_git fetch --quiet --no-tags "$expected_origin" "+refs/heads/$advertised_branch:$tmp_ref" 2>"$transport_error"; then
 	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true
+	echo "remote sync finalize failed: Git coherence fetch failed" >&2
 	cat "$transport_error" >&2
 	cleanup_finalize_lock
 	exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `

@@ -4704,6 +4704,18 @@ func TestRemoteGitOriginAttemptCommandsDeferPolicyToGo(t *testing.T) {
 					t.Fatalf("%s missing %q:\n%s", name, want, command)
 				}
 			}
+			catIndex := strings.Index(command, `cat "$transport_error" >&2`)
+			exitIndex := strings.Index(command[catIndex:], "exit 78")
+			if exitIndex < 0 {
+				t.Fatalf("%s does not emit transport diagnostics before exit 78:\n%s", name, command)
+			}
+			if name == "finalize" {
+				diagnostic := "remote sync finalize failed: Git coherence fetch failed"
+				diagnosticIndex := strings.Index(command, diagnostic)
+				if diagnosticIndex < 0 || diagnosticIndex > catIndex {
+					t.Fatalf("finalize does not emit %q before raw transport diagnostics:\n%s", diagnostic, command)
+				}
+			}
 			for _, forbidden := range []string{"origin_transport_fallback", "CRABBOX_GIT_ORIGIN_FALLBACK", "Authentication failed", "repository not found"} {
 				if strings.Contains(command, forbidden) {
 					t.Fatalf("%s retained origin policy %q:\n%s", name, forbidden, command)
@@ -4907,6 +4919,15 @@ exec /bin/bash --noprofile --norc -c "$remote"
 			if !wantFallback {
 				if err == nil {
 					t.Fatalf("non-origin failure succeeded: output=%q", out)
+				}
+				if kind == "missing branch" {
+					diagnostic := "remote sync finalize failed: Git coherence fetch failed"
+					raw := "fatal: couldn't find remote ref refs/heads/absent"
+					diagnosticIndex := strings.Index(out, diagnostic)
+					rawIndex := strings.Index(out, raw)
+					if diagnosticIndex < 0 || rawIndex < 0 || diagnosticIndex > rawIndex {
+						t.Fatalf("missing branch diagnostics out of order: %q", out)
+					}
 				}
 				if kind == "non-auth HTTP" && !strings.Contains(out, "500") {
 					t.Fatalf("fatal HTTP diagnostics were not retained: %q", out)
