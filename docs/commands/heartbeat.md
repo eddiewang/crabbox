@@ -50,6 +50,8 @@ current direct-provider timeout when it is available in lease metadata and
 omits the coordinator heartbeat override. Direct static and local-runtime
 providers persist the refreshed timestamps, expiry, and any explicit timeout
 replacement in the exact claim so a fresh CLI process observes the same state.
+Heartbeat preserves existing provider metadata, including ownership fingerprints
+and empty attestation fields; it changes only lifecycle values.
 
 ## Output
 

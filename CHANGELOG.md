@@ -8,6 +8,7 @@
 - Added exact-source abandonment for unresolved ordinary Machine0 checkpoints: dispose of the positively identified source through its existing claim owner while retaining the unknown image obligation and rejecting later fork, prune, or local deletion.
 - Released ordinary Machine0 checkpoint reservations when the provider proves image submission was never attempted, keeping failed captures from blocking source cleanup while retaining interrupted or uncertain submissions.
 - Made explicit coordinator Stop share one five-minute cancellation budget across inspection, claim waits, release, and observation, and made local daemon lock waits honor cancellation without losing confirmed cleanup results.
+- Preserved provider ownership fingerprints, exact metadata, and empty attestation fields during heartbeat updates so fixed AWS and other provider leases remain replayable after use.
 - Fixed Parallels clone destinations to pass the configured parent directory to `prlctl --dst`, letting Parallels name and create the VM bundle beneath it.
 - Published exact AWS allocation identity and prepared account scope before readiness and kept explicit Stop observing pending creation cleanup, while preserving allocation claims through storage failures and local ownership until deletion is confirmed.
 - Kept brokered native checkpoint creation waiting through exact coordinator-owned recovery, without repeating capture, while bounding status requests and preserving cancellation and terminal failures.

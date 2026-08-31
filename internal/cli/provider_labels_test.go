@@ -102,6 +102,24 @@ func TestTouchDirectLeaseLabelsMovesExpiryForwardToTTLCap(t *testing.T) {
 	}
 }
 
+func TestTouchDirectLeaseLabelsPreservesProviderMetadata(t *testing.T) {
+	labels := map[string]string{
+		"fixed_intent_sha256": strings.Repeat("a", 64),
+		"optional_identity":   "",
+		"provider_endpoint":   "https://api.example.test/org:team/",
+		"provider_document":   `{"scope":"exact"}`,
+	}
+	got := touchDirectLeaseLabels(labels, Config{TTL: time.Hour, IdleTimeout: time.Minute}, "worker busy", time.Now())
+	for key, value := range labels {
+		if got[key] != value {
+			t.Errorf("touch changed admitted provider metadata %s: got %q want %q", key, got[key], value)
+		}
+	}
+	if got["state"] != "worker_busy" || labels["state"] != "" {
+		t.Fatalf("state update should sanitize only the new value without mutating input: got=%q input=%q", got["state"], labels["state"])
+	}
+}
+
 func TestTouchDirectLeaseLabelsExplicitIdleTimeoutOverridesStoredValue(t *testing.T) {
 	created := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	touched := created.Add(time.Minute)
@@ -183,8 +201,8 @@ func TestTouchDirectLeaseLabelsFallsBackForMalformedStoredValues(t *testing.T) {
 	if got["idle_timeout_secs"] != "120" || got["ttl_secs"] != "600" || got["expires_at"] != "1777636920" {
 		t.Fatalf("durations did not fall back to cfg: %#v", got)
 	}
-	if got["slug"] != "blue_lobster" {
-		t.Fatalf("slug was not sanitized: %#v", got)
+	if got["slug"] != "blue lobster" {
+		t.Fatalf("touch changed existing slug metadata: %#v", got)
 	}
 }
 
