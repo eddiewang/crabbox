@@ -54,6 +54,7 @@
 
 ### Safer cleanup and reproducible images
 
+- Preserved replacement and backend-retained claims after delegated stops in `pond release` by leaving claim finalization to the provider.
 - Pinned the shipped Local Container and Apple Container Ubuntu defaults to reviewed multi-platform image digests, verified Apple Container images before bootstrap, and preserved explicit custom-image overrides. Thanks @coygeek.
 - Pinned Tart's built-in macOS image and verified the cloned disk, NVRAM, and configuration before boot, recorded the verified image identity, waited for the guest agent before SSH setup, and disabled automatic host clipboard and audio passthrough. Thanks @coygeek.
 - Required exact resource and provider-scope claims for Modal, Tensorlake, ASCII Box, and SmolVM reuse and cleanup, checking the applicable account, API-key scope, organization, or endpoint and refusing concurrent ownership changes; ASCII Box setup rollback also preserves uncertain resources and keys. Thanks @coygeek.
