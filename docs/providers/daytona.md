@@ -43,6 +43,7 @@ crabbox checkpoint create --provider daytona --id swift-crab \
   --mode native --name after-install --no-reboot=false
 crabbox checkpoint inspect chk_<id> --verify
 crabbox checkpoint fork chk_<id> --slug snapshot-fork
+crabbox checkpoint fork chk_<id> --lease-id cbx_012345abcdef --json
 crabbox run --provider daytona --id snapshot-fork -- pnpm test
 crabbox checkpoint delete chk_<id>
 ```
@@ -54,6 +55,18 @@ interruption with `--no-reboot=false`. The snapshot barrier applies even with
 `--wait=false`, bounded by `--wait-timeout`. Memory and running processes are
 not captured. Forks start independent sandboxes and relocate the saved workspace
 into the new lease's workdir.
+
+Direct Daytona leases also accept `warmup --lease-id` and native checkpoint
+`fork --lease-id`. A fixed ID binds one checkpoint, immutable snapshot ID,
+create request, and API/organization/credential context. Repeating the same
+request adopts the same sandbox; a lost create response never submits another
+allocation. Keep the local claim for reconciliation: a changed context, missing
+resource, conflicting request, or released ID fails instead of creating a
+replacement. Stop retains a terminal receipt so the ID cannot be reused.
+Provider credentials and short-lived SSH tokens are not stored in that receipt.
+If acquisition stops before any create attempt was durably authorized, `stop`
+can finalize that unused ID without provider credentials. Submitted or ambiguous
+attempts still require exact provider reconciliation.
 
 The local `daytona-snapshot` record binds the exact snapshot ID, organization,
 API endpoint, and source sandbox. Provider names include the checkpoint ID to

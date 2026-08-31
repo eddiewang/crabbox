@@ -40,6 +40,15 @@ type daytonaLifecycleFixture struct {
 
 func newDaytonaLifecycleFixture(t *testing.T) (*daytonaLifecycleFixture, *daytonaLeaseBackend, Repo) {
 	t.Helper()
+	f, backend, repo := newDaytonaFixture(t)
+	if out, err := exec.Command("git", "init", "-q", repo.Root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	return f, backend, repo
+}
+
+func newDaytonaFixture(t *testing.T) (*daytonaLifecycleFixture, *daytonaLeaseBackend, Repo) {
+	t.Helper()
 	testutil.IsolateUserDirs(t)
 	f := &daytonaLifecycleFixture{createState: api.SANDBOXSTATE_STARTED}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +70,13 @@ func newDaytonaLifecycleFixture(t *testing.T) (*daytonaLifecycleFixture, *dayton
 			f.sandbox = &api.Sandbox{}
 			f.sandbox.SetId("sandbox-test")
 			f.sandbox.SetName(f.create.GetName())
+			f.sandbox.SetOrganizationId("org-test")
+			f.sandbox.SetSnapshot(f.create.GetSnapshot())
+			if f.create.GetSnapshot() == "snapshot-exact-id" {
+				f.sandbox.SetSnapshot("test-snapshot")
+			}
+			f.sandbox.SetUser(f.create.GetUser())
+			f.sandbox.SetTarget(f.create.GetTarget())
 			f.sandbox.SetLabels(f.create.GetLabels())
 			f.sandbox.SetState(f.createState)
 			f.sandbox.SetToolboxProxyUrl(f.server.URL + "/toolbox")
@@ -89,6 +105,9 @@ func newDaytonaLifecycleFixture(t *testing.T) (*daytonaLifecycleFixture, *dayton
 				return
 			}
 			f.sandbox.SetState(api.SANDBOXSTATE_DESTROYED)
+			_ = json.NewEncoder(w).Encode(f.sandbox)
+		case r.Method == "POST" && r.URL.Path == "/sandbox/sandbox-test/start":
+			f.sandbox.SetState(api.SANDBOXSTATE_STARTED)
 			_ = json.NewEncoder(w).Encode(f.sandbox)
 		case strings.HasSuffix(r.URL.Path, "/labels"):
 			var body api.SandboxLabels
@@ -161,9 +180,6 @@ func newDaytonaLifecycleFixture(t *testing.T) (*daytonaLifecycleFixture, *dayton
 	cfg.Daytona.Snapshot = "test-snapshot"
 	cfg.Daytona.WorkRoot = t.TempDir()
 	repo := Repo{Root: t.TempDir(), Name: "fixture"}
-	if out, err := exec.Command("git", "init", "-q", repo.Root).CombinedOutput(); err != nil {
-		t.Fatalf("git init: %v %s", err, out)
-	}
 	backend := &daytonaLeaseBackend{cfg: cfg, rt: Runtime{HTTP: f.server.Client(), Stdout: io.Discard, Stderr: io.Discard}}
 	return f, backend, repo
 }
@@ -298,7 +314,7 @@ func TestDaytonaHeartbeatUpdatesProviderAndLabels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata := map[string]string{"fixed_intent_sha256": strings.Repeat("a", 64), "optional_identity": ""}
+	metadata := map[string]string{"provider_fingerprint": strings.Repeat("a", 64), "optional_identity": ""}
 	for key, value := range metadata {
 		sandbox.GetLabels()[key] = value
 	}

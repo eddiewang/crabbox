@@ -1125,13 +1125,14 @@ type RunRequest struct {
 }
 
 type WarmupRequest struct {
-	Repo          Repo
-	Options       LeaseOptions
-	Keep          bool
-	Reclaim       bool
-	ActionsRunner bool
-	RequestedSlug string
-	TimingJSON    bool
+	RequestedLeaseID string
+	Repo             Repo
+	Options          LeaseOptions
+	Keep             bool
+	Reclaim          bool
+	ActionsRunner    bool
+	RequestedSlug    string
+	TimingJSON       bool
 	// BeforeComplete runs synchronous, best-effort core bookkeeping once after
 	// successful acquisition/retention and before final output. Providers opting
 	// in must include it in total timing; it cannot fail or roll back the lease.

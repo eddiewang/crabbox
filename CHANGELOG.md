@@ -2,6 +2,10 @@
 
 ## 0.48.1 (Unreleased)
 
+### Added
+
+- Added fixed-ID Daytona warmup and native checkpoint forks that replay one exact sandbox, preserve uncertain creation attempts, and retain terminal identities after cleanup.
+
 ### Fixed
 
 - Preserved coordinator control-heartbeat failures when HTTP fallback also fails or has no remaining budget, without extending heartbeat deadlines or changing successful fallback.

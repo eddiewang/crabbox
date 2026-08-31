@@ -95,7 +95,8 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 	options := leaseOptionsFromConfig(cfg)
 	if delegated, ok := backend.(DelegatedRunBackend); ok {
 		return delegated.Warmup(ctx, WarmupRequest{
-			Repo: repo, Options: options, Keep: *keep, Reclaim: *reclaim,
+			RequestedLeaseID: strings.TrimSpace(*requestedLeaseID),
+			Repo:             repo, Options: options, Keep: *keep, Reclaim: *reclaim,
 			ActionsRunner: *actionsRunner, RequestedSlug: requestedSlug, TimingJSON: *timingJSON,
 			BeforeComplete: func() { a.syncExternalRunnersBestEffort(ctx, cfg, backend) },
 		})
