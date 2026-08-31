@@ -1721,9 +1721,9 @@ func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.C
 		return "", "", core.Exit(2, "compiled container image is missing its reviewed digest")
 	}
 	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, time.Now().UTC())
-	if fixedFingerprint != "" {
-		labels["fixed_intent_sha256"] = fixedFingerprint
-	}
+	// Checkpoint images may carry an older allocation's fixed-ID authority.
+	// Always override it, including for ordinary allocations with no intent.
+	labels["fixed_intent_sha256"] = fixedFingerprint
 	if core.IsArchitectureExplicit(cfg) {
 		labels["architecture"] = cfg.Architecture
 	}
