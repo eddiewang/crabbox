@@ -58,11 +58,12 @@ import {
   abortCheckpointProvisioningForLease,
   acquireCheckpointUse,
   backfillFailedCheckpointCreateRecovery,
-  bindCheckpointUseProvisioning,
+  bindCheckpointUseProvisioningInTransaction,
   cancelFailedCheckpointCreate,
   checkpointDuePrefix,
   checkpointEventKey,
   checkpointKey,
+  checkpointLeaseSourceIdentity,
   checkpointLimits,
   checkpointUseKey,
   checkpointVisibleTo,
@@ -1267,6 +1268,16 @@ export class FleetCoordinator {
       }
       if (method === "POST" && parts.join("/") === "v1/leases/from-checkpoint") {
         return await this.createCheckpointLease(request);
+      }
+      if (
+        method === "PUT" &&
+        parts[0] === "v1" &&
+        parts[1] === "leases" &&
+        parts[2] &&
+        parts[3] === "from-checkpoint" &&
+        parts.length === 4
+      ) {
+        return await this.createCheckpointLease(request, parts[2]);
       }
       if (
         method === "POST" &&
@@ -3507,8 +3518,12 @@ export class FleetCoordinator {
     workspaceID?: string,
     workspaceCapability?: ProviderWorkspaceCapability,
     fixedLeaseID?: string,
-    checkpointAuthorization?: CoordinatorCheckpointRecord,
-    checkpointUseClaimHash?: string,
+    checkpointAuthorization?: {
+      checkpoint: CoordinatorCheckpointRecord;
+      principal: CheckpointPrincipal;
+      token: string;
+      tokenHash: string;
+    },
   ): Promise<Response> {
     const owner = requestOwner(request);
     const org = requestOrg(request, this.env);
@@ -3545,8 +3560,8 @@ export class FleetCoordinator {
         input.createAttemptID,
         owner,
         org,
-        checkpointAuthorization?.id,
-        checkpointUseClaimHash,
+        checkpointAuthorization?.checkpoint.id,
+        checkpointAuthorization?.tokenHash,
       );
       if (replay) {
         return replay;
@@ -3628,21 +3643,32 @@ export class FleetCoordinator {
       if (!config.providerKey) {
         config = { ...config, providerKey: providerKeyForLease(fixedLeaseID) };
       }
-      fixedCreateIntentHash = await fixedLeaseCreateIntentHash(config, requestedSlug);
+      fixedCreateIntentHash = await fixedLeaseCreateIntentHash(
+        config,
+        requestedSlug,
+        checkpointAuthorization?.checkpoint,
+      );
       const replay = await this.state.runExclusive(async () => {
-        if (createAttemptBlocksLeaseID(await this.getCreateAttempt(fixedLeaseID))) {
-          return createAttemptIDConflictResponse();
-        }
         return this.fixedLeaseReplayResponse(
-          await this.getLease(fixedLeaseID),
+          fixedLeaseID,
           owner,
           org,
           fixedCreateIntentHash!,
+          checkpointAuthorization?.checkpoint.id,
         );
       });
       if (replay) {
         return replay;
       }
+    }
+    if (fixedLeaseID && checkpointAuthorization) {
+      await validateCheckpointUse(
+        this.state.storage,
+        checkpointAuthorization.checkpoint.id,
+        checkpointAuthorization.token,
+        checkpointAuthorization.principal,
+      );
+      await this.validateCheckpointLeaseSource(checkpointAuthorization.checkpoint);
     }
     if (deferredSlugError) {
       return json({ error: "invalid_slug", message: deferredSlugError.message }, { status: 400 });
@@ -3658,7 +3684,8 @@ export class FleetCoordinator {
           !checkpointAuthorization ||
           !(
             field === "awsAMI" ||
-            (field === "gcpProject" && input.gcpProject === checkpointAuthorization.scope.project)
+            (field === "gcpProject" &&
+              input.gcpProject === checkpointAuthorization.checkpoint.scope.project)
           ),
       );
       if (restrictedFields.length > 0) {
@@ -3696,7 +3723,7 @@ export class FleetCoordinator {
       !isAdminRequest(request) &&
       requestedHostID &&
       !reusesOwnedReleasedMacHost &&
-      requestedHostID !== checkpointAuthorization?.hostID
+      requestedHostID !== checkpointAuthorization?.checkpoint.hostID
     ) {
       return json(
         {
@@ -3788,8 +3815,8 @@ export class FleetCoordinator {
         input.createAttemptID,
         owner,
         org,
-        checkpointAuthorization?.id,
-        checkpointUseClaimHash,
+        checkpointAuthorization?.checkpoint.id,
+        checkpointAuthorization?.tokenHash,
       );
       if (reserved instanceof Response) {
         return reserved;
@@ -3899,7 +3926,9 @@ export class FleetCoordinator {
           : undefined;
         let reactivated: LeaseRecord = {
           ...current,
-          ...(checkpointAuthorization ? { checkpointID: checkpointAuthorization.id } : {}),
+          ...(checkpointAuthorization
+            ? { checkpointID: checkpointAuthorization.checkpoint.id }
+            : {}),
           createAttemptGeneration,
           ...(boundAttempt
             ? {
@@ -4064,11 +4093,21 @@ export class FleetCoordinator {
     }
     const reservation = await this.state.runExclusive(async () => {
       const reservedAttempt = await this.getCreateAttempt(leaseID);
-      const currentAttempt = createAttempt
+      let currentAttempt = createAttempt
         ? await this.pendingCreateAttempt(leaseID, createAttempt.token, owner, org)
         : undefined;
       if (createAttempt && !currentAttempt) {
         return createCanceledResponse();
+      }
+      if (fixedLeaseID) {
+        const replay = await this.fixedLeaseReplayResponse(
+          leaseID,
+          owner,
+          org,
+          fixedCreateIntentHash!,
+          checkpointAuthorization?.checkpoint.id,
+        );
+        if (replay) return replay;
       }
       if (
         !createAttempt &&
@@ -4085,9 +4124,6 @@ export class FleetCoordinator {
         return workspaceManagedLeaseResponse();
       }
       const existingLease = await this.getLease(leaseID);
-      if (existingLease && fixedLeaseID) {
-        return this.fixedLeaseReplayResponse(existingLease, owner, org, fixedCreateIntentHash!)!;
-      }
       if (
         existingLease &&
         currentAttempt &&
@@ -4102,6 +4138,20 @@ export class FleetCoordinator {
         );
       }
       const now = new Date();
+      if (fixedLeaseID && checkpointAuthorization) {
+        currentAttempt = createAttempt = {
+          version: 1,
+          requestedLeaseID: leaseID,
+          token: `cat_${crypto.randomUUID().replaceAll("-", "")}`,
+          owner,
+          org,
+          state: "pending",
+          checkpointID: checkpointAuthorization.checkpoint.id,
+          checkpointUseClaimHash: checkpointAuthorization.tokenHash,
+          createdAt: now.toISOString(),
+          updatedAt: now.toISOString(),
+        };
+      }
       const createAttemptGeneration = currentAttempt ? newCreateAttemptGeneration() : undefined;
       const admission = await this.leaseAdmissionState({ owner, org }, now);
       const slug = allocateLeaseSlug(
@@ -4118,7 +4168,7 @@ export class FleetCoordinator {
       let record: LeaseRecord = {
         id: leaseID,
         slug,
-        ...(checkpointAuthorization ? { checkpointID: checkpointAuthorization.id } : {}),
+        ...(checkpointAuthorization ? { checkpointID: checkpointAuthorization.checkpoint.id } : {}),
         ...(currentAttempt
           ? {
               createAttemptID: currentAttempt.token,
@@ -4201,15 +4251,45 @@ export class FleetCoordinator {
       if (limitError) {
         return json({ error: "cost_limit_exceeded", message: limitError }, { status: 429 });
       }
-      if (currentAttempt) {
-        await this.putCreateAttempt({
-          ...currentAttempt,
-          canonicalLeaseID: leaseID,
-          generation: createAttemptGeneration!,
-          updatedAt: now.toISOString(),
-        });
-      }
-      await this.putLease(record);
+      const persist = async (storage: CoordinatorStorageView) => {
+        if (
+          fixedLeaseID &&
+          checkpointAuthorization &&
+          ((await storage.get(leaseKey(leaseID))) ||
+            createAttemptBlocksLeaseID(
+              await storage.get<CreateAttemptRecord>(createAttemptKey(leaseID)),
+            ) ||
+            (await storage.get(workspaceLeaseReservationKey(leaseID))))
+        ) {
+          throw new CheckpointError(
+            "lease_id_conflict",
+            "lease identity changed during checkpoint admission",
+          );
+        }
+        if (currentAttempt) {
+          await storage.put(createAttemptKey(leaseID), {
+            ...currentAttempt,
+            canonicalLeaseID: leaseID,
+            generation: createAttemptGeneration!,
+            updatedAt: now.toISOString(),
+          } satisfies CreateAttemptRecord);
+        }
+        if (fixedLeaseID && checkpointAuthorization) {
+          await bindCheckpointUseProvisioningInTransaction(
+            storage,
+            checkpointAuthorization.checkpoint.id,
+            checkpointAuthorization.tokenHash,
+            checkpointAuthorization.principal,
+            currentAttempt!.token,
+            leaseID,
+            checkpointLeaseSourceIdentity(checkpointAuthorization.checkpoint),
+          );
+        }
+        await storage.put(leaseKey(leaseID), record);
+      };
+      // The fixed intent and its image fence must survive or roll back together.
+      if (fixedLeaseID && checkpointAuthorization) await this.state.storage.transaction(persist);
+      else await persist(this.state.storage);
       await this.scheduleAlarm();
       return { record, slug };
     });
@@ -4592,23 +4672,35 @@ export class FleetCoordinator {
     return json({ lease: publicLeaseRecord(record) }, { status: 201 });
   }
 
-  private fixedLeaseReplayResponse(
-    existing: LeaseRecord | undefined,
+  private async fixedLeaseReplayResponse(
+    leaseID: string,
     owner: string,
     org: string,
     intentHash: string,
-  ): Response | undefined {
+    checkpointID?: string,
+  ): Promise<Response | undefined> {
+    const existing = await this.getLease(leaseID);
+    const attempt = await this.getCreateAttempt(leaseID);
+    if (createAttemptBlocksLeaseID(attempt) && (!checkpointID || !existing))
+      return createAttemptIDConflictResponse();
     if (!existing) return undefined;
     const sameOwner = existing.owner === owner && existing.org === org;
     const sameIntent =
       existing.fixedCreateIntentVersion === fixedLeaseCreateIntentVersion &&
-      existing.fixedCreateIntentHash === intentHash;
-    if (!sameOwner || !sameIntent || !leaseIsLive(existing)) {
+      existing.fixedCreateIntentHash === intentHash &&
+      existing.checkpointID === checkpointID;
+    const sameAttempt =
+      !checkpointID ||
+      (attempt &&
+        attempt.checkpointID === checkpointID &&
+        createAttemptMatchesLease(attempt, existing));
+    if (!sameOwner || !sameIntent || !sameAttempt || !leaseIsLive(existing)) {
       return json(
         { error: "lease_id_conflict", message: "lease id is bound to another create intent" },
         { status: 409 },
       );
     }
+    if (checkpointID && attempt?.state === "canceled") return createCanceledResponse();
     return json(
       { lease: publicLeaseRecord(existing) },
       { status: existing.state === "active" ? 200 : 202 },
@@ -14598,9 +14690,16 @@ export class FleetCoordinator {
     }
   }
 
-  private async createCheckpointLease(request: Request): Promise<Response> {
+  private async createCheckpointLease(request: Request, fixedLeaseID?: string): Promise<Response> {
     try {
       const input = await readJson<LeaseRequest>(request);
+      if (
+        fixedLeaseID &&
+        (!validLeaseID(fixedLeaseID) ||
+          (input.leaseID !== undefined && input.leaseID !== fixedLeaseID))
+      ) {
+        return json({ error: "invalid_lease_id" }, { status: 400 });
+      }
       const checkpointID = input.checkpointID;
       const token = input.checkpointUseClaim;
       if (!validCheckpointID(checkpointID) || typeof token !== "string" || !token) {
@@ -14620,7 +14719,11 @@ export class FleetCoordinator {
       if (!authorizedCheckpoint || !checkpointVisibleTo(authorizedCheckpoint, principal)) {
         return notFound();
       }
-      if (validCreateAttemptID(input.createAttemptID) && validLeaseID(input.leaseID)) {
+      if (
+        !fixedLeaseID &&
+        validCreateAttemptID(input.createAttemptID) &&
+        validLeaseID(input.leaseID)
+      ) {
         const existingAttemptReplay = await this.replayCreateAttempt(
           input.leaseID,
           input.createAttemptID,
@@ -14632,15 +14735,17 @@ export class FleetCoordinator {
         if (existingAttemptReplay && !existingAttemptReplay.ok) return existingAttemptReplay;
       }
       await expireCheckpointClaims(this.state.storage, checkpointID);
-      let checkpoint: CoordinatorCheckpointRecord;
+      let checkpoint: CoordinatorCheckpointRecord = authorizedCheckpoint;
       let completedReplay: Response | undefined;
       try {
-        checkpoint = await validateCheckpointUse(
-          this.state.storage,
-          checkpointID,
-          token,
-          principal,
-        );
+        // An unpublished capture cannot be a replay; retain the canonical claim refusal.
+        if (!fixedLeaseID || !authorizedCheckpoint.image)
+          checkpoint = await validateCheckpointUse(
+            this.state.storage,
+            checkpointID,
+            token,
+            principal,
+          );
       } catch (error) {
         if (
           !(error instanceof CheckpointError) ||
@@ -14730,7 +14835,10 @@ export class FleetCoordinator {
           { status: 409 },
         );
       }
-      if (!validCreateAttemptID(input.createAttemptID) || !validLeaseID(input.leaseID)) {
+      if (
+        !fixedLeaseID &&
+        (!validCreateAttemptID(input.createAttemptID) || !validLeaseID(input.leaseID))
+      ) {
         return json(
           {
             error: "checkpoint_claim_invalid",
@@ -14740,21 +14848,9 @@ export class FleetCoordinator {
         );
       }
       if (completedReplay) return completedReplay;
-      const requestedLeaseID = input.leaseID;
-      const createAttemptID = input.createAttemptID;
-      const checkpointProvider = this.provider(
-        checkpoint.provider,
-        checkpoint.scope.region,
-        checkpoint.scope.project,
-      );
-      await checkpointProvider.validateCheckpointLeaseScope?.(checkpoint);
-      if (!checkpointProvider.validateCheckpointImage) {
-        throw new CheckpointError(
-          "checkpoint_source_mismatch",
-          "checkpoint provider cannot verify its exact owned source resource",
-        );
-      }
-      await checkpointProvider.validateCheckpointImage(checkpoint);
+      const requestedLeaseID = fixedLeaseID ?? input.leaseID!;
+      const createAttemptID = input.createAttemptID!;
+      if (!fixedLeaseID) await this.validateCheckpointLeaseSource(checkpoint);
       const {
         checkpointID: _checkpointID,
         checkpointUseClaim: _checkpointUseClaim,
@@ -14770,62 +14866,70 @@ export class FleetCoordinator {
         leaseInput.gcpZone = checkpoint.scope.region;
         leaseInput.gcpProject = checkpoint.scope.project!;
       }
-      const reserved = await this.reserveCreateAttempt(
-        requestedLeaseID,
-        createAttemptID,
-        principal.owner,
-        principal.org,
-        checkpointID,
-        checkpointUseClaimHash,
-      );
-      if (reserved instanceof Response) return reserved;
-      if (
-        reserved.replayLease &&
-        (reserved.replayLease.checkpointID !== checkpointID ||
-          reserved.replayLease.owner !== principal.owner ||
-          reserved.replayLease.org !== principal.org ||
-          !createAttemptMatchesLease(reserved.attempt, reserved.replayLease))
-      ) {
-        return createAttemptBindingConflictResponse();
-      }
-      if (reserved.replayLease && !leaseIsLive(reserved.replayLease)) {
-        return createAttemptReplayResponse(reserved.replayLease);
-      }
-      const bound = await this.state.runExclusive(async () => {
-        const current = await this.getCreateAttempt(requestedLeaseID);
-        if (!current || current.token !== createAttemptID) {
-          return createAttemptConflictResponse();
-        }
-        if (current.owner !== principal.owner || current.org !== principal.org) {
-          return createAttemptConflictResponse();
-        }
-        if (current.state === "canceled") return createCanceledResponse();
-        if (!sameCreateAttempt(current, reserved.attempt)) {
+      if (!fixedLeaseID) {
+        const reserved = await this.reserveCreateAttempt(
+          requestedLeaseID,
+          createAttemptID,
+          principal.owner,
+          principal.org,
+          checkpointID,
+          checkpointUseClaimHash,
+        );
+        if (reserved instanceof Response) return reserved;
+        if (
+          reserved.replayLease &&
+          (reserved.replayLease.checkpointID !== checkpointID ||
+            reserved.replayLease.owner !== principal.owner ||
+            reserved.replayLease.org !== principal.org ||
+            !createAttemptMatchesLease(reserved.attempt, reserved.replayLease))
+        ) {
           return createAttemptBindingConflictResponse();
         }
-        return await bindCheckpointUseProvisioning(
-          this.state.storage,
-          checkpointID,
-          token,
-          principal,
-          createAttemptID,
-          requestedLeaseID,
-        );
-      });
-      if (bound instanceof Response) return bound;
-      await this.scheduleCheckpointAlarm();
-      if (reserved.replayLease) {
-        await finishCheckpointUse(
-          this.state.storage,
-          checkpointID,
-          token,
-          principal,
-          true,
-          createAttemptID,
-          { requestedLeaseID, generation: checkpoint.generation, createdAt: checkpoint.createdAt },
-        );
+        if (reserved.replayLease && !leaseIsLive(reserved.replayLease)) {
+          return createAttemptReplayResponse(reserved.replayLease);
+        }
+        const bound = await this.state.runExclusive(async () => {
+          const current = await this.getCreateAttempt(requestedLeaseID);
+          if (!current || current.token !== createAttemptID) {
+            return createAttemptConflictResponse();
+          }
+          if (current.owner !== principal.owner || current.org !== principal.org) {
+            return createAttemptConflictResponse();
+          }
+          if (current.state === "canceled") return createCanceledResponse();
+          if (!sameCreateAttempt(current, reserved.attempt)) {
+            return createAttemptBindingConflictResponse();
+          }
+          return await this.state.storage.transaction((transaction) =>
+            bindCheckpointUseProvisioningInTransaction(
+              transaction,
+              checkpointID,
+              checkpointUseClaimHash,
+              principal,
+              createAttemptID,
+              requestedLeaseID,
+            ),
+          );
+        });
+        if (bound instanceof Response) return bound;
         await this.scheduleCheckpointAlarm();
-        return createAttemptReplayResponse(reserved.replayLease);
+        if (reserved.replayLease) {
+          await finishCheckpointUse(
+            this.state.storage,
+            checkpointID,
+            token,
+            principal,
+            true,
+            createAttemptID,
+            {
+              requestedLeaseID,
+              generation: checkpoint.generation,
+              createdAt: checkpoint.createdAt,
+            },
+          );
+          await this.scheduleCheckpointAlarm();
+          return createAttemptReplayResponse(reserved.replayLease);
+        }
       }
       const leaseRequest = new Request(request.url, {
         method: "POST",
@@ -14837,10 +14941,27 @@ export class FleetCoordinator {
         undefined,
         undefined,
         undefined,
-        undefined,
-        checkpoint,
-        checkpointUseClaimHash,
+        fixedLeaseID,
+        { checkpoint, principal, token, tokenHash: checkpointUseClaimHash },
       );
+      if (fixedLeaseID && response.ok && response.status !== 201) {
+        // Replay may carry an already-consumed token or the original in-flight fence.
+        // Neither can be rebound or counted as another completed checkpoint use.
+        try {
+          await finishCheckpointUse(this.state.storage, checkpointID, token, principal, false);
+        } catch (error) {
+          if (
+            !(error instanceof CheckpointError) ||
+            !["checkpoint_claim_invalid", "checkpoint_in_use"].includes(error.code)
+          )
+            throw error;
+        }
+        await this.scheduleCheckpointAlarm();
+        return response;
+      }
+      const admittedAttemptID = fixedLeaseID
+        ? (await this.getCreateAttempt(requestedLeaseID))?.token
+        : createAttemptID;
       if (response.ok) {
         await finishCheckpointUse(
           this.state.storage,
@@ -14848,18 +14969,18 @@ export class FleetCoordinator {
           token,
           principal,
           true,
-          input.createAttemptID,
+          admittedAttemptID,
           { requestedLeaseID, generation: checkpoint.generation, createdAt: checkpoint.createdAt },
         );
         await this.scheduleCheckpointAlarm();
-      } else {
+      } else if (admittedAttemptID) {
         const resolved = await this.state.runExclusive(() =>
           resolveRejectedCheckpointProvisioning(
             this.state.storage,
             checkpointID,
             token,
             principal,
-            createAttemptID,
+            admittedAttemptID,
             requestedLeaseID,
           ),
         );
@@ -14875,6 +14996,24 @@ export class FleetCoordinator {
       }
       throw error;
     }
+  }
+
+  private async validateCheckpointLeaseSource(
+    checkpoint: CoordinatorCheckpointRecord,
+  ): Promise<void> {
+    const checkpointProvider = this.provider(
+      checkpoint.provider,
+      checkpoint.scope.region,
+      checkpoint.scope.project,
+    );
+    await checkpointProvider.validateCheckpointLeaseScope?.(checkpoint);
+    if (!checkpointProvider.validateCheckpointImage) {
+      throw new CheckpointError(
+        "checkpoint_source_mismatch",
+        "checkpoint provider cannot verify its exact owned source resource",
+      );
+    }
+    await checkpointProvider.validateCheckpointImage(checkpoint);
   }
 
   private async deleteManagedCheckpoint(
@@ -23090,6 +23229,7 @@ const fixedLeaseCreateIntentVersion = 2;
 export async function fixedLeaseCreateIntentHash(
   config: LeaseConfig,
   requestedSlug: string,
+  checkpoint?: CoordinatorCheckpointRecord,
 ): Promise<string> {
   const { keep, ...normalizedConfig } = config;
   const semanticConfig: Record<string, unknown> = { ...normalizedConfig };
@@ -23104,6 +23244,7 @@ export async function fixedLeaseCreateIntentHash(
   return await sha256Hex(
     `crabbox-fixed-lease-create-v${fixedLeaseCreateIntentVersion}\0${canonicalJSONStringify({
       requestedSlug,
+      ...(checkpoint ? { checkpoint: checkpointLeaseSourceIdentity(checkpoint) } : {}),
       lifecycle: { keep },
       config: semanticConfig,
     })}`,

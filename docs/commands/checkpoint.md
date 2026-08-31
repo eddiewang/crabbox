@@ -486,10 +486,16 @@ crabbox checkpoint fork --provider parallels --parallels-template ubuntu-fast --
   checkpoint, changed create intent, ambiguous resources, or a released lease
   ID fails without allocating a replacement. A later fork failure preserves the
   known fixed-ID lease for recovery instead of deleting adopted work. Direct
-  AWS, Machine0, local-container, and Incus container backends support this
-  checkpoint-bound contract. Archive checkpoints, direct Hetzner, direct Parallels snapshots,
-  coordinator-backed leases, and external providers reject fixed checkpoint
-  forks. Fixed IDs must remain retained and cannot fan out, override the
+  AWS, Machine0, local-container, Incus containers, and coordinator-managed native
+  checkpoint backends support this checkpoint-bound contract. Managed forks bind the
+  checkpoint incarnation and immutable image to the coordinator's fixed intent;
+  replay preserves the original provisioning claim and does not advance checkpoint
+  usage again. An older coordinator rejects the dedicated fixed-checkpoint route
+  without falling back to ordinary creation. A fresh CLI invocation still needs
+  a valid use claim and refuses a deleted checkpoint; an in-request retry can
+  recover its already-created child after source deletion. Archive checkpoints, direct Hetzner,
+  direct Parallels snapshots, legacy unmanaged brokered checkpoints, and external
+  providers reject fixed checkpoint forks. Fixed IDs must remain retained and cannot fan out, override the
   deterministic workdir, or run commands following `--`.
 - *JSON output:* one fork prints one JSON object; `--count` greater than one
   prints one JSON array. Every object contains `checkpointId`, `leaseId`,

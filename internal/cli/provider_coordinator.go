@@ -83,6 +83,8 @@ func (b *coordinatorLeaseBackend) Spec() ProviderSpec { return b.spec }
 
 func (b *coordinatorLeaseBackend) SupportsRequestedLeaseID() bool { return true }
 
+func (b *coordinatorLeaseBackend) SupportsRequestedCheckpointID() bool { return true }
+
 func (b *coordinatorLeaseBackend) ReleaseLeaseConnectionCleanupSafe() bool { return false }
 
 func (b *coordinatorLeaseBackend) validateCoordinatorLeaseProviderIdentity(lease CoordinatorLease) error {
@@ -155,6 +157,10 @@ func (b *coordinatorLeaseBackend) RebindResolvedLeaseTarget(target *LeaseTarget,
 }
 
 func (b *coordinatorLeaseBackend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
+	claim, checkpointBacked := checkpointLeaseClaimFromContext(ctx)
+	if req.RequestedLeaseID != "" && ((req.RequestedCheckpointID != "") != checkpointBacked || checkpointBacked && req.RequestedCheckpointID != claim.CheckpointID) {
+		return LeaseTarget{}, exit(2, "fixed coordinator checkpoint acquisition requires its exact checkpoint use context")
+	}
 	if strings.TrimSpace(req.RequestedLeaseID) != "" {
 		acquired, err := b.acquireOnceWithLeaseID(ctx, req.Keep, strings.TrimSpace(req.RequestedLeaseID), req.RequestedSlug)
 		if err != nil {

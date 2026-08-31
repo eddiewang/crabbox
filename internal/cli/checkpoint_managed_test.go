@@ -944,6 +944,95 @@ func TestCheckpointManagedLeaseSuccessStopsClaimRenewalImmediately(t *testing.T)
 	}
 }
 
+func TestCheckpointManagedFixedLeaseUsesExactCheckpointRoute(t *testing.T) {
+	for _, supported := range []bool{true, false} {
+		t.Run(strconv.FormatBool(supported), func(t *testing.T) {
+			const leaseID = "cbx_000000000002"
+			const checkpointID = "chk_fixed_managed"
+			calls := 0
+			server, _ := configureManagedCheckpointTest(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.Method != http.MethodPut || r.URL.Path != "/v1/leases/"+leaseID+"/from-checkpoint" {
+					t.Errorf("fixed checkpoint escaped its authenticated route: %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if body["leaseID"] != leaseID || body["checkpointID"] != checkpointID || body["checkpointUseClaim"] != "fresh-use-claim" {
+					t.Error("fixed checkpoint request lost its exact identity or use claim")
+				}
+				if !supported {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{ID: leaseID, Provider: "aws", State: "active"}})
+			})
+			coord := &CoordinatorClient{BaseURL: server.URL, Client: server.Client(), checkpointSupportKnown: true, checkpointSupported: true}
+			cfg := defaultConfig()
+			cfg.Provider = "aws"
+			cfg.AWSSnapshot = "snap-0001"
+			acknowledged := false
+			ctx := withCheckpointLeaseProvisioned(context.Background(), checkpointID, "fresh-use-claim", func() { acknowledged = true })
+			lease, err := coord.EnsureLease(ctx, cfg, "ssh-ed25519 public", true, leaseID, "fixed-fork")
+			if calls != 1 || acknowledged != supported {
+				t.Fatalf("calls=%d acknowledged=%v; expected exactly one checkpoint request, acknowledgement only on success", calls, acknowledged)
+			}
+			if supported && (err != nil || lease.ID != leaseID) {
+				t.Fatalf("fixed checkpoint lease=%#v error=%v", lease, err)
+			}
+			if !supported && err == nil {
+				t.Fatal("old coordinator must reject without ordinary-create fallback")
+			}
+		})
+	}
+}
+
+func TestCheckpointManagedFixedForkReachesCoordinatorAdmission(t *testing.T) {
+	checkpoint := managedCheckpointFixture("chk_fixed_cli")
+	const leaseID = "cbx_000000000002"
+	puts := 0
+	_, _ = configureManagedCheckpointTest(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/checkpoints/" + checkpoint.ID:
+			_ = json.NewEncoder(w).Encode(map[string]any{"checkpoint": checkpoint})
+		case "/v1/checkpoints/" + checkpoint.ID + "/use":
+			_ = json.NewEncoder(w).Encode(map[string]any{"checkpoint": checkpoint, "claim": "cli-fork-claim", "expiresAt": time.Now().Add(time.Minute).Format(time.RFC3339)})
+		case "/v1/leases/" + leaseID + "/from-checkpoint":
+			puts++
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":"checkpoint_admission_test_refusal"}`)
+		default:
+			t.Errorf("unexpected fixed-fork operation: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+	testAWSBackendOverride = &testSSHBackend{spec: ProviderSpec{Name: "aws"}}
+	t.Cleanup(func() { testAWSBackendOverride = nil })
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).checkpointFork(context.Background(), []string{checkpoint.ID, "--lease-id", leaseID, "--json"})
+	if puts != 1 || err == nil || !strings.Contains(err.Error(), "checkpoint_admission_test_refusal") {
+		t.Fatalf("fixed fork must reach the coordinator-owned admission exactly once: puts=%d error=%v", puts, err)
+	}
+}
+
+func TestCoordinatorFixedCheckpointRequiresMatchingContext(t *testing.T) {
+	for _, contextCheckpoint := range []string{"", "chk_other"} {
+		t.Run(contextCheckpoint, func(t *testing.T) {
+			backend := &coordinatorLeaseBackend{}
+			ctx := context.Background()
+			if contextCheckpoint != "" {
+				ctx = withCheckpointLeaseClaim(ctx, contextCheckpoint, "claim")
+			}
+			_, err := backend.Acquire(ctx, AcquireRequest{RequestedLeaseID: "cbx_000000000002", RequestedCheckpointID: "chk_requested"})
+			if err == nil || !strings.Contains(err.Error(), "exact checkpoint use context") {
+				t.Fatalf("mismatched checkpoint context was admitted: %v", err)
+			}
+		})
+	}
+}
+
 type checkpointRenewalRaceBackend struct {
 	*watchTestBackend
 	coordinator *CoordinatorClient

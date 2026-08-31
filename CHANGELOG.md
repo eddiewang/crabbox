@@ -2,6 +2,10 @@
 
 ## 0.48.1 (Unreleased)
 
+### Added
+
+- Added fixed-ID coordinator-managed checkpoint forks with atomic image-use ownership, exact source binding, and replay without duplicate allocation or checkpoint usage.
+
 ### Fixed
 
 - Made explicit coordinator Stop share one five-minute cancellation budget across inspection, claim waits, release, and observation, and made local daemon lock waits honor cancellation without losing confirmed cleanup results.

@@ -1020,9 +1020,6 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 	method := http.MethodPost
 	path := "/v1/leases"
 	checkpointClaim, checkpointBacked := checkpointLeaseClaimFromContext(ctx)
-	if checkpointBacked && fixed {
-		return CoordinatorLease{}, fmt.Errorf("checkpoint-backed leases do not support fixed lease identifiers")
-	}
 	if fixed {
 		method = http.MethodPut
 		path = "/v1/leases/" + url.PathEscape(leaseID)
@@ -1049,6 +1046,9 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 		req["checkpointID"] = checkpointClaim.CheckpointID
 		req["checkpointUseClaim"] = checkpointClaim.Token
 		path = "/v1/leases/from-checkpoint"
+		if fixed {
+			path = "/v1/leases/" + url.PathEscape(leaseID) + "/from-checkpoint"
+		}
 	}
 	err = c.do(ctx, method, path, req, &res)
 	if err == nil && checkpointBacked && checkpointClaim.LeaseCreated != nil {

@@ -159,6 +159,7 @@ GET    /v1/providers/{provider}/readiness
 GET    /v1/control                       (websocket: run events + heartbeats)
 POST   /v1/leases
 POST   /v1/leases/from-checkpoint
+PUT    /v1/leases/{canonical-id}/from-checkpoint
 PUT    /v1/leases/{canonical-id}       (fixed-ID idempotent create)
 PUT    /v1/leases/{id}/registration
 GET    /v1/leases
@@ -243,6 +244,16 @@ If the PUT response is ambiguous, the CLI repeats the full identical PUT until
 the coordinator atomically confirms the same stored intent or returns a
 conflict/definite error. Public GET is used only after that PUT confirmation,
 never to adopt an unverified fixed-ID record.
+
+Fixed checkpoint forks use `PUT /v1/leases/{canonical-id}/from-checkpoint` with
+the existing checkpoint ID and use claim fields. The first admission atomically
+reserves the fixed lease, its exact create attempt, and the checkpoint's
+provisioning fence. Its immutable intent also binds the checkpoint incarnation
+and provider artifact. Replays preserve that original binding and consume only
+an unused caller claim; they do not advance `lastUsedAt` again. An in-request
+retry may adopt its child after source deletion, but a fresh CLI invocation still
+requires a valid new checkpoint use claim. Older coordinators reject this route
+without ordinary-create fallback.
 
 Registration accepts generic provider and SSH metadata. Repeating the same
 owner/org/id/provider tuple refreshes it and reactivates an expired record.

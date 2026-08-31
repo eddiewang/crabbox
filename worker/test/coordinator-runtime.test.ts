@@ -562,6 +562,7 @@ describe("coordinator runtimes", () => {
       ["GET", "/v1/native-vnc/handoff"],
       ["GET", "/v1/leases/cbx_abcdef123456"],
       ["PUT", "/v1/leases/cbx_abcdef123456"],
+      ["PUT", "/v1/leases/cbx_abcdef123456/from-checkpoint"],
       ["POST", "/v1/leases/from-checkpoint"],
       ["POST", "/v1/checkpoints"],
       ["GET", "/v1/checkpoints/chk_example"],

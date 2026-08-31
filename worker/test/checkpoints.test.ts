@@ -18,7 +18,7 @@ import {
   checkpointProviderAbsenceHorizonMS,
   checkpointResourceKey,
   checkpointUseClaimTTLMS,
-  bindCheckpointUseProvisioning as bindCheckpointUseProvisioningTransaction,
+  bindCheckpointUseProvisioningInTransaction,
   claimCheckpointDeletion,
   findManagedCheckpointImage,
   finalizeCheckpointDeletion,
@@ -359,6 +359,7 @@ async function bindCheckpointUseProvisioning(
   requestedLeaseID: string,
 ): Promise<CoordinatorCheckpointRecord> {
   const now = new Date().toISOString();
+  const tokenHash = await sha256Hex(claim);
   await storage.put(`create-attempt:${requestedLeaseID}`, {
     version: 1,
     requestedLeaseID,
@@ -367,21 +368,471 @@ async function bindCheckpointUseProvisioning(
     org: principal.org,
     state: "pending",
     checkpointID,
-    checkpointUseClaimHash: await sha256Hex(claim),
+    checkpointUseClaimHash: tokenHash,
     createdAt: now,
     updatedAt: now,
   } satisfies CreateAttemptRecord);
-  return await bindCheckpointUseProvisioningTransaction(
-    storage,
-    checkpointID,
-    claim,
-    principal,
-    attemptID,
-    requestedLeaseID,
+  return await storage.transaction((transaction) =>
+    bindCheckpointUseProvisioningInTransaction(
+      transaction,
+      checkpointID,
+      tokenHash,
+      principal,
+      attemptID,
+      requestedLeaseID,
+    ),
   );
 }
 
 describe("coordinator-managed checkpoints", () => {
+  it.each(["creating", "failed"] as const)(
+    "rejects fixed checkpoint admission while its real capture is %s without an image",
+    async (state) => {
+      const { coordinator, storage, provider } = await checkpointFixture();
+      const entered = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      const capture = vi.mocked(provider.createCheckpointImage).getMockImplementation()!;
+      vi.mocked(provider.createCheckpointImage).mockImplementation(async (...args) => {
+        entered.resolve();
+        if (state === "failed") throw new Error("uncertain capture");
+        await finish.promise;
+        return capture(...args);
+      });
+      const allocate = vi.spyOn(provider, "createServerWithFallback");
+      const checkpointID = `chk_unpublished_fixed_${state}`;
+      const creating = createCheckpoint(coordinator, checkpointID);
+      try {
+        await entered.promise;
+        if (state === "failed") {
+          await creating;
+          await Array.from({ length: checkpointMaxCreateRecoveryAttempts }).reduce(
+            async (previous) => {
+              await previous;
+              await recordCheckpointCreateRecoveryFailure(storage, checkpointID, "still absent");
+            },
+            Promise.resolve(),
+          );
+        }
+        const checkpoint = await storage.get<CoordinatorCheckpointRecord>(
+          checkpointKey(checkpointID),
+        );
+        expect(checkpoint?.state).toBe(state);
+        expect(checkpoint?.image).toBeUndefined();
+        const body = {
+          provider: "aws",
+          awsSnapshot: "snap-000000000001",
+          checkpointID,
+          checkpointUseClaim: "not-yet-admitted",
+          leaseID: "cbx_000000000002",
+        };
+        const normal = await coordinator.fetch(
+          checkpointRequest("POST", "/v1/leases/from-checkpoint", {
+            ...body,
+            createAttemptID: `cat_${"a".repeat(32)}`,
+          }),
+        );
+        const fixed = await coordinator.fetch(
+          checkpointRequest("PUT", `/v1/leases/${body.leaseID}/from-checkpoint`, body),
+        );
+        expect(normal.status).toBe(409);
+        expect(fixed.status).toBe(409);
+        await expect(fixed.json()).resolves.toEqual(await normal.json());
+        expect(allocate).not.toHaveBeenCalled();
+        expect(await storage.get(`lease:${body.leaseID}`)).toBeUndefined();
+        expect(await storage.get(`create-attempt:${body.leaseID}`)).toBeUndefined();
+      } finally {
+        finish.resolve();
+        await creating;
+      }
+      expect((await creating).status).toBe(state === "failed" ? 503 : 201);
+    },
+  );
+
+  async function fixedForkFixture(providerName: CoordinatorCheckpointProvider = "aws") {
+    const fixture = await checkpointFixture(providerName);
+    const { coordinator, provider } = fixture;
+    const checkpointID = "chk_fixed_fork";
+    expect((await createCheckpoint(coordinator, checkpointID)).status).toBe(201);
+    vi.spyOn(provider, "hourlyPriceUSD").mockResolvedValue(1);
+    vi.spyOn(provider, "supportsSSHHostKeyInjection").mockReturnValue(false);
+    vi.spyOn(provider, "prepareLeaseConfig").mockImplementation(async (config) => config);
+    vi.spyOn(provider, "prepareLeaseCreate").mockImplementation(async (config, lease) => ({
+      config,
+      lease,
+    }));
+    vi.spyOn(provider, "finalizeLeaseCreate").mockImplementation(async (config, lease) => ({
+      config,
+      lease,
+    }));
+    const create = vi
+      .spyOn(provider, "createServerWithFallback")
+      .mockImplementation(async (config, id, slug) => ({
+        server: {
+          provider: providerName,
+          id: 2,
+          cloudID: "i-fixed-fork",
+          name: slug,
+          host: "192.0.2.2",
+          serverType: config.serverType,
+          region: providerScope(providerName).region,
+          status: "running",
+          labels: { lease: id },
+        },
+        serverType: config.serverType,
+      }));
+    const checkpoint = (await fixture.storage.get<CoordinatorCheckpointRecord>(
+      checkpointKey(checkpointID),
+    ))!;
+    const body = {
+      leaseID: "cbx_000000000002",
+      checkpointID,
+      provider: providerName,
+      ...(providerName === "azure"
+        ? { azureSnapshot: checkpoint.image!.id }
+        : providerName === "gcp"
+          ? { gcpSnapshot: checkpoint.image!.id }
+          : { awsSnapshot: checkpoint.image!.id }),
+      sshPublicKey: "ssh-ed25519 fixed-checkpoint",
+      keep: true,
+    };
+    const begin = async () => {
+      const response = await coordinator.fetch(
+        checkpointRequest("POST", `/v1/checkpoints/${checkpointID}/use`, { action: "begin" }),
+      );
+      expect(response.status).toBe(201);
+      return ((await response.json()) as { claim: string }).claim;
+    };
+    const fork = (claim: string, changes: Record<string, unknown> = {}) =>
+      coordinator.fetch(
+        checkpointRequest("PUT", `/v1/leases/${body.leaseID}/from-checkpoint`, {
+          ...body,
+          checkpointUseClaim: claim,
+          ...changes,
+        }),
+      );
+    return { ...fixture, checkpointID, body, begin, fork, create };
+  }
+
+  it.each(
+    [
+      { scope: "owner", owner: "operator@example.com", org: "example-org" },
+      { scope: "organization", owner: "alice@example.com", org: "other-org" },
+      { scope: "owner and organization", owner: "operator@example.com", org: "other-org" },
+    ].flatMap((principal) => ["POST", "PUT"].map((method) => ({ ...principal, method }))),
+  )(
+    "carries authenticated checkpoint authority across $scope through $method",
+    async (principal) => {
+      const { coordinator, storage, checkpointID, body, create } = await fixedForkFixture();
+      const before = (await storage.get<CoordinatorCheckpointRecord>(checkpointKey(checkpointID)))!;
+      const admin = { ...principal, admin: true };
+      const acquired = await coordinator.fetch(
+        checkpointRequest(
+          "POST",
+          `/v1/checkpoints/${checkpointID}/use`,
+          { action: "begin" },
+          admin,
+        ),
+      );
+      expect(acquired.status).toBe(201);
+      const { claim } = (await acquired.json()) as { claim: string };
+      const path =
+        principal.method === "PUT"
+          ? `/v1/leases/${body.leaseID}/from-checkpoint`
+          : "/v1/leases/from-checkpoint";
+      const input = {
+        ...body,
+        checkpointUseClaim: claim,
+        ...(principal.method === "POST" ? { createAttemptID: `cat_${"a".repeat(32)}` } : {}),
+      };
+      const refused = await coordinator.fetch(
+        checkpointRequest(principal.method, path, input, principal),
+      );
+      expect(refused.status).toBe(404);
+      expect(create).not.toHaveBeenCalled();
+      expect(await storage.get(`lease:${body.leaseID}`)).toBeUndefined();
+      expect(await storage.get(checkpointKey(checkpointID))).toMatchObject({ activeUseCount: 1 });
+
+      const forked = await coordinator.fetch(
+        checkpointRequest(principal.method, path, input, admin),
+      );
+      expect(forked.status).toBe(201);
+      await expect(forked.json()).resolves.toMatchObject({
+        lease: { id: body.leaseID, checkpointID, state: "active" },
+      });
+      expect(create).toHaveBeenCalledOnce();
+      expect(await storage.get(`lease:${body.leaseID}`)).toMatchObject({
+        owner: principal.owner,
+        org: orgKeyForLabel(principal.org),
+      });
+      expect(await storage.get(checkpointKey(checkpointID))).toMatchObject({
+        owner: before.owner,
+        org: before.org,
+        activeUseCount: 0,
+      });
+      expect(await storage.list({ prefix: `checkpoint-use:${checkpointID}:` })).toHaveLength(0);
+    },
+  );
+
+  it.each(["aws", "azure", "gcp"] as const)(
+    "replays a fixed checkpoint fork for %s with a fresh claim without another allocation or use",
+    async (providerName) => {
+      const { storage, checkpointID, body, begin, fork, create } =
+        await fixedForkFixture(providerName);
+      const firstClaim = await begin();
+      const first = await fork(firstClaim);
+      expect(first.status).toBe(201);
+      await expect(first.json()).resolves.toMatchObject({
+        lease: { id: body.leaseID, checkpointID, state: "active" },
+      });
+      const original = await storage.get<LeaseRecord>(`lease:${body.leaseID}`);
+      const attempt = await storage.get<CreateAttemptRecord>(`create-attempt:${body.leaseID}`);
+      const completed = await storage.get<CoordinatorCheckpointRecord>(checkpointKey(checkpointID));
+      expect(original?.fixedCreateIntentHash).toMatch(/^[a-f0-9]{64}$/);
+      const freshClaim = await begin();
+      const replay = await fork(freshClaim);
+      expect(replay.status).toBe(200);
+      expect(create).toHaveBeenCalledOnce();
+      expect(await storage.get(`lease:${body.leaseID}`)).toEqual(original);
+      expect(await storage.get(`create-attempt:${body.leaseID}`)).toEqual(attempt);
+      expect(await storage.get(checkpointKey(checkpointID))).toMatchObject({
+        activeUseCount: 0,
+        lastUsedAt: completed!.lastUsedAt,
+      });
+      expect(await storage.list({ prefix: `checkpoint-use:${checkpointID}:` })).toHaveLength(0);
+      expect(storage.snapshot()).not.toContain(firstClaim);
+      expect((await fork(freshClaim)).status).toBe(200);
+      expect(create).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("replays a fixed checkpoint child after source deletion without inspecting its image", async () => {
+    const { coordinator, storage, checkpointID, provider, begin, fork, create } =
+      await fixedForkFixture();
+    const claim = await begin();
+    expect((await fork(claim)).status).toBe(201);
+    expect(
+      (await coordinator.fetch(checkpointRequest("DELETE", `/v1/checkpoints/${checkpointID}`)))
+        .status,
+    ).toBe(200);
+    const deleted = await storage.get(checkpointKey(checkpointID));
+    vi.mocked(provider.validateCheckpointImage).mockRejectedValue(
+      new Error("deleted source must not be inspected for replay"),
+    );
+    expect((await fork(claim)).status).toBe(200);
+    expect(await storage.get(checkpointKey(checkpointID))).toEqual(deleted);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("rolls back a fixed checkpoint reservation and its fence together on storage failure", async () => {
+    const { storage, checkpointID, body, begin, fork, create } = await fixedForkFixture();
+    const claim = await begin();
+    storage.failKey = `lease:${body.leaseID}`;
+    expect((await fork(claim)).status).toBe(500);
+    expect(await storage.get(`lease:${body.leaseID}`)).toBeUndefined();
+    expect(await storage.get(`create-attempt:${body.leaseID}`)).toBeUndefined();
+    expect([
+      ...(
+        await storage.list<CoordinatorCheckpointUseClaim>({
+          prefix: `checkpoint-use:${checkpointID}:`,
+        })
+      ).values(),
+    ]).toEqual([expect.objectContaining({ state: "available" })]);
+    expect(create).not.toHaveBeenCalled();
+    delete storage.failKey;
+    expect((await fork(claim)).status).toBe(201);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it.each(["expired claim", "replaced checkpoint"])(
+    "revalidates fixed checkpoint admission after preflight: %s",
+    async (change) => {
+      const { storage, checkpointID, provider, body, begin, fork, create } =
+        await fixedForkFixture();
+      const claim = await begin();
+      vi.spyOn(provider, "prepareLeaseConfig").mockImplementation(async (config) => {
+        if (change === "expired claim") {
+          const key = `checkpoint-use:${checkpointID}:${await sha256Hex(claim)}`;
+          const current = (await storage.get<CoordinatorCheckpointUseClaim>(key))!;
+          await storage.put(key, { ...current, expiresAt: "2000-01-01T00:00:00.000Z" });
+        } else {
+          const current = (await storage.get<CoordinatorCheckpointRecord>(
+            checkpointKey(checkpointID),
+          ))!;
+          await storage.put(checkpointKey(checkpointID), {
+            ...current,
+            createdAt: "2000-01-01T00:00:00.000Z",
+          });
+        }
+        return config;
+      });
+      expect((await fork(claim)).status).toBe(409);
+      expect(await storage.get(`lease:${body.leaseID}`)).toBeUndefined();
+      expect(await storage.get(`create-attempt:${body.leaseID}`)).toBeUndefined();
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("joins a pending fixed checkpoint fork without replacing its deletion fence", async () => {
+    const { storage, coordinator, checkpointID, body, begin, fork, create } =
+      await fixedForkFixture();
+    const firstClaim = await begin();
+    const secondClaim = await begin();
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const provision = create.getMockImplementation()!;
+    create.mockImplementation(async (...args) => {
+      entered.resolve();
+      await finish.promise;
+      return provision(...args);
+    });
+    const first = fork(firstClaim);
+    try {
+      await Promise.race([
+        entered.promise,
+        first.then(async (response) => {
+          throw new Error(
+            `fixed fork ended before provisioning: ${response.status} ${await response.text()}`,
+          );
+        }),
+      ]);
+      const originalAttempt = await storage.get(`create-attempt:${body.leaseID}`);
+      const second = await fork(secondClaim);
+      expect(second.status).toBe(202);
+      expect(create).toHaveBeenCalledOnce();
+      expect(await storage.get(`create-attempt:${body.leaseID}`)).toEqual(originalAttempt);
+      expect([
+        ...(
+          await storage.list<CoordinatorCheckpointUseClaim>({
+            prefix: `checkpoint-use:${checkpointID}:`,
+          })
+        ).values(),
+      ]).toEqual([
+        expect.objectContaining({
+          state: "provisioning",
+          tokenHash: await sha256Hex(firstClaim),
+          leaseID: body.leaseID,
+        }),
+      ]);
+      const deletion = await coordinator.fetch(
+        checkpointRequest("DELETE", `/v1/checkpoints/${checkpointID}`),
+      );
+      expect(deletion.status).toBe(409);
+    } finally {
+      finish.resolve();
+      await first;
+    }
+    expect((await first).status).toBe(201);
+    expect(await storage.get(checkpointKey(checkpointID))).toMatchObject({ activeUseCount: 0 });
+  });
+
+  it("releases a fixed checkpoint fork while provisioning and rejects late activation", async () => {
+    const { storage, coordinator, provider, checkpointID, body, begin, fork, create } =
+      await fixedForkFixture();
+    const claim = await begin();
+    const entered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const provision = create.getMockImplementation()!;
+    const release = vi.spyOn(provider, "releaseLease").mockResolvedValue(undefined);
+    create.mockImplementation(async (...args) => {
+      entered.resolve();
+      await finish.promise;
+      return provision(...args);
+    });
+    const first = fork(claim);
+    try {
+      await entered.promise;
+      const released = await coordinator.fetch(
+        checkpointRequest("POST", `/v1/leases/${body.leaseID}/release`, { delete: true }),
+      );
+      expect(released.status).toBe(200);
+      expect(await storage.get(`lease:${body.leaseID}`)).toMatchObject({ state: "released" });
+      expect((await fork(claim)).status).toBe(409);
+    } finally {
+      finish.resolve();
+      await first;
+    }
+    expect((await first).status).toBe(409);
+    expect(release).toHaveBeenCalledOnce();
+    expect(await storage.get(`lease:${body.leaseID}`)).toMatchObject({ state: "released" });
+    expect(await storage.get(checkpointKey(checkpointID))).toMatchObject({ activeUseCount: 0 });
+  });
+
+  it.each([false, true])(
+    "keeps ordinary and checkpoint fixed intents separate (checkpoint first=%s)",
+    async (checkpointFirst) => {
+      const { coordinator, body, begin, fork, create } = await fixedForkFixture();
+      const ordinary = () =>
+        coordinator.fetch(
+          checkpointRequest("PUT", `/v1/leases/${body.leaseID}`, body, { admin: true }),
+        );
+      const claim = await begin();
+      expect((await (checkpointFirst ? fork(claim) : ordinary())).status).toBe(201);
+      expect((await (checkpointFirst ? ordinary() : fork(claim))).status).toBe(409);
+      expect(create).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("does not remap a fixed checkpoint fork to a retained Mac lease", async () => {
+    const { storage, checkpointID, body, begin, fork, create } = await fixedForkFixture();
+    const checkpoint = (await storage.get<CoordinatorCheckpointRecord>(
+      checkpointKey(checkpointID),
+    ))!;
+    await storage.put(checkpointKey(checkpointID), {
+      ...checkpoint,
+      target: "macos",
+      hostID: "h-0123456789abcdef0",
+    });
+    await storage.put(`lease:${leaseID}`, {
+      ...checkpointLease("aws"),
+      target: "macos",
+      state: "released",
+      releaseDeletesServer: false,
+      hostId: "h-0123456789abcdef0",
+    });
+    const response = await fork(await begin(), {
+      target: "macos",
+      awsMacHostID: "h-0123456789abcdef0",
+      capacity: { market: "on-demand" },
+    });
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({ lease: { id: body.leaseID } });
+    expect(await storage.get(`lease:${leaseID}`)).toMatchObject({ state: "released" });
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "incarnation",
+    "immutable image",
+    "scope",
+    "create intent",
+    "terminal lease",
+    "canceled attempt",
+  ])("rejects fixed checkpoint replay after %s changes", async (change) => {
+    const { storage, checkpointID, body, begin, fork, create } = await fixedForkFixture();
+    expect((await fork(await begin())).status).toBe(201);
+    const checkpoint = (await storage.get<CoordinatorCheckpointRecord>(
+      checkpointKey(checkpointID),
+    ))!;
+    if (change === "incarnation") checkpoint.createdAt = "2020-01-01T00:00:00.000Z";
+    if (change === "immutable image") checkpoint.image!.immutableID = "i-replaced-snapshot";
+    if (change === "scope") checkpoint.scope.accountID = "999999999999";
+    await storage.put(checkpointKey(checkpointID), checkpoint);
+    if (change === "terminal lease") {
+      const lease = (await storage.get<LeaseRecord>(`lease:${body.leaseID}`))!;
+      await storage.put(`lease:${body.leaseID}`, { ...lease, state: "released" });
+    }
+    if (change === "canceled attempt") {
+      const attempt = (await storage.get<CreateAttemptRecord>(`create-attempt:${body.leaseID}`))!;
+      await storage.put(`create-attempt:${body.leaseID}`, { ...attempt, state: "canceled" });
+    }
+    const response = await fork(
+      await begin(),
+      change === "create intent" ? { slug: "changed" } : {},
+    );
+    expect(response.status).toBe(409);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
   it("parses finite positive checkpoint limits and falls back for invalid or unlimited values", () => {
     expect(checkpointLimits()).toEqual({
       checkpoints: 64,
@@ -3629,15 +4080,18 @@ describe("coordinator-managed checkpoints", () => {
       });
     }
     const before = storage.snapshot();
+    const tokenHash = await sha256Hex(acquired.claim);
 
     await expect(
-      bindCheckpointUseProvisioningTransaction(
-        storage,
-        checkpointID,
-        acquired.claim,
-        { owner: "alice@example.com", org },
-        attemptID,
-        requestedLeaseID,
+      storage.transaction((transaction) =>
+        bindCheckpointUseProvisioningInTransaction(
+          transaction,
+          checkpointID,
+          tokenHash,
+          { owner: "alice@example.com", org },
+          attemptID,
+          requestedLeaseID,
+        ),
       ),
     ).rejects.toMatchObject({ code: test.error });
 

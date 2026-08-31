@@ -66,7 +66,7 @@ export function coordinatorRequestQueue(request: Request): CoordinatorRequestQue
     path[0] === "v1" &&
     path[1] === "leases" &&
     path[2] &&
-    path.length === 3
+    (path.length === 3 || (path.length === 4 && path[3] === "from-checkpoint"))
   ) {
     return "direct";
   }
