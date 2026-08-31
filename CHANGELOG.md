@@ -5,7 +5,9 @@
 ### Fixed
 
 - Kept brokered native checkpoint creation waiting through exact coordinator-owned recovery, without repeating capture, while bounding status requests and preserving cancellation and terminal failures.
+- Made explicit coordinator Stop share one five-minute cancellation budget across inspection, claim waits, release, and observation, and made local daemon lock waits honor cancellation without losing confirmed cleanup results.
 - Fixed Parallels clone destinations to pass the configured parent directory to `prlctl --dst`, letting Parallels name and create the VM bundle beneath it.
+- Published exact AWS allocation identity and prepared account scope before readiness and kept explicit Stop observing pending creation cleanup, while preserving allocation claims through storage failures and local ownership until deletion is confirmed.
 
 ## 0.48.0 - 2026-08-30
 
