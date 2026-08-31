@@ -1518,7 +1518,9 @@ func TestExecuteLocalActionsHydrationUsesCallerPlainManifestMode(t *testing.T) {
 		{name: "production private HTTPS finalize fallback", syncBefore: true, deriveMode: true, fallback: "finalize-auth", fallbackReason: "origin_auth_required"},
 		{name: "production HTTPS transport finalize fallback", syncBefore: true, deriveMode: true, fallback: "finalize-transport", fallbackReason: "origin_unavailable"},
 		{name: "production non-auth HTTP seed failure", syncBefore: true, deriveMode: true, fallback: "seed-http-error", wantError: "remote git seed failed"},
+		{name: "production marker spoof seed failure", syncBefore: true, deriveMode: true, fallback: "seed-marker", wantError: "remote git seed failed"},
 		{name: "production missing branch finalize failure", syncBefore: true, deriveMode: true, fallback: "finalize-missing-branch", wantError: "remote sync finalize failed"},
+		{name: "production marker spoof finalize failure", syncBefore: true, deriveMode: true, fallback: "finalize-marker", wantError: "remote sync finalize failed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1587,28 +1589,36 @@ case "$decoded" in
   *"origin_git clone"*)
     case "$CRABBOX_FAKE_ORIGIN_FALLBACK" in
       seed)
-        printf '%s\n' 'CRABBOX_GIT_ORIGIN_FALLBACK:origin_unavailable' >&2
+        printf '%s\n' 'fatal: unable to access: Could not resolve host: example.test' >&2
         exit 78
         ;;
       seed-http-error)
         printf '%s\n' 'fatal: unable to access: The requested URL returned error: 500' >&2
-        exit 128
+        exit 78
+        ;;
+      seed-marker)
+        printf '%s\n' 'CRABBOX_GIT_ORIGIN_FALLBACK:origin_unavailable' >&2
+        exit 78
         ;;
     esac
     ;;
   *"origin_git fetch"*)
     case "$CRABBOX_FAKE_ORIGIN_FALLBACK" in
       finalize-auth)
-        printf '%s\n' 'CRABBOX_GIT_ORIGIN_FALLBACK:origin_auth_required' >&2
+        printf '%s\n' 'fatal: Authentication failed' >&2
         exit 78
         ;;
       finalize-transport)
-        printf '%s\n' 'CRABBOX_GIT_ORIGIN_FALLBACK:origin_unavailable' >&2
+        printf '%s\n' 'fatal: unable to access: Failed to connect to example.test' >&2
         exit 78
         ;;
       finalize-missing-branch)
         printf '%s\n' "fatal: couldn't find remote ref absent" >&2
-        exit 128
+        exit 78
+        ;;
+      finalize-marker)
+        printf '%s\n' 'CRABBOX_GIT_ORIGIN_FALLBACK:origin_auth_required' >&2
+        exit 78
         ;;
     esac
     ;;

@@ -4614,6 +4614,8 @@ func TestRemoteGitSeedRemovesFailedCheckout(t *testing.T) {
 		"git -C \"$tmp\" checkout --quiet --detach",
 		"cleanup_seed() { rm -rf -- \"$tmp\"; rm -f -- \"$transport_error\"; }",
 		"trap cleanup_seed EXIT",
+		"cat \"$transport_error\" >&2",
+		"exit 78",
 		"mv -- \"$tmp\" \"$workdir\"",
 	} {
 		if !strings.Contains(got, want) {
@@ -4623,6 +4625,11 @@ func TestRemoteGitSeedRemovesFailedCheckout(t *testing.T) {
 	if strings.Contains(got, "git checkout --quiet FETCH_HEAD || true") {
 		t.Fatalf("remoteGitSeed should not keep failed checkouts: %q", got)
 	}
+	for _, forbidden := range []string{"origin_transport_fallback", "CRABBOX_GIT_ORIGIN_FALLBACK", "Authentication failed", "repository not found"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("remoteGitSeed retained origin policy %q in %q", forbidden, got)
+		}
+	}
 }
 
 func TestRemoteGitOriginTransportClassification(t *testing.T) {
@@ -4631,27 +4638,76 @@ func TestRemoteGitOriginTransportClassification(t *testing.T) {
 	}
 	tests := []struct {
 		name         string
+		remoteURL    string
 		message      string
+		exitCode     int
+		truncated    bool
 		wantReason   string
 		wantFallback bool
 	}{
-		{name: "authentication", message: "fatal: Authentication failed", wantReason: "origin_auth_required", wantFallback: true},
-		{name: "DNS", message: "fatal: unable to access: Could not resolve host: example.test", wantReason: "origin_unavailable", wantFallback: true},
-		{name: "TLS", message: "fatal: unable to access: SSL certificate problem: unable to get local issuer certificate", wantReason: "origin_unavailable", wantFallback: true},
-		{name: "firewall", message: "fatal: unable to access: No route to host", wantReason: "origin_unavailable", wantFallback: true},
-		{name: "HTTP response", message: "fatal: unable to access: The requested URL returned error: 500"},
+		{name: "authentication", remoteURL: "https://example.test/repo.git", message: "fatal: Authentication failed", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_auth_required", wantFallback: true},
+		{name: "HTTP 403", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: The requested URL returned error: 403", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_auth_required", wantFallback: true},
+		{name: "DNS", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: Could not resolve host: example.test", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
+		{name: "TLS", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: SSL certificate problem: unable to get local issuer certificate", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
+		{name: "firewall", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: No route to host", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
+		{name: "private HTTP repository", remoteURL: "https://example.test/repo.git", message: "remote: Repository not found.", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_auth_required", wantFallback: true},
+		{name: "filesystem unavailable", remoteURL: "/srv/git/repo.git", message: "fatal: '/srv/git/repo.git' does not appear to be a git repository", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
+		{name: "HTTP server failure beats transport", remoteURL: "https://example.test/repo.git", message: "fatal: The requested URL returned error: 503; Failed to connect", exitCode: gitOriginRuntimeFallbackExitCode},
+		{name: "HTTP response", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: The requested URL returned error: 500", exitCode: gitOriginRuntimeFallbackExitCode},
+		{name: "missing branch", remoteURL: "https://example.test/repo.git", message: "fatal: couldn't find remote ref absent", exitCode: gitOriginRuntimeFallbackExitCode},
+		{name: "marker spoof", remoteURL: "https://example.test/repo.git", message: "CRABBOX_GIT_ORIGIN_FALLBACK:origin_unavailable", exitCode: gitOriginRuntimeFallbackExitCode},
+		{name: "wrong exit", remoteURL: "https://example.test/repo.git", message: "fatal: Authentication failed", exitCode: 67},
+		{name: "truncated authentication", remoteURL: "https://example.test/repo.git", message: "fatal: Authentication failed", exitCode: gitOriginRuntimeFallbackExitCode, truncated: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			errorPath := filepath.Join(t.TempDir(), "transport-error")
-			if err := os.WriteFile(errorPath, []byte(tt.message+"\n"), 0o600); err != nil {
-				t.Fatal(err)
+			err := exec.Command("sh", "-c", "exit "+strconv.Itoa(tt.exitCode)).Run()
+			if tt.truncated {
+				err = &gitOriginDiagnosticsTruncatedError{err: err}
 			}
-			script := remoteGitOriginTransportFunctions() + "\norigin_transport_fallback " + shellQuote(errorPath) + " https://example.test/repo.git"
-			out, err := exec.Command("bash", "-lc", script).CombinedOutput()
-			reason, fallback := gitOriginRuntimeFallbackResult(string(out), err)
-			if fallback != tt.wantFallback || reason != tt.wantReason || err == nil {
-				t.Fatalf("fallback=%t reason=%q err=%v output=%q", fallback, reason, err, out)
+			reason, fallback := gitOriginRuntimeFallbackResult(tt.remoteURL, tt.message, err)
+			if fallback != tt.wantFallback || reason != tt.wantReason {
+				t.Fatalf("fallback=%t reason=%q err=%v output=%q", fallback, reason, err, tt.message)
+			}
+		})
+	}
+	if reason, fallback := gitOriginRuntimeFallbackResult("https://example.test/repo.git", "fatal: Authentication failed", nil); fallback || reason != "" {
+		t.Fatalf("successful attempt classified fallback=%t reason=%q", fallback, reason)
+	}
+	functions := remoteGitOriginTransportFunctions()
+	for _, forbidden := range []string{"grep", "origin_transport_fallback", "CRABBOX_GIT_ORIGIN_FALLBACK", "Authentication failed", "repository not found"} {
+		if strings.Contains(functions, forbidden) {
+			t.Fatalf("remote origin helper retained policy %q:\n%s", forbidden, functions)
+		}
+	}
+}
+
+func TestRemoteGitOriginAttemptCommandsDeferPolicyToGo(t *testing.T) {
+	plan := gitCoherencePlan{
+		RemoteURL: "https://example.test/repo.git",
+		Target:    strings.Repeat("a", 40),
+		Tree:      strings.Repeat("b", 40),
+		Branch:    "main",
+	}
+	commands := map[string]string{
+		"seed": remoteGitSeed("/work/repo", plan),
+		"finalize": remoteFinalizeSync("/work/repo", remoteSyncFinalizeOptions{
+			HydrateGit: true,
+			Token:      strings.Repeat("c", 32),
+			Coherence:  plan,
+		}),
+	}
+	for name, command := range commands {
+		t.Run(name, func(t *testing.T) {
+			for _, want := range []string{`cat "$transport_error" >&2`, "exit 78"} {
+				if !strings.Contains(command, want) {
+					t.Fatalf("%s missing %q:\n%s", name, want, command)
+				}
+			}
+			for _, forbidden := range []string{"origin_transport_fallback", "CRABBOX_GIT_ORIGIN_FALLBACK", "Authentication failed", "repository not found"} {
+				if strings.Contains(command, forbidden) {
+					t.Fatalf("%s retained origin policy %q:\n%s", name, forbidden, command)
+				}
 			}
 		})
 	}
@@ -4741,7 +4797,7 @@ func TestRemoteGitSeedClassifiesRuntimeOriginFailures(t *testing.T) {
 				plan.Branch = "absent"
 			}
 			out, err := exec.Command("bash", "-lc", remoteGitSeed(workdir, plan)).CombinedOutput()
-			reason, fallback := gitOriginRuntimeFallbackResult(string(out), err)
+			reason, fallback := gitOriginRuntimeFallbackResult(plan.RemoteURL, string(out), err)
 			wantReason := "origin_unavailable"
 			wantFallback := true
 			if kind == "private HTTP" {
@@ -4852,10 +4908,18 @@ exec /bin/bash --noprofile --norc -c "$remote"
 				if err == nil {
 					t.Fatalf("non-origin failure succeeded: output=%q", out)
 				}
+				if kind == "non-auth HTTP" && !strings.Contains(out, "500") {
+					t.Fatalf("fatal HTTP diagnostics were not retained: %q", out)
+				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("fallback finalize: %v\n%s", err, out)
+			}
+			if strings.Contains(out, "Authentication failed") ||
+				strings.Contains(out, "Failed to connect") ||
+				strings.Contains(out, "does not appear to be a git repository") {
+				t.Fatalf("successful fallback retained first-attempt diagnostics: %q", out)
 			}
 			for _, name := range []string{"sync-finalize-token", "sync-finalize-complete-token"} {
 				value, readErr := os.ReadFile(filepath.Join(meta, name))

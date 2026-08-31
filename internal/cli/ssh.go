@@ -989,6 +989,49 @@ func (b *synchronizedBuffer) String() string {
 	return b.buf.String()
 }
 
+func (b *synchronizedBuffer) boundedString() (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String(), b.truncated
+}
+
+type gitOriginDiagnosticsTruncatedError struct {
+	err error
+}
+
+func (e *gitOriginDiagnosticsTruncatedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *gitOriginDiagnosticsTruncatedError) Unwrap() error {
+	return e.err
+}
+
+func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	var (
+		out       synchronizedBuffer
+		lastErr   error
+		truncated bool
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		out = synchronizedBuffer{limit: gitSeedDiagnosticLimit}
+		lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
+			break
+		}
+		if err := sleepContext(ctx, retryDelay); err != nil {
+			lastErr = err
+			break
+		}
+	}
+	output, truncated := out.boundedString()
+	output = strings.TrimSpace(output)
+	if truncated && lastErr != nil {
+		lastErr = &gitOriginDiagnosticsTruncatedError{err: lastErr}
+	}
+	return output, lastErr
+}
+
 func isSSHCommandExitError(err error) bool {
 	var exitErr *exec.ExitError
 	return asExitError(err, &exitErr)
@@ -1873,9 +1916,8 @@ cleanup_seed() { rm -rf -- "$tmp"; rm -f -- "$transport_error"; }
 trap cleanup_seed EXIT
 printf 'crabbox-git-seed phase=clone\n'
 if ! origin_git clone --quiet --filter=blob:none --no-checkout --single-branch --branch ` + shellQuote(plan.Branch) + ` "$expected_origin" "$tmp" >/dev/null 2>"$transport_error"; then
-  if origin_transport_fallback "$transport_error" "$expected_origin"; then :; fi
   cat "$transport_error" >&2
-  exit 1
+  exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
 fi
 printf 'crabbox-git-seed phase=checkout\n'
 git -C "$tmp" checkout --quiet --detach ` + shellQuote(plan.Target) + `
@@ -1906,26 +1948,6 @@ func remoteGitOriginTransportFunctions() string {
       -c protocol.allow=never -c protocol.file.allow=always -c protocol.http.allow=always \
       -c protocol.https.allow=always -c protocol.ext.allow=never -c protocol.git.allow=never \
       -c protocol.ssh.allow=never "$@"
-}
-origin_transport_fallback() {
-  case "$2" in
-    http://*|https://*)
-      if /usr/bin/grep -Eiq 'authentication (failed|required)|could not read Username|unable to get password|terminal prompts disabled|access denied|permission denied|HTTP.*(401|403)|requested URL returned error: (401|403)|repository not found' "$1"; then
-        printf '%s%s\n' ` + shellQuote(gitOriginRuntimeFallbackMarker) + ` origin_auth_required >&2
-        exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
-      fi
-      if /usr/bin/grep -Eiq 'Could not resolve (host|proxy)|Could not resolve hostname|Failed to connect|Couldn.t connect to server|Connection (refused|timed out|reset by peer)|Operation timed out|Network is unreachable|No route to host|SSL certificate problem|server certificate verification failed|TLS connect error|SSL connect error|gnutls_handshake\(\) failed|Empty reply from server|Recv failure|Send failure|Failed sending data to the peer' "$1"; then
-        printf '%s%s\n' ` + shellQuote(gitOriginRuntimeFallbackMarker) + ` origin_unavailable >&2
-        exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
-      fi
-      return 1 ;;
-    *)
-      if /usr/bin/grep -Eiq 'does not appear to be a git repository|repository .* does not exist|No such file or directory|Permission denied|unable to access' "$1"; then
-        printf '%s%s\n' ` + shellQuote(gitOriginRuntimeFallbackMarker) + ` origin_unavailable >&2
-        exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
-      fi
-      return 1 ;;
-  esac
 }
 `
 }
@@ -2416,14 +2438,14 @@ coherence_committed=1
 }
 
 func runRemoteFinalizeSync(ctx context.Context, target SSHTarget, workdir string, opts remoteSyncFinalizeOptions) (string, error, string, bool) {
-	out, err := runIdempotentSSHCombinedOutput(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
-	reason, fallback := gitOriginRuntimeFallbackResult(out, err)
+	out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	reason, fallback := gitOriginRuntimeFallbackResult(opts.Coherence.RemoteURL, out, err)
 	if !fallback {
 		return out, err, "", false
 	}
 	opts.HydrateGit, opts.GitOverlay, opts.PlainManifest = false, false, true
 	opts.Fingerprint, opts.Coherence = "", gitCoherencePlan{}
-	out, err = runIdempotentSSHCombinedOutput(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	out, err = runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
 	return out, err, reason, true
 }
 
@@ -2488,8 +2510,9 @@ elif ! repair_origin; then
 	echo "remote sync finalize failed: Git origin repair failed" >&2; cleanup_finalize_lock; exit 67
 elif transport_error="$meta_dir/sync-fetch-error.$expected_token.$$"; ! origin_git fetch --quiet --no-tags "$expected_origin" "+refs/heads/$advertised_branch:$tmp_ref" 2>"$transport_error"; then
 	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true
-	if origin_transport_fallback "$transport_error" "$expected_origin"; then :; fi
-	echo "remote sync finalize failed: Git coherence fetch failed" >&2; cleanup_finalize_lock; exit 67
+	cat "$transport_error" >&2
+	cleanup_finalize_lock
+	exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
 elif ! git merge-base --is-ancestor ` + shellQuote(plan.Target) + ` "$tmp_ref" >/dev/null 2>&1; then
 	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: requested commit is not on advertised branch" >&2; cleanup_finalize_lock; exit 67
 elif [ "$(git rev-parse --verify ` + shellQuote(plan.Target+"^{tree}") + ` 2>/dev/null || true)" != ` + shellQuote(plan.Tree) + ` ]; then

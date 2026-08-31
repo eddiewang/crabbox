@@ -4,22 +4,31 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
 
 const (
 	gitOriginRuntimeFallbackExitCode = 78
-	gitOriginRuntimeFallbackMarker   = "CRABBOX_GIT_ORIGIN_FALLBACK:"
 	gitOverlayFallbackExitCode       = 78
 	gitOverlayFallbackMarker         = "CRABBOX_GIT_OVERLAY_FALLBACK:"
 	gitOverlayMutationMarker         = "CRABBOX_GIT_OVERLAY_WORKSPACE_MUTATED"
+)
+
+var (
+	gitOriginHTTPServerError = regexp.MustCompile(`(?i)(?:requested URL returned error:[[:space:]]*|HTTP(?:/[0-9.]+)?[[:space:]]+|HTTP code[[:space:]]*=[[:space:]]*)5[0-9][0-9]\b`)
+	gitOriginHTTPAuthError   = regexp.MustCompile(`(?i)authentication (?:failed|required)|could not read Username|unable to get password|terminal prompts disabled|access denied|permission denied|HTTP(?:/[0-9.]+)?[[:space:]]+(?:401|403)\b|requested URL returned error:[[:space:]]*(?:401|403)\b`)
+	gitOriginTransportError  = regexp.MustCompile(`(?i)Could not resolve (?:host|proxy)|Could not resolve hostname|Failed to connect|Couldn.t connect to server|Connection (?:refused|timed out|reset by peer)|Operation timed out|Network is unreachable|No route to host|SSL certificate problem|server certificate verification failed|TLS connect error|SSL connect error|gnutls_handshake\(\) failed|Empty reply from server|Recv failure|Send failure|Failed sending data to the peer`)
+	gitOriginHTTPNotFound    = regexp.MustCompile(`(?i)\brepository not found\b`)
+	gitOriginFilesystemError = regexp.MustCompile(`(?i)does not appear to be a git repository|repository .* does not exist|No such file or directory|Permission denied|unable to access`)
 )
 
 var gitOverlayTransformAttributes = []string{
@@ -371,17 +380,27 @@ func gitOverlayFallbackResult(output string, err error) (string, bool) {
 	return reason, fallback
 }
 
-func gitOriginRuntimeFallbackResult(output string, err error) (string, bool) {
+func gitOriginRuntimeFallbackResult(remoteURL, output string, err error) (string, bool) {
 	if err == nil || exitCode(err) != gitOriginRuntimeFallbackExitCode {
 		return "", false
 	}
-	for _, line := range strings.Split(output, "\n") {
-		switch strings.TrimSpace(line) {
-		case gitOriginRuntimeFallbackMarker + "origin_unavailable":
-			return "origin_unavailable", true
-		case gitOriginRuntimeFallbackMarker + "origin_auth_required":
-			return "origin_auth_required", true
-		}
+	var truncated *gitOriginDiagnosticsTruncatedError
+	if errors.As(err, &truncated) {
+		return "", false
+	}
+	parsed, parseErr := url.Parse(strings.TrimSpace(remoteURL))
+	isHTTP := parseErr == nil && (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https"))
+	switch {
+	case isHTTP && gitOriginHTTPAuthError.MatchString(output):
+		return "origin_auth_required", true
+	case isHTTP && gitOriginHTTPServerError.MatchString(output):
+		return "", false
+	case gitOriginTransportError.MatchString(output):
+		return "origin_unavailable", true
+	case isHTTP && gitOriginHTTPNotFound.MatchString(output):
+		return "origin_auth_required", true
+	case !isHTTP && gitOriginFilesystemError.MatchString(output):
+		return "origin_unavailable", true
 	}
 	return "", false
 }

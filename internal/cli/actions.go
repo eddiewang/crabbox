@@ -720,8 +720,8 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 		coherence = gitCoherencePlan{}
 	}
 	if !plainManifest && coherence.seedEnabled() {
-		if out, err := runIdempotentSSHCombinedOutputLimit(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay, gitSeedDiagnosticLimit); err != nil {
-			if reason, fallback := gitOriginRuntimeFallbackResult(out, err); fallback {
+		if out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
+			if reason, fallback := gitOriginRuntimeFallbackResult(coherence.RemoteURL, out, err); fallback {
 				plainManifest = true
 				coherence = gitCoherencePlan{}
 				fmt.Fprintf(a.Stderr, "git origin fallback reason=%s; using plain manifest sync\n", reason)
