@@ -515,6 +515,13 @@ function coordinatorDiagnosticSecrets(env: Env): Array<string | undefined> {
   ];
 }
 
+interface CheckpointLeaseAuthorization {
+  checkpoint: CoordinatorCheckpointRecord;
+  principal: CheckpointPrincipal;
+  token: string;
+  tokenHash: string;
+}
+
 interface PortalViewerPrincipalRecord extends CachedBridgeGrant {
   auth: AuthContext["auth"];
   admin: boolean;
@@ -3518,12 +3525,7 @@ export class FleetCoordinator {
     workspaceID?: string,
     workspaceCapability?: ProviderWorkspaceCapability,
     fixedLeaseID?: string,
-    checkpointAuthorization?: {
-      checkpoint: CoordinatorCheckpointRecord;
-      principal: CheckpointPrincipal;
-      token: string;
-      tokenHash: string;
-    },
+    checkpointAuthorization?: CheckpointLeaseAuthorization,
   ): Promise<Response> {
     const owner = requestOwner(request);
     const org = requestOrg(request, this.env);
@@ -3654,7 +3656,7 @@ export class FleetCoordinator {
           owner,
           org,
           fixedCreateIntentHash!,
-          checkpointAuthorization?.checkpoint.id,
+          checkpointAuthorization,
         );
       });
       if (replay) {
@@ -4105,7 +4107,7 @@ export class FleetCoordinator {
           owner,
           org,
           fixedCreateIntentHash!,
-          checkpointAuthorization?.checkpoint.id,
+          checkpointAuthorization,
         );
         if (replay) return replay;
       }
@@ -4677,8 +4679,9 @@ export class FleetCoordinator {
     owner: string,
     org: string,
     intentHash: string,
-    checkpointID?: string,
+    checkpointAuthorization?: CheckpointLeaseAuthorization,
   ): Promise<Response | undefined> {
+    const checkpointID = checkpointAuthorization?.checkpoint.id;
     const existing = await this.getLease(leaseID);
     const attempt = await this.getCreateAttempt(leaseID);
     if (createAttemptBlocksLeaseID(attempt) && (!checkpointID || !existing))
@@ -4701,6 +4704,20 @@ export class FleetCoordinator {
       );
     }
     if (checkpointID && attempt?.state === "canceled") return createCanceledResponse();
+    // Only the original attempt retains replay authority after claim consumption.
+    // Consume replacements before returning the lease, without releasing its provisioning fence.
+    if (
+      checkpointAuthorization &&
+      checkpointAuthorization.tokenHash !== attempt?.checkpointUseClaimHash
+    ) {
+      await finishCheckpointUse(
+        this.state.storage,
+        checkpointAuthorization.checkpoint.id,
+        checkpointAuthorization.token,
+        checkpointAuthorization.principal,
+        false,
+      );
+    }
     return json(
       { lease: publicLeaseRecord(existing) },
       { status: existing.state === "active" ? 200 : 202 },
@@ -14945,17 +14962,6 @@ export class FleetCoordinator {
         { checkpoint, principal, token, tokenHash: checkpointUseClaimHash },
       );
       if (fixedLeaseID && response.ok && response.status !== 201) {
-        // Replay may carry an already-consumed token or the original in-flight fence.
-        // Neither can be rebound or counted as another completed checkpoint use.
-        try {
-          await finishCheckpointUse(this.state.storage, checkpointID, token, principal, false);
-        } catch (error) {
-          if (
-            !(error instanceof CheckpointError) ||
-            !["checkpoint_claim_invalid", "checkpoint_in_use"].includes(error.code)
-          )
-            throw error;
-        }
         await this.scheduleCheckpointAlarm();
         return response;
       }

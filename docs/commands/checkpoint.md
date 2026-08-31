@@ -490,7 +490,9 @@ crabbox checkpoint fork --provider parallels --parallels-template ubuntu-fast --
   checkpoint backends support this checkpoint-bound contract. Managed forks bind the
   checkpoint incarnation and immutable image to the coordinator's fixed intent;
   replay preserves the original provisioning claim and does not advance checkpoint
-  usage again. An older coordinator rejects the dedicated fixed-checkpoint route
+  usage again. A replacement use claim must still be valid and available; replay
+  consumes it once. Only the exact original attempt claim can replay after its
+  consumption. An older coordinator rejects the dedicated fixed-checkpoint route
   without falling back to ordinary creation. A fresh CLI invocation still needs
   a valid use claim and refuses a deleted checkpoint; an in-request retry can
   recover its already-created child after source deletion. Archive checkpoints, direct Hetzner,
