@@ -103,6 +103,89 @@ func TestDaytonaFixedAcquisitionReplaysAndRetainsTerminalIdentity(t *testing.T) 
 	}
 }
 
+func TestDaytonaFixedReplayDoesNotNeedSourceSnapshot(t *testing.T) {
+	f, b, req := newFixedDaytonaFixture(t)
+	fork := core.NativeCheckpointForkRequest{Config: &b.cfg, Record: core.NativeCheckpointForkRecord{
+		Kind: core.CheckpointKindDaytona, ImageID: "snapshot-exact-id", Name: "test-snapshot", Direct: true,
+		Metadata: map[string]string{"api_url": b.cfg.Daytona.APIURL, "organization": "org-test", "checkpoint": req.RequestedCheckpointID,
+			"source": "source-sandbox", "snapshot_id": "snapshot-exact-id", "work_root": b.cfg.Daytona.WorkRoot, "user": "daytona"},
+	}}
+	if err := (Provider{}).ApplyNativeCheckpointForkConfig(fork); err != nil {
+		t.Fatal(err)
+	}
+	req.CheckpointSource = &fork.Record
+	first, err := b.Acquire(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := f.server.Config.Handler
+	f.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/snapshots/") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		original.ServeHTTP(w, r)
+	})
+	if err := (Provider{}).ApplyNativeCheckpointForkConfig(fork); err != nil {
+		t.Fatalf("fork configuration required the retired source: %v", err)
+	}
+	replayed, err := b.Acquire(t.Context(), req)
+	if err != nil || replayed.Server.CloudID != first.Server.CloudID || fixedDaytonaCreateCount(f) != 1 {
+		t.Fatalf("source snapshot retirement prevented exact sandbox replay: resource=%s creates=%d err=%v", replayed.Server.CloudID, fixedDaytonaCreateCount(f), err)
+	}
+	fork.Record.Name = "changed-record"
+	if _, err := b.Acquire(t.Context(), req); err == nil || !strings.Contains(err.Error(), "checkpoint source does not match") || fixedDaytonaCreateCount(f) != 1 {
+		t.Fatalf("replay accepted a different source record: %v", err)
+	}
+}
+
+func TestDaytonaNativeForkAttestsSourceBeforeAllocation(t *testing.T) {
+	for _, fixed := range []bool{false, true} {
+		for _, drift := range []string{"none", "id", "name", "organization", "general", "state"} {
+			t.Run(fmt.Sprintf("fixed=%t/%s", fixed, drift), func(t *testing.T) {
+				f, b, req := newFixedDaytonaFixture(t)
+				if !fixed {
+					req.RequestedLeaseID, req.RequestedCheckpointID = "", ""
+				}
+				req.CheckpointSource = &core.NativeCheckpointForkRecord{ImageID: "snapshot-exact-id", Name: "test-snapshot",
+					Metadata: map[string]string{"organization": "org-test"}}
+				snapshot := &api.SnapshotDto{Id: "snapshot-exact-id", Name: "test-snapshot", State: api.SNAPSHOTSTATE_ACTIVE, Entrypoint: []string{}}
+				snapshot.SetOrganizationId("org-test")
+				switch drift {
+				case "id":
+					snapshot.Id = "replacement-id"
+				case "name":
+					snapshot.Name = "replacement-name"
+				case "organization":
+					snapshot.SetOrganizationId("other-org")
+				case "general":
+					snapshot.SetGeneral(true)
+				case "state":
+					snapshot.State = api.SNAPSHOTSTATE_PENDING
+				}
+				original := f.server.Config.Handler
+				f.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if strings.HasPrefix(r.URL.Path, "/snapshots/") {
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(snapshot)
+						return
+					}
+					original.ServeHTTP(w, r)
+				})
+				_, err := b.Acquire(t.Context(), req)
+				if drift == "none" {
+					if err != nil || fixedDaytonaCreateCount(f) != 1 || f.create.GetSnapshot() != req.CheckpointSource.ImageID {
+						t.Fatalf("exact source did not reach pinned allocation: creates=%d snapshot=%s err=%v", fixedDaytonaCreateCount(f), f.create.GetSnapshot(), err)
+					}
+				} else if err == nil || fixedDaytonaCreateCount(f) != 0 {
+					t.Fatalf("unattested native source reached allocation: creates=%d err=%v", fixedDaytonaCreateCount(f), err)
+				}
+			})
+		}
+	}
+}
+
 func TestDaytonaFixedLostCreateResponseNeverResubmits(t *testing.T) {
 	f, b, req := newFixedDaytonaFixture(t)
 	f.lostCreate = true

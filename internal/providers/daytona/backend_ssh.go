@@ -94,7 +94,7 @@ func (b *daytonaLeaseBackend) Acquire(ctx context.Context, req AcquireRequest) (
 	if req.RequestedLeaseID != "" {
 		return b.acquireFixed(ctx, req)
 	}
-	sandbox, leaseID, slug, err := b.createDaytonaSandbox(ctx, req.Repo, req.Keep, req.Reclaim, req.RequestedSlug)
+	sandbox, leaseID, slug, err := b.createDaytonaSandbox(ctx, req)
 	if err != nil {
 		return LeaseTarget{}, err
 	}

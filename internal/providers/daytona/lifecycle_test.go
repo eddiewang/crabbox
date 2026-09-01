@@ -306,7 +306,7 @@ func TestDaytonaAllocationRecoveryIsBounded(t *testing.T) {
 
 func TestDaytonaDeleteWaitsForAlreadyDestroyingSandbox(t *testing.T) {
 	f, b, repo := newDaytonaLifecycleFixture(t)
-	sandbox, leaseID, _, err := b.createDaytonaSandbox(t.Context(), repo, true, false, "")
+	sandbox, leaseID, _, err := b.createDaytonaSandbox(t.Context(), AcquireRequest{Repo: repo, Keep: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +349,7 @@ func TestDaytonaReadinessIgnoresStaleLabels(t *testing.T) {
 
 func TestDaytonaHeartbeatUpdatesProviderAndLabels(t *testing.T) {
 	f, b, repo := newDaytonaLifecycleFixture(t)
-	sandbox, leaseID, _, err := b.createDaytonaSandbox(t.Context(), repo, true, false, "")
+	sandbox, leaseID, _, err := b.createDaytonaSandbox(t.Context(), AcquireRequest{Repo: repo, Keep: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestDaytonaHeartbeatUpdatesProviderAndLabels(t *testing.T) {
 
 func TestDaytonaHeartbeatPolicyFailureDoesNotPublishNewTimeout(t *testing.T) {
 	f, b, repo := newDaytonaLifecycleFixture(t)
-	sandbox, leaseID, _, err := b.createDaytonaSandbox(t.Context(), repo, true, false, "")
+	sandbox, leaseID, _, err := b.createDaytonaSandbox(t.Context(), AcquireRequest{Repo: repo, Keep: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestDaytonaHeartbeatPolicyFailureDoesNotPublishNewTimeout(t *testing.T) {
 
 func TestDaytonaStatusWaitFailsOnTerminalProviderState(t *testing.T) {
 	f, b, repo := newDaytonaLifecycleFixture(t)
-	_, leaseID, _, err := b.createDaytonaSandbox(t.Context(), repo, true, false, "")
+	_, leaseID, _, err := b.createDaytonaSandbox(t.Context(), AcquireRequest{Repo: repo, Keep: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +404,7 @@ func TestDaytonaStatusWaitFailsOnTerminalProviderState(t *testing.T) {
 
 func TestDaytonaActivityRefreshStopsWithRun(t *testing.T) {
 	f, b, repo := newDaytonaLifecycleFixture(t)
-	sandbox, _, _, err := b.createDaytonaSandbox(t.Context(), repo, true, false, "")
+	sandbox, _, _, err := b.createDaytonaSandbox(t.Context(), AcquireRequest{Repo: repo, Keep: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +550,7 @@ func TestDaytonaRunFiltersProviderCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := map[string]string{"SAFE_ENV": "value", "CRABBOX_RUN_ID": "run-fixture"}
-	for _, key := range []string{"DAYTONA_API_KEY", "CRABBOX_DAYTONA_API_KEY", "DAYTONA_JWT_TOKEN", "CRABBOX_DAYTONA_JWT_TOKEN", "CRABBOX_COORDINATOR_TOKEN"} {
+	for _, key := range []string{"DAYTONA_API_KEY", "CRABBOX_DAYTONA_API_KEY", "DAYTONA_CRABBOX_KEY", "DAYTONA_JWT_TOKEN", "CRABBOX_DAYTONA_JWT_TOKEN", "CRABBOX_COORDINATOR_TOKEN"} {
 		input[key] = "synthetic-control-credential"
 	}
 	if _, err := b.Run(t.Context(), RunRequest{ID: leaseID, Repo: repo, NoSync: true, Command: []string{"true"}, Env: input}); err != nil {
@@ -560,7 +560,7 @@ func TestDaytonaRunFiltersProviderCredentials(t *testing.T) {
 	if len(env) != 2 || env["SAFE_ENV"] != "value" || env["CRABBOX_RUN_ID"] != "run-fixture" {
 		t.Fatalf("provider credentials were forwarded or command metadata lost: names=%v", reflect.ValueOf(env).MapKeys())
 	}
-	if len(input) != 7 {
+	if len(input) != 8 {
 		t.Fatal("request environment was mutated")
 	}
 }

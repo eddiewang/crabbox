@@ -90,13 +90,27 @@ func daytonaCreateBody(cfg Config, leaseID, slug string, keep bool, now time.Tim
 	return body
 }
 
-func (b *daytonaLeaseBackend) createDaytonaSandbox(ctx context.Context, repo Repo, keep, reclaim bool, requestedSlug string) (sandbox *daytona.Sandbox, leaseID, slug string, err error) {
+func (b *daytonaLeaseBackend) createDaytonaSandbox(ctx context.Context, req AcquireRequest) (sandbox *daytona.Sandbox, leaseID, slug string, err error) {
+	repo, keep, reclaim, requestedSlug := req.Repo, req.Keep, req.Reclaim, req.RequestedSlug
 	if err := validateDaytonaCreateConfig(b.cfg); err != nil {
 		return nil, "", "", err
 	}
 	client, err := newDaytonaClient(b.cfg, b.rt)
 	if err != nil {
 		return nil, "", "", err
+	}
+	if req.CheckpointSource != nil {
+		snapshots, ok := client.(daytonaSnapshotAPI)
+		if !ok {
+			return nil, "", "", errors.New("Daytona client does not support snapshots")
+		}
+		snapshot, err := snapshots.GetSnapshot(ctx, req.CheckpointSource.ImageID)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if err := validateDaytonaForkSnapshot(snapshot, req.CheckpointSource); err != nil {
+			return nil, "", "", err
+		}
 	}
 	existing, err := client.ListCrabboxSandboxes(ctx)
 	if err != nil {
@@ -108,6 +122,9 @@ func (b *daytonaLeaseBackend) createDaytonaSandbox(ctx context.Context, repo Rep
 		return nil, "", "", err
 	}
 	cfg := b.cfg
+	if req.CheckpointSource != nil {
+		cfg.Daytona.Snapshot = req.CheckpointSource.ImageID
+	}
 	cfg.ServerType, cfg.WorkRoot, cfg.SSHUser, cfg.SSHPort = "snapshot", daytonaWorkRoot(cfg), daytonaUser(cfg), "22"
 	body := daytonaCreateBody(cfg, leaseID, slug, keep, time.Now().UTC())
 	labels := body.GetLabels()

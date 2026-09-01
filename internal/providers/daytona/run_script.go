@@ -62,7 +62,7 @@ func daytonaCommandEnv(input map[string]string) (map[string]string, []string) {
 	var stripped []string
 	for name, value := range input {
 		switch strings.ToUpper(strings.TrimSpace(name)) {
-		case "DAYTONA_API_KEY", "CRABBOX_DAYTONA_API_KEY", "DAYTONA_JWT_TOKEN", "CRABBOX_DAYTONA_JWT_TOKEN",
+		case "DAYTONA_API_KEY", "CRABBOX_DAYTONA_API_KEY", "DAYTONA_CRABBOX_KEY", "DAYTONA_JWT_TOKEN", "CRABBOX_DAYTONA_JWT_TOKEN",
 			"DAYTONA_ORGANIZATION_ID", "CRABBOX_DAYTONA_ORGANIZATION_ID", "CRABBOX_COORDINATOR_TOKEN":
 			stripped = append(stripped, name)
 		default:

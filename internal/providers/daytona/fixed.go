@@ -23,9 +23,9 @@ func (b *daytonaLeaseBackend) SupportsRequestedCheckpointID() bool {
 }
 
 func (c *daytonaSDKClient) fixedContext() (string, string) {
-	// API keys can select an organization without an explicit organization header.
-	// Bind credentials without storing them; compare any explicit organization
-	// against the provider-returned organization even when a resource is absent.
+	// API keys are bound to their issuing organization, even without a header.
+	// Hash the exact client's credentials; also bind explicit organization headers
+	// so a missing resource cannot hide a changed authentication context.
 	data, _ := json.Marshal([]string{c.apiURL, c.token})
 	return fmt.Sprintf("daytona:context:v1:%x", sha256.Sum256(data)), c.orgID
 }
@@ -65,21 +65,41 @@ func (b *daytonaLeaseBackend) acquireFixed(ctx context.Context, req AcquireReque
 			return core.FixedLeaseBinding{}, exit(4, "lease_id_conflict: Daytona API, organization, or credential context changed")
 		}
 		var err error
-		snapshot, err = client.GetSnapshot(ctx, strings.TrimSpace(cfg.Daytona.Snapshot))
-		if err != nil {
-			return core.FixedLeaseBinding{}, err
+		snapshotID := ""
+		if exists {
+			// A submitted attempt pins its immutable source. Its sandbox remains
+			// replayable after that source snapshot is retired or becomes unavailable.
+			snapshotID = claim.FixedCreateIntent.Attempt["snapshot_id"]
+			if source := req.CheckpointSource; source != nil && snapshotID != "" {
+				attempt := claim.FixedCreateIntent.Attempt
+				if snapshotID != source.ImageID || attempt["snapshot"] != source.Name || attempt["organization"] != source.Metadata["organization"] {
+					return core.FixedLeaseBinding{}, exit(4, "lease_id_conflict: Daytona checkpoint source does not match the fixed create attempt")
+				}
+			}
 		}
-		if snapshot == nil || snapshot.GetId() == "" || snapshot.GetName() == "" || snapshot.GetState() != api.SNAPSHOTSTATE_ACTIVE {
-			return core.FixedLeaseBinding{}, exit(4, "Daytona fixed acquisition requires an active, identified snapshot")
-		}
-		if organization != "" && !snapshot.GetGeneral() && snapshot.GetOrganizationId() != organization {
-			return core.FixedLeaseBinding{}, exit(4, "Daytona snapshot organization mismatch")
+		if snapshotID == "" {
+			snapshot, err = client.GetSnapshot(ctx, strings.TrimSpace(cfg.Daytona.Snapshot))
+			if err != nil {
+				return core.FixedLeaseBinding{}, err
+			}
+			if snapshot == nil || snapshot.GetId() == "" || snapshot.GetName() == "" || snapshot.GetState() != api.SNAPSHOTSTATE_ACTIVE {
+				return core.FixedLeaseBinding{}, exit(4, "Daytona fixed acquisition requires an active, identified snapshot")
+			}
+			if organization != "" && !snapshot.GetGeneral() && snapshot.GetOrganizationId() != organization {
+				return core.FixedLeaseBinding{}, exit(4, "Daytona snapshot organization mismatch")
+			}
+			if req.CheckpointSource != nil {
+				if err := validateDaytonaForkSnapshot(snapshot, req.CheckpointSource); err != nil {
+					return core.FixedLeaseBinding{}, err
+				}
+			}
+			snapshotID = snapshot.GetId()
 		}
 		data, err := json.Marshal(struct {
 			Snapshot, Selector, User, Target, WorkRoot, Slug string
 			Keep                                             bool
 			TTL, Idle                                        time.Duration
-		}{snapshot.GetId(), cfg.Daytona.Snapshot, daytonaUser(cfg), cfg.Daytona.Target, daytonaWorkRoot(cfg), normalizeLeaseSlug(req.RequestedSlug), req.Keep, cfg.TTL, cfg.IdleTimeout})
+		}{snapshotID, cfg.Daytona.Snapshot, daytonaUser(cfg), cfg.Daytona.Target, daytonaWorkRoot(cfg), normalizeLeaseSlug(req.RequestedSlug), req.Keep, cfg.TTL, cfg.IdleTimeout})
 		if err != nil {
 			return core.FixedLeaseBinding{}, err
 		}

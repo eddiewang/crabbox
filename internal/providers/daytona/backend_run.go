@@ -330,7 +330,7 @@ func (b *daytonaLeaseBackend) Stop(ctx context.Context, req StopRequest) error {
 }
 
 func (b *daytonaLeaseBackend) createDaytonaToolboxSandbox(ctx context.Context, repo Repo, keep, reclaim bool, requestedSlug string) (*sdkdaytona.Sandbox, string, string, error) {
-	sandbox, leaseID, slug, err := b.createDaytonaSandbox(ctx, repo, keep, reclaim, requestedSlug)
+	sandbox, leaseID, slug, err := b.createDaytonaSandbox(ctx, AcquireRequest{Repo: repo, Keep: keep, Reclaim: reclaim, RequestedSlug: requestedSlug})
 	if err != nil {
 		return nil, leaseID, slug, err
 	}

@@ -943,7 +943,9 @@ type AcquireRequest struct {
 	Reclaim               bool
 	RequestedLeaseID      string
 	RequestedCheckpointID string
-	RequestedSlug         string
+	// CheckpointSource carries the recorded native image identity to its allocation owner.
+	CheckpointSource *NativeCheckpointForkRecord
+	RequestedSlug    string
 	// OnAcquired observes a fully validated raw provider identity before local
 	// routing, readiness, or claim side effects. Returning an error requires the
 	// provider adapter to roll back the acquired resource.

@@ -343,26 +343,26 @@ func (Provider) DeleteNativeCheckpoint(ctx context.Context, req core.NativeCheck
 	}
 }
 
+func validateDaytonaForkSnapshot(snapshot *api.SnapshotDto, source *core.NativeCheckpointForkRecord) error {
+	if snapshot == nil || snapshot.GetId() != source.ImageID || snapshot.GetName() != source.Name ||
+		snapshot.GetOrganizationId() != source.Metadata["organization"] || snapshot.GetGeneral() {
+		return exit(4, "Daytona snapshot ownership mismatch")
+	}
+	if snapshot.GetState() != api.SNAPSHOTSTATE_ACTIVE {
+		return exit(2, "Daytona snapshot %s is not active: state=%s", snapshot.GetName(), snapshot.GetState())
+	}
+	return nil
+}
+
 func (Provider) ApplyNativeCheckpointForkConfig(req core.NativeCheckpointForkRequest) error {
 	resource := core.NativeCheckpointResourceRequest{LoadConfig: func() (Config, error) { return *req.Config, nil }, Image: core.NativeCheckpointImage{ID: req.Record.ImageID, Name: req.Record.Name, Provider: daytonaProvider, Kind: req.Record.Kind, Direct: req.Record.Direct}, Metadata: req.Record.Metadata}
 	cfg, err := daytonaCheckpointConfig(resource)
 	if err != nil {
 		return err
 	}
-	client, err := snapshotClient(cfg, core.RuntimeForProviderOperation(nil))
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	snap, err := loadDaytonaCheckpoint(ctx, client, resource)
-	if err != nil {
-		return err
-	}
-	if snap.GetState() != api.SNAPSHOTSTATE_ACTIVE {
-		return exit(2, "Daytona snapshot %s is not active: state=%s", snap.GetName(), snap.GetState())
-	}
-	cfg.Daytona.Snapshot = snap.GetId()
+	// Allocation owns live source validation; replay owns the recorded attempt.
+	// Config binding must not make an existing sandbox depend on a retired image.
+	cfg.Daytona.Snapshot = req.Record.ImageID
 	cfg.Daytona.Target = req.Record.Metadata["target"]
 	cfg.Daytona.User = req.Record.Metadata["user"]
 	cfg.Daytona.WorkRoot = req.Record.Metadata["work_root"]
