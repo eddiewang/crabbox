@@ -50,6 +50,8 @@ func TestCheckpointCaptureBuiltBinaryContract(t *testing.T) {
 		t.Fatalf("build fake provider: %v\n%s", err, output)
 	}
 
+	runCheckpointAbandonContract(t, repo, binary)
+
 	for _, boundary := range []string{"flush", "stopped"} {
 		t.Run("ordinary failure before submission releases reservation after "+boundary, func(t *testing.T) {
 			f := newCheckpointCaptureFixture(t, repo, binary)
