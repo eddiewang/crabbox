@@ -186,6 +186,8 @@ jobs:
         shell: pwsh
         run: |
           $required = @(
+            'TestWindowsSSHStdinReaderBehavior',
+            'TestWindowsWitnessRedirectedStdinUploadBehavior',
             'TestWSLStageLauncherVerifiesAndConsumesReadyFile',
             'TestWSLStageLauncherRejectsCorruptOrNonFileStage',
             'TestWSLStageLauncherRejectsSameNonceValidReplacement',
