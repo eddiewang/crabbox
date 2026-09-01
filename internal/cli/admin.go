@@ -735,5 +735,9 @@ func configuredAdminCoordinator() (*CoordinatorClient, error) {
 	if !ok {
 		return nil, exit(2, "admin command requires a configured coordinator")
 	}
+	// Reject missing credentials before callers perform guest-side preparation.
+	if !coord.hasConfiguredAuth() {
+		return nil, exit(2, "admin command requires broker authentication; run crabbox login or configure broker credentials")
+	}
 	return coord, nil
 }

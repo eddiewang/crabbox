@@ -16,11 +16,13 @@ import (
 
 func TestAdminLeasesUsesConfiguredAuthorization(t *testing.T) {
 	for _, tt := range []struct {
-		name         string
-		tokenCommand bool
-		adminToken   string
-		responseCode int
+		name          string
+		noCredentials bool
+		tokenCommand  bool
+		adminToken    string
+		responseCode  int
 	}{
+		{name: "missing broker credentials", noCredentials: true, responseCode: http.StatusOK},
 		{name: "configured session", responseCode: http.StatusOK},
 		{name: "configured token command", tokenCommand: true, responseCode: http.StatusOK},
 		{name: "explicit admin token overrides session", adminToken: "explicit-admin", responseCode: http.StatusOK},
@@ -52,6 +54,9 @@ func TestAdminLeasesUsesConfiguredAuthorization(t *testing.T) {
 			}))
 			defer server.Close()
 			broker := map[string]any{"url": server.URL, "token": "configured-session"}
+			if tt.noCredentials {
+				delete(broker, "token")
+			}
 			if tt.tokenCommand {
 				broker["token"] = "superseded-session"
 				command := []string{os.Args[0], "-test.run=^TestCoordinatorTokenCommandHelper$"}
@@ -81,6 +86,16 @@ func TestAdminLeasesUsesConfiguredAuthorization(t *testing.T) {
 			t.Setenv("CRABBOX_CONFIG", configPath)
 			app := App{Stdout: io.Discard, Stderr: io.Discard}
 			err = app.adminLeases(context.Background(), []string{"--json"})
+			if tt.noCredentials {
+				var exitErr ExitError
+				if !errors.As(err, &exitErr) || exitErr.Code != 2 || !strings.Contains(err.Error(), "broker authentication") {
+					t.Errorf("err=%v, want missing broker authentication before request", err)
+				}
+				if requests != 0 {
+					t.Errorf("requests=%d, want no unauthenticated admin request", requests)
+				}
+				return
+			}
 			if tt.responseCode == http.StatusForbidden {
 				var httpErr CoordinatorHTTPError
 				if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusForbidden {
