@@ -234,6 +234,11 @@ development endpoints.
 - SSH: yes, via a short-lived Daytona SSH access token.
 - Sync: direct mode uses Daytona toolbox archive sync; brokered mode uses normal
   Crabbox rsync over SSH.
+- Scripts: direct mode accepts `--script` and `--script-stdin`, including with
+  `--no-sync`. Bytes upload through the toolbox file API into private staging,
+  then publish atomically under `.crabbox/scripts/`. The standalone copy remains
+  on the lease after execution. Shebangs and literal trailing arguments are
+  honored; scripts without a shebang use bash. PWD is the lease workdir.
 - Desktop / browser / code: no — Daytona has no Crabbox VNC or `code` surface.
 - Actions hydration: no.
 - Coordinator (broker): yes for Linux SSH/sync/run. The coordinator owns the
@@ -254,7 +259,7 @@ development endpoints.
 - Daytona `run` is delegated to the toolbox APIs; it is not core-over-SSH
   execution. Because of that, the following `run` options are rejected:
   `--checksum`, `--full-resync`,
-  `--fresh-pr`, `--script` / `--script-stdin`, `--env-helper`,
+  `--fresh-pr`, `--env-helper`,
   `--capture-stdout` / `--capture-stderr`, `--capture-on-fail`, `--download`,
   `--artifact-glob`, `--require-artifact`, `--emit-proof`, and `--stop-after`.
 - Use `--sync-only` to pre-upload the archive into a kept sandbox before a later
@@ -263,6 +268,10 @@ development endpoints.
 - `--actions-runner` is rejected because it needs a normal SSH lease host.
 - `--keep-on-failure` keeps a newly created failed sandbox until Daytona
   auto-stop or an explicit `crabbox stop`.
+- Command environment values travel through the toolbox request body. Daytona
+  API-key, JWT, organization, and Crabbox coordinator-token variables are removed
+  even when explicitly selected by `--allow-env`; other allowed values and run
+  identity metadata are preserved.
 
 ## Related docs
 

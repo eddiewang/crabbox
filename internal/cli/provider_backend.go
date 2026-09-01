@@ -672,6 +672,7 @@ const (
 	FeatureRunSession   Feature = "run-session"
 	FeatureRunArtifacts Feature = "run-artifacts"
 	FeatureRunDownloads Feature = "run-downloads"
+	FeatureRunScript    Feature = "run-script"
 	FeatureModuleRun    Feature = "module-run"
 	FeaturePauseResume  Feature = "pause-resume"
 	FeatureMCP          Feature = "mcp-attachments"
@@ -1833,7 +1834,7 @@ func rejectDelegatedSyncOptionsForSpec(spec ProviderSpec, req RunRequest) error 
 	if req.StopAfter != "" {
 		return exit(2, "%s delegates run execution; --stop-after is not supported", provider)
 	}
-	if (req.Script != nil || req.ScriptRequested) && !moduleRun {
+	if (req.Script != nil || req.ScriptRequested) && !moduleRun && !spec.Features.Has(FeatureRunScript) {
 		return exit(2, "%s delegates run execution; --script is not supported", provider)
 	}
 	if moduleRun && len(req.Command) > 0 {

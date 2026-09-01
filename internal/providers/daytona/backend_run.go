@@ -187,13 +187,25 @@ func (b *daytonaLeaseBackend) Run(ctx context.Context, req RunRequest) (result R
 		return result, nil
 	}
 	command := daytonaCommandString(req.Command, req.ShellMode)
+	commandDisplay := strings.Join(req.Command, " ")
+	if req.Script != nil {
+		if err := uploadDaytonaRunScript(ctx, sandbox, commands, workdir, req.Script); err != nil {
+			return RunResult{Total: time.Since(started), SyncDelegated: true}, err
+		}
+		command = core.POSIXRunScriptCommand(req.Script, req.Command)
+		commandDisplay = "--script=" + req.Script.Source
+	}
 	if command == "" {
 		return RunResult{}, exit(2, "missing command")
 	}
 	commandStarted := time.Now()
-	fmt.Fprintf(b.rt.Stderr, "running on daytona %s\n", strings.Join(req.Command, " "))
+	fmt.Fprintf(b.rt.Stderr, "running on daytona %s\n", commandDisplay)
 	execOpts := []func(*sdkoptions.ExecuteCommand){sdkoptions.WithCwd(workdir)}
-	if env := req.Env; len(env) > 0 {
+	env, stripped := daytonaCommandEnv(req.Env)
+	if len(stripped) > 0 {
+		fmt.Fprintf(b.rt.Stderr, "warning: daytona did not forward provider authentication variables: %s\n", strings.Join(stripped, ","))
+	}
+	if len(env) > 0 {
 		execOpts = append(execOpts, sdkoptions.WithCommandEnv(env))
 	}
 	response, err := commands.ExecuteCommand(ctx, command, execOpts...)
