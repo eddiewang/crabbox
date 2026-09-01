@@ -717,10 +717,11 @@ measured request, network-readiness, or bootstrap timing. It does not infer
 provider-internal timings. Delegated providers expose known sync and command
 time and place only unmeasured time inside the delegated provider call in
 `delegated.opaque`; Crabbox-owned follow-up work is `unattributed`. The final
-JSON record follows receipts and cleanup, including when a post-command
-download or artifact-glob collection fails. Phase identity fields and artifact
-transfer counts or bytes appear only when the underlying run already has those
-values.
+JSON record follows cleanup and the failure digest, then terminal receipt
+finalization runs with any timing-record failure included in its outcome. This
+ordering also applies when a post-command download or artifact-glob collection
+fails. Phase identity fields and artifact transfer counts or bytes appear only
+when the underlying run already has those values.
 Commands can emit
 phase markers on stdout or stderr as
 `CRABBOX_PHASE:<name>`; Crabbox records those as `commandPhases` without removing

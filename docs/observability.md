@@ -169,8 +169,9 @@ Retained resources and accepted but pending, failed, retry-scheduled, or otherwi
 unconfirmed cleanup report false and preserve failure recovery guidance. False
 does not certify a running or reachable resource. `leaseStopError` reports cleanup
 errors separately and may be present even after confirmed removal, for example
-when local finalization fails. Run finalization emits timing after cleanup and
-the failure digest; a failing CLI invocation can append its normal exit diagnostic.
+when local finalization fails. Run finalization emits the failure digest and
+timing after cleanup, then finalizes the terminal receipt; a failing CLI
+invocation can append its normal exit diagnostic.
 
 `runnerPhases` is the sum-safe lifecycle view. Its positive-duration entries
 are mutually exclusive and add up to `runnerTotalMs`; any observed time that
@@ -179,9 +180,10 @@ Provider acquire or pool borrow, provider/SSH readiness, workspace seed and
 overlay, command, artifacts, and cleanup appear when Crabbox observes them.
 Unmeasured time inside a delegated provider call is named `delegated.opaque`;
 Crabbox-owned follow-up work is `unattributed`. The final JSON record is written
-after receipts and cleanup, including when post-command downloads or artifact
-globs fail. The older `leaseMs`, `bootstrapMs`, `syncMs`, `syncPhases`,
-`commandMs`, and `commandPhases` fields remain unchanged for compatibility.
+after cleanup and before terminal receipt finalization, including when
+post-command downloads or artifact globs fail. The older `leaseMs`,
+`bootstrapMs`, `syncMs`, `syncPhases`, `commandMs`, and `commandPhases` fields
+remain unchanged for compatibility.
 
 Commands can define their own phases by printing marker lines to stdout or
 stderr:

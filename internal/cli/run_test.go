@@ -426,7 +426,7 @@ func assertSSHLogContains(t *testing.T, logPath, want string) {
 	}
 }
 
-func requireArtifactFailureTimingAfterReceipt(t *testing.T, stderr string) TimingReport {
+func requireArtifactFailureTimingBeforeReceipt(t *testing.T, stderr string) TimingReport {
 	t.Helper()
 	lines := strings.Split(strings.TrimSpace(stderr), "\n")
 	var (
@@ -442,8 +442,8 @@ func requireArtifactFailureTimingAfterReceipt(t *testing.T, stderr string) Timin
 			jsonCount++
 		}
 	}
-	if jsonCount != 1 || jsonLine != lines[len(lines)-1] {
-		t.Fatalf("timing JSON count=%d final=%t\nstderr:\n%s", jsonCount, jsonLine == lines[len(lines)-1], stderr)
+	if jsonCount != 1 {
+		t.Fatalf("timing JSON count=%d, want one\nstderr:\n%s", jsonCount, stderr)
 	}
 	if report.ExitCode != 7 {
 		t.Fatalf("timing exitCode=%d, want 7\nreport=%#v", report.ExitCode, report)
@@ -455,8 +455,8 @@ func requireArtifactFailureTimingAfterReceipt(t *testing.T, stderr string) Timin
 	if !artifactTiming {
 		t.Fatalf("missing artifact timing: %#v", report.RunnerPhases)
 	}
-	if receiptIndex, jsonIndex := strings.LastIndex(stderr, "artifact kind=receipt"), strings.LastIndex(stderr, jsonLine); receiptIndex < 0 || jsonIndex <= receiptIndex {
-		t.Fatalf("receipt was not written before timing JSON:\n%s", stderr)
+	if jsonIndex, receiptIndex := strings.LastIndex(stderr, jsonLine), strings.LastIndex(stderr, "artifact kind=receipt"); jsonIndex < 0 || receiptIndex <= jsonIndex {
+		t.Fatalf("receipt was not written after timing JSON:\n%s", stderr)
 	}
 	return report
 }
@@ -4019,11 +4019,11 @@ func TestRunCommandTerminalReceiptIncludesLateTimingRecordFailure(t *testing.T) 
 			jsonCount++
 		}
 	}
-	if jsonCount != 1 || jsonLine != lines[len(lines)-1] || report.ExitCode != 2 {
-		t.Fatalf("timing JSON count=%d final=%t exit=%d, want one final exit 2 report\nstderr:\n%s", jsonCount, jsonLine == lines[len(lines)-1], report.ExitCode, stderr.String())
+	if jsonCount != 1 || report.ExitCode != 2 {
+		t.Fatalf("timing JSON count=%d exit=%d, want one exit 2 report\nstderr:\n%s", jsonCount, report.ExitCode, stderr.String())
 	}
-	if receiptIndex, jsonIndex := strings.LastIndex(stderr.String(), "artifact kind=receipt"), strings.LastIndex(stderr.String(), jsonLine); receiptIndex < 0 || jsonIndex <= receiptIndex {
-		t.Fatalf("receipt was not written before final timing JSON:\n%s", stderr.String())
+	if jsonIndex, receiptIndex := strings.LastIndex(stderr.String(), jsonLine), strings.LastIndex(stderr.String(), "artifact kind=receipt"); jsonIndex < 0 || receiptIndex <= jsonIndex {
+		t.Fatalf("receipt was not written after timing JSON:\n%s", stderr.String())
 	}
 }
 
@@ -4228,7 +4228,7 @@ exit 0
 	if receipt.ExitCode != 7 {
 		t.Fatalf("receipt exit=%d want=7 run error=%v", receipt.ExitCode, err)
 	}
-	requireArtifactFailureTimingAfterReceipt(t, stderr.String())
+	requireArtifactFailureTimingBeforeReceipt(t, stderr.String())
 }
 
 func TestRunCommandWritesTimingWhenPostCommandArtifactGlobFails(t *testing.T) {
@@ -4290,7 +4290,7 @@ exit 0
 	if receipt.ExitCode != 7 {
 		t.Fatalf("receipt exit=%d want=7 run error=%v", receipt.ExitCode, err)
 	}
-	requireArtifactFailureTimingAfterReceipt(t, stderr.String())
+	requireArtifactFailureTimingBeforeReceipt(t, stderr.String())
 }
 
 func TestRunCommandMacOSMissingRequiredArtifactE2E(t *testing.T) {

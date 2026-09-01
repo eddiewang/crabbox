@@ -500,6 +500,14 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 		return finalizeTimingReport(report), true
 	}
 	defer func() {
+		recorder.Failed(runFailure)
+	}()
+	defer func() {
+		if finalizeTerminalRun != nil {
+			finalizeTerminalRun()
+		}
+	}()
+	defer func() {
 		if !*timingJSON {
 			return
 		}
@@ -508,26 +516,11 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			return
 		}
 		if writeErr := writeTimingJSON(a.Stderr, report); writeErr != nil && err == nil {
-			// The terminal receipt is already finalized when this defer runs so
-			// timing JSON stays last. Do not rewrite an attested command result
-			// because its final output sink failed afterward.
+			// Receipt-bearing and coordinator-recorded runs preserve the command
+			// outcome when this late output sink fails before terminal finalization.
 			if !terminalReceiptExpected && recorder.runID == "" {
 				err = writeErr
 			}
-		}
-	}()
-	defer func() {
-		recorder.Failed(runFailure)
-	}()
-	// Cleanup runs first; the final timing JSON must still be the last line.
-	defer func() {
-		if finalizeFailureDigest != nil {
-			finalizeFailureDigest()
-		}
-	}()
-	defer func() {
-		if finalizeTerminalRun != nil {
-			finalizeTerminalRun()
 		}
 	}()
 	defer func() {
@@ -551,6 +544,11 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 				benchmarkCtx.OnRecord()
 			}
 			fmt.Fprintf(a.Stderr, "benchmark timing record appended path=%s observations=1\n", timingRecordPath)
+		}
+	}()
+	defer func() {
+		if finalizeFailureDigest != nil {
+			finalizeFailureDigest()
 		}
 	}()
 	command := fs.Args()
