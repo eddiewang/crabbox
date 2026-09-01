@@ -144,6 +144,14 @@ Retention defaults to manual. Explicit expiry rejects direct, archive, recipe,
 and unsupported checkpoints before any resource mutation; an older coordinator
 returns an upgrade diagnostic instead of silently creating an unmanaged image.
 
+For brokered native checkpoints, `--wait` also follows a coordinator-retained
+capture while its provider result is being recovered. It observes the same
+checkpoint ID and never submits another capture. The wait timeout bounds both
+status requests and polling; cancellation or timeout leaves the owned checkpoint
+available for `crabbox checkpoint inspect <checkpoint-id> --verify`. With
+`--wait=false`, a pending creation response still reports an error and retains
+the checkpoint for inspection.
+
 **Strategy details**
 
 - `disk-snapshot` — EBS / Azure managed-OS-disk / GCP persistent-disk / direct
@@ -254,6 +262,12 @@ Unresolved operations cannot be forked, pruned, or deleted locally. Historical
 native records with missing image references are also held: a blank reference
 does not prove that submission never happened. Inspect and reconcile the
 original provider operation before removing any ownership evidence.
+
+An ordinary Machine0 capture that returns an error before attempting image
+submission removes its uncommitted reservation, so the source can still be
+released normally. A process interruption or attempted submission without a
+returned image identity remains unresolved; this does not unlock historical
+blank records.
 
 Older binaries do not understand these operation holds. Before downgrading,
 stop new capture admission and finish all operations with this binary; do not
