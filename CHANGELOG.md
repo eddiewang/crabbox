@@ -1,10 +1,32 @@
 # Changelog
 
-## 0.48.1 (Unreleased)
+## 0.48.1 - 2026-09-01
 
-### Fixed
+### Changes
 
-- Fixed Parallels clone destinations to pass the configured parent directory to `prlctl --dst`, letting Parallels name and create the VM bundle beneath it.
+- Corrected nested JUnit totals and preserved failed-case details so `--fail-on-test-failures` catches failures even when suite counters are missing or zero, without double-counting parent aggregates.
+- Fixed signed receipt/log mismatches by keeping retained output valid UTF-8 before signing and storage, preserving raw captures and full-stream hashes, and marking incomplete retained logs as truncated.
+- Kept automatic POSIX SSH failure bundles focused on the current uploaded script instead of earlier uploads and neighboring files. Explicit artifact and download selections remain independent.
+- Reduced SSH startup round trips by avoiding redundant successful-login checks and skipping telemetry when no coordinator run handle exists.
+- Made run summaries, timing JSON, and recovery guidance distinguish confirmed release from retained or pending cleanup, report local cleanup errors separately, and preserve an existing workload failure's exit code.
+- Made coordinator-backed `stop` use one five-minute cancellation budget across inspection, claim waits, cleanup, release, and observation; local daemon lock waits now honor cancellation without reversing confirmed cleanup.
+- Fixed coordinator-managed AWS cleanup during creation by tracking the exact allocation before readiness, continuing to observe pending cleanup, and retaining recovery evidence when storage or deletion is uncertain.
+- Prevented ready-pool leases from being borrowed concurrently across typed and legacy pools, including existing duplicate records, and blocked expired or quarantined borrows from returning to ready.
+- Honored explicit empty YAML lists for environment forwarding, JUnit paths, and preflight probes while preserving omitted-key inheritance, additive profile/sync lists, and independent automatic result discovery.
+- Honored explicit advertised SSH-port selection on ordinary reused coordinator leases without changing host trust or provider cleanup; ready-pool connections retain their pool-recorded endpoint.
+- Exposed local-container settings in `config show` text and JSON, including effective work-root defaults when selected, without Docker discovery or daemon access.
+- Kept brokered native checkpoint creation waiting through coordinator-owned capture recovery without submitting another capture, while respecting cancellation, timeouts, and terminal failures. Thanks @Copilot.
+- Restored machine-readable missing-checkpoint inspection after managed deletion without treating unresolved capture bindings or coordinator failures as confirmed deletion.
+- Unblocked ordinary Machine0 source cleanup when a failed checkpoint capture is proven not to have attempted image submission; interrupted or uncertain submissions retain their recovery records.
+- Added `checkpoint abandon` for unresolved ordinary Machine0 captures: dispose of the verified source through its existing ownership claim while retaining the unresolved image record and blocking image reuse, deletion, or pruning.
+- Preserved the original coordinator heartbeat transport error when HTTP fallback also fails or has no time left, without changing successful fallback behavior.
+- Fixed Parallels clone placement under the configured parent directory, leaving VM bundle naming and creation to Parallels.
+
+### Upgrade notes
+
+- Previously ignored SSH-port overrides now take effect on ordinary reused coordinator leases and reject unadvertised ports. Remove obsolete `--ssh-port`, `ssh.port`, or `CRABBOX_SSH_PORT` settings to retain automatic selection; explicit selection disables port fallback.
+- Empty YAML `env.allow`, `results.junit`, and `run.preflightTools` lists now clear inherited values. Omit the key to inherit instead; clearing JUnit paths does not disable `results.auto`, and profile allowlists remain additive.
+- Automatic POSIX SSH failure bundles no longer include the retained `.crabbox/scripts` store. Explicitly select additional files you need; use `--download-on-failure` for eligible Linux SSH failure downloads.
 
 ## 0.48.0 - 2026-08-30
 
@@ -94,8 +116,6 @@
 - Bounded VNC/WebVNC credential reads to 30 seconds and 64 KiB, discarding partial credentials on any failure while preserving connection defaults, caller cancellation, and transport cleanup. Thanks @SebTardif.
 - Bounded WebVNC bridge response-header waits to 30 seconds without limiting established WebSocket sessions or bypassing configured HTTP transports. Thanks @SebTardif.
 - Preserved macOS WebVNC authentication timeout diagnostics when a connection deadline closes the browser transport before negotiation returns.
-- Hardened reused Git overlay workspaces with isolated Git metadata, verified cache preservation, and scrub proof before ready-pool return.
-- Fell back to full manifest sync when Git origins are non-forwardable or unavailable from a runner, without forwarding credentials or reusing Git hydration metadata.
 - Honored `pond connect` flags after the pond name so the documented `pond connect <name> --export` form starts tracked daemons instead of blocking in foreground mode.
 - Validated generated prewarm probes through the provider's run contract before backend configuration, ready-pool checks, or ACL changes, preserving follow-up routing and reuse intent.
 - Rejected Blacksmith Testbox `--no-sync` with exit 2 before acquisition or reuse instead of silently delegating sync, including nonblank `prewarm --probe-command` and named jobs with `noSync: true` before warmup or dry-run planning.

@@ -1728,8 +1728,8 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(ports) != "2222\n22\n22\n" {
-		t.Fatalf("ports=%q want probe fallback then readiness execution", string(ports))
+	if string(ports) != "2222\n22\n" {
+		t.Fatalf("ports=%q want one readiness execution per candidate", string(ports))
 	}
 }
 
@@ -1822,7 +1822,7 @@ exit 0
 				t.Fatalf("readiness did not pin the fully ready fallback: %+v", target)
 			}
 			calls, err := os.ReadFile(callsPath)
-			if got, want := string(calls), "2222:exit 0\n2222:true\n22:exit 0\n22:true\n"; err != nil || got != want {
+			if got, want := string(calls), "2222:true\n22:true\n"; err != nil || got != want {
 				t.Fatalf("readiness calls=%q error=%v want=%q", got, err, want)
 			}
 		})
@@ -5011,6 +5011,13 @@ func TestRemoteGitSeedLocalCanary(t *testing.T) {
 		seed := exec.Command("bash", "-lc", remoteGitSeed(workdir, plan))
 		if out, err := seed.CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", label, err, out)
+		}
+		staging, err := filepath.Glob(filepath.Join(filepath.Dir(workdir), ".seed.*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(staging) != 0 {
+			t.Fatalf("%s left seed staging files: %v", label, staging)
 		}
 	}
 	requireSeeded := func(workdir string) {
