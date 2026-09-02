@@ -2478,6 +2478,7 @@ afterSync:
 		failureClassificationPrinted = true
 	}
 	report := timingReportFromRunWithActionsURL(cfg.Provider, leaseID, serverSlug(server), timings, total, code, actionsURL)
+	report.Memory = failureEvidence.Memory
 	populateRunTimingMetadata(&report, cfg, repo, server, leaseID, executionRunID, workdir, runArtifacts)
 	report.Label = runLabelValue
 	report.SchemaValidations = schemaValidationResults
@@ -2556,6 +2557,7 @@ afterSync:
 			StopRouting:           CommandRoutingFor(cfg, leaseID, CommandRoutingStop),
 			StopCommand:           report.StopCommand,
 			Classification:        classification,
+			Memory:                failureEvidence.Memory,
 			Phases:                timings.commandPhases,
 			Results:               results,
 		}

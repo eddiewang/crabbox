@@ -256,6 +256,15 @@ type RunFailureEvidenceCollector func(context.Context) (RunFailureEvidence, erro
 
 type RunFailureEvidence struct {
 	ResourceExhaustion ResourceExhaustionReason
+	Memory             *MemoryCapacity
+}
+
+// MemoryCapacity contains observed bounds, not free or reserved memory.
+// A nil LimitBytes is unknown; zero means the runtime reported no limit.
+type MemoryCapacity struct {
+	LimitBytes               *int64 `json:"limitBytes,omitempty"`
+	HostCapacityBytes        int64  `json:"hostCapacityBytes,omitempty"`
+	EffectiveUpperBoundBytes int64  `json:"effectiveUpperBoundBytes,omitempty"`
 }
 
 type ResourceExhaustionReason string
@@ -1314,6 +1323,7 @@ type LeaseTarget struct {
 	SSH         SSHTarget
 	LeaseID     string
 	Coordinator *CoordinatorClient
+	Memory      *MemoryCapacity
 }
 
 type LeaseView = Server

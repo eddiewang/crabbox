@@ -25,6 +25,8 @@ const (
 	checkpointMetadataForkName = "fork_image_name"
 	checkpointMetadataUser     = "container_user"
 	checkpointMetadataWorkRoot = "container_work_root"
+
+	podmanRuntimeIdentityFormat = `{{.Host.Hostname}}|{{.Store.GraphRoot}}|{{.Store.RunRoot}}|{{.Host.RemoteSocket.Path}}|{{.Host.Security.Rootless}}`
 )
 
 var checkpointScopeMetadataKeys = []string{
@@ -604,16 +606,20 @@ func checkpointContextEndpoint(ctx context.Context, scope checkpointScope) (stri
 
 func checkpointDaemonID(ctx context.Context, scope checkpointScope) (string, error) {
 	if isPodmanRuntime(scope.Runtime) {
-		cmd := checkpointCommand(ctx, scope, "info", "--format", `{{.Host.Hostname}}|{{.Store.GraphRoot}}|{{.Store.RunRoot}}|{{.Host.RemoteSocket.Path}}|{{.Host.Security.Rootless}}`)
+		cmd := checkpointCommand(ctx, scope, "info", "--format", podmanRuntimeIdentityFormat)
 		identity, err := checkpointRequiredOutput(cmd, "resolve Podman runtime identity", "identity")
 		if err != nil {
 			return "", err
 		}
-		sum := sha256.Sum256([]byte(identity))
-		return fmt.Sprintf("podman-%x", sum[:16]), nil
+		return podmanRuntimeIdentity(identity), nil
 	}
 	cmd := checkpointCommand(ctx, scope, "info", "--format", "{{.ID}}")
 	return checkpointRequiredOutput(cmd, "resolve Docker daemon identity", "id")
+}
+
+func podmanRuntimeIdentity(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("podman-%x", sum[:16])
 }
 
 func checkpointRequiredOutput(cmd *exec.Cmd, operation, valueName string) (string, error) {
