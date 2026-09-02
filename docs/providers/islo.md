@@ -200,7 +200,7 @@ immediately with exit code 5.
 
 Two opt-in smoke tests in `internal/providers/islo/backend_live_test.go`
 (build tag `smoke`) exercise the real Islo API. Neither runs in the default
-`go test -race ./...` job, and both skip in `go test -short` mode. Both read
+`go test -race -timeout=15m ./...` job, and both skip in `go test -short` mode. Both read
 `ISLO_API_KEY` only — `CRABBOX_ISLO_API_KEY`, which authenticates normal
 Crabbox runs, is not consulted — and skip when it is unset.
 
