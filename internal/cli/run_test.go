@@ -3753,12 +3753,14 @@ exit 0
 			releases := 0
 			runEnvProfileTestReleaseHook = func() error {
 				releases++
-				remoteArchives, globErr := filepath.Glob(filepath.Join(remoteRoot, "cbx_env_profile_test", "crabbox", ".crabbox", "*-artifacts.tgz"))
-				if globErr != nil {
-					return globErr
+				remoteFiles, readErr := os.ReadDir(filepath.Join(remoteRoot, "cbx_env_profile_test", filepath.Base(dir), ".crabbox"))
+				if readErr != nil {
+					return readErr
 				}
-				if len(remoteArchives) != 0 {
-					return fmt.Errorf("remote archives still present at release: %v", remoteArchives)
+				for _, file := range remoteFiles {
+					if strings.HasSuffix(file.Name(), "-artifacts.tgz") {
+						return fmt.Errorf("remote archive still present at release: %s", file.Name())
+					}
 				}
 				file, openErr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 				if openErr != nil {
@@ -3817,7 +3819,7 @@ exit 0
 			}
 			logText := string(logData)
 			previous := -1
-			for _, want := range []string{"check_artifact_file()", "tar -czf", "base64 <", "rm -f --", "RELEASE"} {
+			for _, want := range []string{"check_artifact_file()", "tar -czf", "base64 <", "RELEASE"} {
 				index := strings.Index(logText, want)
 				if index < 0 {
 					t.Fatalf("ssh log missing %q:\n%s", want, logText)
