@@ -282,8 +282,9 @@ or a native CLI exit 1 do not establish a remote workload exit.
 
 The remote Linux environment must provide `timeout` with `--kill-after` support,
 in addition to Bash and the existing `find`, `tar`, `base64`, and temporary-file
-utilities. Its availability is checked before starting the child. Collection
-has an independent 30-second budget, with a one-second forced-kill grace;
+utilities. The required timeout option and duration syntax are checked with a
+harmless command before starting the child. Collection has an independent
+30-second budget, with a one-second forced-kill grace;
 the local wait is also bounded from the workload exit receipt. Caller
 cancellation takes precedence. This is not a 30-second workload deadline.
 
@@ -296,9 +297,10 @@ an observed nonzero workload exit. Collection failure after a successful
 workload still fails the run (missing required artifacts return exit 7).
 Command timing ends at the exit receipt; collection and cleanup count toward total.
 
-Protocol and archive bytes are removed before console/proof/failure-log capture;
-malformed or overflowing collection output is discarded and cancels the local
-runner. `--keep`, `--keep-on-failure`, reused leases, and failure bundles retain
+Reserved receipt frames and archive bytes are removed before
+console/proof/failure-log capture; unrelated workload control bytes remain
+streaming. Malformed or overflowing collection output is discarded and cancels
+the local runner. `--keep`, `--keep-on-failure`, reused leases, and failure bundles retain
 their existing policy. Downloaded evidence does **not** mean the workload
 succeeded; proof rendering remains success-only. The nonce binds the local
 invocation, not remote source authenticity or exact Git bytes: native Blacksmith
