@@ -430,6 +430,29 @@ func gitOverlayFallbackOutcome(output string, err error) (string, bool, bool) {
 	return reason, true, mutated
 }
 
+// Hidden index flags omit worktree changes from ordinary fingerprint inputs.
+func gitOverlayLocalFingerprintUnsafe(root string) bool {
+	tracked, err := loadGitTrackedPaths(root)
+	if err != nil {
+		return true
+	}
+	for _, entry := range tracked {
+		if entry.skipWorktree || entry.assumeUnchanged {
+			return true
+		}
+	}
+	return false
+}
+
+func gitOverlayFallbackInvalidatesFingerprint(reason string) bool {
+	switch reason {
+	case "assume_unchanged_index", "skip_worktree_index", "index_inspection_failed":
+		return true
+	default:
+		return false
+	}
+}
+
 func gitOverlayBoundaryViolation(reason string) bool {
 	switch reason {
 	case "unsafe_remote_root", "symlink_remote_root", "symlink_remote_parent", "symlink_git_directory", "symlink_git_config", "symlink_git_objects", "symlink_git_info", "symlink_git_attributes", "symlink_git_exclude", "symlink_git_objects_info", "symlink_git_alternates", "unsafe_git_metadata", "unsafe_overlay_metadata", "unsafe_runtime_state":

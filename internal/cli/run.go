@@ -1749,7 +1749,8 @@ retrySync:
 			timings.syncFallbackReason = overlayDecision.Reason
 		}
 		fingerprint := ""
-		if cfg.Sync.Fingerprint && !isWindowsNativeTarget(target) && !plainManifestMode {
+		fingerprintUnsafe := cfg.Sync.Fingerprint && overlayDecision.Requested && !overlayDecision.Enabled && gitOverlayLocalFingerprintUnsafe(repo.Root)
+		if cfg.Sync.Fingerprint && !fingerprintUnsafe && !isWindowsNativeTarget(target) && !plainManifestMode {
 			stepStart = time.Now()
 			fingerprintConfig := cfg
 			fingerprintConfig.Sync.GitOverlay = overlayDecision.Enabled
@@ -1821,12 +1822,13 @@ retrySync:
 					}
 					overlayDecision.Enabled = false
 					overlayDecision.Reason = reason
+					fingerprintUnsafe = fingerprintUnsafe || gitOverlayFallbackInvalidatesFingerprint(reason)
 					plainManifestMode = mutated || reason == "origin_unavailable" || reason == "origin_auth_required"
 					timings.syncMode = "manifest"
 					timings.syncTransferFiles = len(manifest.Files)
 					timings.syncTransferBytes = manifest.Bytes
 					timings.syncFallbackReason = reason
-					if plainManifestMode {
+					if plainManifestMode || fingerprintUnsafe {
 						if reason == "origin_unavailable" || reason == "origin_auth_required" {
 							coherence = gitCoherencePlan{}
 						}

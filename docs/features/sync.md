@@ -234,6 +234,11 @@ userinfo, warns without printing the URL, and uses the normal file sync instead.
 This prevents credentials stored in local Git remotes from reaching lease
 command arguments or the seeded worktree's Git configuration.
 
+Git seeding, coherence finalization, and Git-state probes run in non-login Bash
+shells with `BASH_ENV` and `ENV` disabled. Runner login and logout hooks cannot
+replace these control-command exit statuses. User workload commands keep their
+existing login-shell behavior.
+
 If an otherwise forwardable origin requires authentication or is unreachable
 due to DNS, connectivity, or TLS transport errors, ordinary POSIX/WSL2 sync
 and local Actions hydration fall back to the full, plain manifest sync. This
@@ -278,6 +283,11 @@ configuration, external transports, or repository-defined filters.
 Anonymous HTTP authentication failures and eligible-origin DNS, TLS, firewall,
 connection, and fetch failures safely fall back to the complete ordinary file
 manifest.
+
+A fallback involving `assume-unchanged` or `skip-worktree` index flags does
+not reuse or publish a sync fingerprint: Git can hide edits behind those
+flags. Crabbox transfers the full ordinary manifest instead. An index
+inspection failure also disables fingerprint reuse for that fallback.
 
 Only dependency caches ignored by verified `.gitignore` files from the exact
 target tree may survive overlay preparation: `node_modules`, `.pnpm-store`,

@@ -3412,17 +3412,13 @@ exec ` + shellQuote(gitOutput("", "--exec-path")+"/git") + ` "$@"
 	if err := os.WriteFile(filepath.Join(tools, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	envFile := filepath.Join(tools, "env")
-	if err := os.WriteFile(envFile, []byte("export PATH="+shellQuote(tools)+":$PATH\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	commonEnv := []string{
-		"BASH_ENV=" + envFile,
+		"PATH=" + tools + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"CRABBOX_COHERENT_READY=" + coherentReady,
 		"CRABBOX_OVERLAY_WROTE=" + overlayWrote,
 		"CRABBOX_RELEASE_OVERLAY=" + releaseOverlay,
 	}
-	coherent := exec.Command("bash", "-lc", remoteFinalizeSync(coherentWorkdir, remoteSyncFinalizeOptions{
+	coherent := exec.Command("/bin/sh", "-c", remoteFinalizeSync(coherentWorkdir, remoteSyncFinalizeOptions{
 		Token:       token,
 		Fingerprint: "coherent",
 		Coherence:   plan,
@@ -3462,7 +3458,7 @@ exec ` + shellQuote(gitOutput("", "--exec-path")+"/git") + ` "$@"
 	}
 	waitForPath(coherentReady, "coherent finalizer did not reach candidate status inspection")
 
-	overlay = exec.Command("bash", "-lc", remoteFinalizeSync(overlayWorkdir, remoteSyncFinalizeOptions{Token: token}))
+	overlay = exec.Command("/bin/sh", "-c", remoteFinalizeSync(overlayWorkdir, remoteSyncFinalizeOptions{Token: token}))
 	overlay.Env = append(os.Environ(), append(commonEnv, "CRABBOX_STATUS_ROLE=overlay")...)
 	var overlayOutput bytes.Buffer
 	overlay.Stdout = &overlayOutput
@@ -3658,7 +3654,7 @@ func stageCoherenceFinalize(t *testing.T, workdir, token string) {
 }
 
 func runCoherenceFinalize(workdir string, plan gitCoherencePlan, token, fingerprint string, env ...string) ([]byte, error) {
-	cmd := exec.Command("bash", "-lc", remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{
+	cmd := exec.Command("/bin/sh", "-c", remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{
 		Token:       token,
 		Fingerprint: fingerprint,
 		Coherence:   plan,
@@ -3752,7 +3748,7 @@ func TestRemoteGitCoherenceExitTrapBehavior(t *testing.T) {
 		beforeIndex := coherenceIndexBytes(t, workdir)
 		tools := coherenceFailureTools(t, plan.Target)
 		out, err := runCoherenceFinalize(workdir, plan, token, "fp-failure",
-			"BASH_ENV="+filepath.Join(tools, "env"), "CRABBOX_FAIL_MV=complete")
+			"PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"), "CRABBOX_FAIL_MV=complete")
 		if got := exitCode(err); got != 94 {
 			t.Fatalf("failed finalize exit=%d, want original exit 94: %v\n%s", got, err, out)
 		}
@@ -3926,9 +3922,6 @@ exec /bin/mv "$@"
 	if err := os.WriteFile(filepath.Join(dir, "mv"), []byte(mvScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "env"), []byte("export PATH="+shellQuote(dir)+":$PATH\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	return dir
 }
 
@@ -3943,7 +3936,7 @@ func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 			stageCoherenceFinalize(t, workdir, token)
 			beforeIndex := coherenceIndexBytes(t, workdir)
 			tools := coherenceFailureTools(t, plan.Target)
-			env := []string{"BASH_ENV=" + filepath.Join(tools, "env")}
+			env := []string{"PATH=" + tools + string(os.PathListSeparator) + os.Getenv("PATH")}
 			if failure == "fingerprint" || failure == "complete" {
 				env = append(env, "CRABBOX_FAIL_MV="+failure)
 			} else {
@@ -3979,7 +3972,7 @@ func TestRemoteGitCoherenceDoesNotOverwriteConcurrentRollbackChanges(t *testing.
 			token := fmt.Sprintf("%032x", len(failure)+200)
 			stageCoherenceFinalize(t, workdir, token)
 			tools := coherenceFailureTools(t, plan.Target)
-			env := []string{"BASH_ENV=" + filepath.Join(tools, "env"), "CRABBOX_FAIL_MV=" + failure, "CRABBOX_CONCURRENT_WORKDIR=" + workdir, "CRABBOX_CONCURRENT_HEAD=" + f.c, "CRABBOX_TARGET_HEAD=" + f.b, "CRABBOX_OLD_HEAD=" + f.a}
+			env := []string{"PATH=" + tools + string(os.PathListSeparator) + os.Getenv("PATH"), "CRABBOX_FAIL_MV=" + failure, "CRABBOX_CONCURRENT_WORKDIR=" + workdir, "CRABBOX_CONCURRENT_HEAD=" + f.c, "CRABBOX_TARGET_HEAD=" + f.b, "CRABBOX_OLD_HEAD=" + f.a}
 			out, err := runCoherenceFinalize(workdir, plan, token, "fp-"+failure, env...)
 			if err == nil {
 				t.Fatalf("concurrent fault unexpectedly succeeded\n%s", out)
@@ -4771,6 +4764,144 @@ func newGitTransportFailureHTTPServer(t *testing.T) string {
 		}
 	})
 	return "http://" + listener.Addr().String()
+}
+
+func runGitControlWithShellHook(t *testing.T, hook, command string) ([]byte, error) {
+	t.Helper()
+	home := t.TempDir()
+	marker := filepath.Join(home, "hook-ran")
+	envFile := os.DevNull
+	if hook == "logout" {
+		mustWriteTestFile(t, filepath.Join(home, ".bash_profile"), ":\n")
+		mustWriteTestFile(t, filepath.Join(home, ".bash_logout"), "printf logout >"+shellQuote(marker)+"\nfalse\n")
+	} else {
+		envFile = filepath.Join(home, "bash-env")
+		mustWriteTestFile(t, envFile, "printf startup >"+shellQuote(marker)+"\nexit 97\n")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "exec "+command)
+	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "SHLVL=0", "BASH_ENV=" + envFile, "ENV=" + envFile, "LC_ALL=C"}
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if data, statErr := os.ReadFile(marker); !os.IsNotExist(statErr) {
+		t.Errorf("Git control executed %s hook: marker=%q err=%v", hook, data, statErr)
+	}
+	return out, err
+}
+
+func TestRemoteGitControlsIgnoreShellHooks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX Git control shell")
+	}
+	f := newGitCoherenceFixture(t)
+	for _, hook := range []string{"logout", "BASH_ENV"} {
+		for _, scenario := range []string{"seed unavailable", "seed fresh", "seed reused", "finalize unavailable", "finalize success", "finalize tree mismatch"} {
+			t.Run(hook+"/"+scenario, func(t *testing.T) {
+				plan := f.plan(t, f.b)
+				workdir := filepath.Join(t.TempDir(), "work")
+				wantCode, wantReason := 0, ""
+				if strings.HasSuffix(scenario, "unavailable") {
+					plan.RemoteURL = filepath.Join(t.TempDir(), "absent-origin.git")
+					wantCode, wantReason = gitOriginRuntimeFallbackExitCode, "origin_unavailable"
+				}
+				var command string
+				if strings.HasPrefix(scenario, "seed") {
+					if scenario == "seed reused" {
+						workdir = f.workspace(t, f.b, false)
+					}
+					command = remoteGitSeed(workdir, plan)
+				} else {
+					workdir = f.workspace(t, f.a, true)
+					mustWriteTestFile(t, filepath.Join(workdir, "tracked.txt"), "B\n")
+					const token = "61616161616161616161616161616161"
+					stageCoherenceFinalize(t, workdir, token)
+					if scenario == "finalize tree mismatch" {
+						plan.Tree = strings.Repeat("f", 40)
+						wantCode = 67
+					}
+					command = remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{Token: token, Fingerprint: "coherent", Coherence: plan})
+				}
+				out, err := runGitControlWithShellHook(t, hook, command)
+				if got := exitCode(err); got != wantCode {
+					t.Fatalf("Git control exit=%d want=%d err=%v output=%q", got, wantCode, err, out)
+				}
+				if reason, fallback := gitOriginRuntimeFallbackResult(plan.RemoteURL, string(out), err); reason != wantReason || fallback != (wantReason != "") {
+					t.Fatalf("fallback=%t reason=%q want=%q output=%q", fallback, reason, wantReason, out)
+				}
+				if wantCode == 0 {
+					requireGitOutput(t, workdir, f.b, "rev-parse", "HEAD")
+					requireGitOutput(t, workdir, plan.Tree, "write-tree")
+				} else if strings.HasPrefix(scenario, "finalize") {
+					requireGitOutput(t, workdir, f.a, "rev-parse", "HEAD")
+					if got := readCoherentFingerprint(t, workdir, plan); got != "" {
+						t.Fatalf("failed finalizer certified fingerprint %q", got)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRemoteGitMetadataControlsIgnoreShellHooks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX Git control shell")
+	}
+	f := newGitCoherenceFixture(t)
+	for _, hook := range []string{"logout", "BASH_ENV"} {
+		for _, operation := range []string{"hydrate status", "fingerprint", "seed manifest"} {
+			t.Run(hook+"/"+operation, func(t *testing.T) {
+				workdir := f.workspace(t, f.c, false)
+				plan := f.plan(t, f.c)
+				meta := coherenceMetaDir(t, workdir)
+				var command, want string
+				switch operation {
+				case "hydrate status":
+					mustWriteTestFile(t, filepath.Join(meta, "git-hydrate-base"), "main "+f.c+"\n")
+					command, want = remoteGitHydrateStatus(workdir, "main", f.c), "marker base current"
+				case "fingerprint":
+					for name, value := range map[string]string{"sync-finalize-token": "complete", "sync-finalize-complete-token": "complete", "sync-fingerprint": "coherent"} {
+						mustWriteTestFile(t, filepath.Join(meta, name), value)
+					}
+					command, want = remoteReadSyncFingerprint(workdir, plan), "coherent"
+				case "seed manifest":
+					command = remoteSeedSyncManifestFromGit(workdir)
+				}
+				out, err := runGitControlWithShellHook(t, hook, command)
+				if err != nil || string(out) != want {
+					t.Fatalf("Git metadata control output=%q want=%q err=%v", out, want, err)
+				}
+				if operation == "seed manifest" {
+					wantManifest := "deleted.txt\x00modified.txt\x00other/omit.txt\x00src/keep.txt\x00tracked.txt\x00"
+					if data, readErr := os.ReadFile(filepath.Join(meta, "sync-manifest")); readErr != nil || string(data) != wantManifest {
+						t.Fatalf("seeded manifest=%q err=%v", data, readErr)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRemoteUserWorkloadPreservesLoginShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX workload shell")
+	}
+	for _, shell := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shell=%t", shell), func(t *testing.T) {
+			home, workdir := t.TempDir(), t.TempDir()
+			mustWriteTestFile(t, filepath.Join(home, ".bash_profile"), "export CRABBOX_TEST_LOGIN_VALUE=profile-loaded\n")
+			const script = `printf '%s' "$CRABBOX_TEST_LOGIN_VALUE"`
+			command := remoteCommand(workdir, nil, []string{"bash", "-c", script})
+			if shell {
+				command = remoteShellCommand(workdir, nil, script)
+			}
+			cmd := exec.Command("/bin/sh", "-c", command)
+			cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "BASH_ENV=" + os.DevNull, "ENV=" + os.DevNull}
+			if out, err := cmd.CombinedOutput(); err != nil || string(out) != "profile-loaded" {
+				t.Fatalf("user workload lost login profile: output=%q err=%v", out, err)
+			}
+		})
+	}
 }
 
 func TestRemoteGitSeedClassifiesRuntimeOriginFailures(t *testing.T) {
