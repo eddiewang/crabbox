@@ -3200,23 +3200,28 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 	}
 	for _, mode := range []string{
 		"success", "file-origin", "runtime-state", "classified-fallback", "snapshot-prepare-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "local-fingerprint-reuse", "remote-fingerprint-reuse", "unsafe-metadata",
+		"ordinary-private-fresh", "ordinary-private-reused", "ordinary-unavailable-fresh", "ordinary-unavailable-reused", "ordinary-server-failure-reused",
 		"symlinked-workdir", "symlinked-git", "symlinked-git-config", "symlinked-git-objects", "linked-worktree",
-		"checkout-file-obstruction", "post-reset-cache", "post-reset-mass-deletion", "late-local-edit", "workload-cleanup", "rsync-failure", "empty-overlay-finalize",
+		"checkout-file-obstruction", "post-reset-cache", "post-reset-mass-deletion", "late-local-edit", "workload-cleanup", "rsync-failure", "rsync-cleanup-failure", "empty-overlay-finalize",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			clearConfigEnv(t)
 			fixture := newGitOverlayFixture(t)
+			ordinary := strings.HasPrefix(mode, "ordinary-")
+			reused := ordinary && strings.HasSuffix(mode, "-reused")
+			privateOrigin := mode == "private-origin" || strings.HasPrefix(mode, "ordinary-private-")
+			unavailableOrigin := mode == "origin-unavailable" || strings.HasPrefix(mode, "ordinary-unavailable-")
 			switch mode {
 			case "file-origin":
 				runGit(t, fixture.root, "remote", "set-url", "origin", "file://"+filepath.ToSlash(fixture.origin))
 			case "missing-origin":
 				runGit(t, fixture.root, "remote", "remove", "origin")
-			case "origin-unavailable":
+			case "origin-unavailable", "ordinary-unavailable-fresh", "ordinary-unavailable-reused":
 				server := httptest.NewServer(http.NotFoundHandler())
 				unavailableOrigin := server.URL + "/unavailable.git"
 				server.Close()
 				runGit(t, fixture.root, "remote", "set-url", "origin", unavailableOrigin)
-			case "private-origin":
+			case "private-origin", "ordinary-private-fresh", "ordinary-private-reused":
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 					if request.Header.Get("Authorization") != "" {
 						t.Errorf("overlay forwarded origin credentials")
@@ -3226,11 +3231,17 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 				}))
 				t.Cleanup(server.Close)
 				runGit(t, fixture.root, "remote", "set-url", "origin", server.URL+"/private.git")
+			case "ordinary-server-failure-reused":
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					http.Error(w, "origin temporarily unavailable", http.StatusServiceUnavailable)
+				}))
+				t.Cleanup(server.Close)
+				runGit(t, fixture.root, "remote", "set-url", "origin", server.URL+"/unavailable.git")
 			}
 			if mode == "local-fingerprint-reuse" {
 				runGit(t, fixture.root, "config", "core.autocrlf", "true")
 			}
-			if mode == "late-local-edit" || mode == "workload-cleanup" || mode == "rsync-failure" {
+			if mode == "late-local-edit" || mode == "workload-cleanup" || mode == "rsync-failure" || mode == "rsync-cleanup-failure" {
 				mustWriteTestFile(t, filepath.Join(fixture.root, "unstaged.txt"), "snapshot local change\n")
 			}
 			if mode == "checkout-file-obstruction" {
@@ -3258,7 +3269,7 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 			}
 			remoteRoot := filepath.Join(testRoot, "remote")
 			configPath := filepath.Join(testRoot, "config.yaml")
-			config := fmt.Sprintf("workRoot: %q\nsync:\n  gitOverlay: true\n  gitSeed: true\n  delete: true\n  fingerprint: %t\n  exclude:\n    - excluded.txt\n", remoteRoot, mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse")
+			config := fmt.Sprintf("workRoot: %q\nsync:\n  gitOverlay: %t\n  gitSeed: true\n  delete: true\n  fingerprint: %t\n  exclude:\n    - excluded.txt\n", remoteRoot, !ordinary, ordinary || mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse")
 			if mode == "post-reset-mass-deletion" {
 				config += "    - bulk\n"
 			}
@@ -3298,7 +3309,7 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 				t.Fatal(err)
 			}
 			workdir := filepath.Join(remoteRoot, "cbx_overlay_runtime", repo.Name)
-			if mode == "runtime-state" || mode == "checkout-file-obstruction" || mode == "post-reset-cache" || mode == "post-reset-mass-deletion" || mode == "classified-fallback" || mode == "missing-origin" || mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse" || mode == "unsafe-metadata" || mode == "symlinked-workdir" || mode == "symlinked-git" || mode == "symlinked-git-config" || mode == "symlinked-git-objects" || mode == "linked-worktree" {
+			if reused || mode == "runtime-state" || mode == "checkout-file-obstruction" || mode == "post-reset-cache" || mode == "post-reset-mass-deletion" || mode == "classified-fallback" || mode == "missing-origin" || mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse" || mode == "unsafe-metadata" || mode == "symlinked-workdir" || mode == "symlinked-git" || mode == "symlinked-git-config" || mode == "symlinked-git-objects" || mode == "linked-worktree" {
 				if err := os.MkdirAll(filepath.Dir(workdir), 0o755); err != nil {
 					t.Fatal(err)
 				}
@@ -3347,14 +3358,18 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 					mustWriteTestFile(t, filepath.Join(workdir, ".crabbox", "env", "persisted-helper"), "runtime helper survives\n")
 				} else if mode == "classified-fallback" {
 					mustWriteTestFile(t, filepath.Join(workdir, ".git", "crabbox", "sync-manifest"), "clean.txt\x00excluded.txt\x00")
-				} else if mode == "missing-origin" {
+				} else if mode == "missing-origin" || reused {
 					meta := filepath.Join(workdir, ".git", "crabbox")
 					mustWriteTestFile(t, filepath.Join(meta, "sync-manifest"), "clean.txt\x00excluded.txt\x00")
 					mustWriteTestFile(t, filepath.Join(meta, "sync-finalize-token"), "stale")
 					mustWriteTestFile(t, filepath.Join(meta, "sync-finalize-complete-token"), "stale")
 					mustWriteTestFile(t, filepath.Join(meta, "sync-fingerprint"), "stale")
 					mustWriteTestFile(t, filepath.Join(meta, "git-hydrate-base"), "main stale\n")
-					runGit(t, workdir, "config", "core.fsmonitor", fsmonitor)
+					if reused {
+						runGit(t, workdir, "remote", "set-url", "origin", repo.RemoteURL)
+					} else {
+						runGit(t, workdir, "config", "core.fsmonitor", fsmonitor)
+					}
 				}
 				if mode == "checkout-file-obstruction" {
 					runGit(t, workdir, "checkout", "-q", "--detach", fixture.repo.Head)
@@ -3462,7 +3477,7 @@ case "$cmd" in
 	    ;;
 esac
 case "$CRABBOX_FAKE_OVERLAY_MODE" in
-	  success|runtime-state|remote-fingerprint-reuse|checkout-file-obstruction|post-reset-cache|post-reset-mass-deletion|late-local-edit|workload-cleanup|rsync-failure|empty-overlay-finalize)
+	  success|runtime-state|remote-fingerprint-reuse|checkout-file-obstruction|post-reset-cache|post-reset-mass-deletion|late-local-edit|workload-cleanup|rsync-failure|rsync-cleanup-failure|empty-overlay-finalize)
     exec /usr/bin/env HOME="$CRABBOX_FAKE_ATTACK_HOME" PATH="$CRABBOX_FAKE_ATTACK_BIN:/usr/bin:/bin" /bin/bash --noprofile --norc -c "$cmd"
     ;;
 esac
@@ -3478,6 +3493,12 @@ args=("$@")
 source="${args[${#args[@]}-2]}"
 source="${source%/}"
 printf '%s\n' "$source" > "$CRABBOX_FAKE_RSYNC_SOURCE_LOG"
+if [ "$CRABBOX_FAKE_OVERLAY_MODE" = rsync-cleanup-failure ]; then
+  mv "$source" "$source.retained"
+  mkdir "$source"
+  printf 'replacement survives\n' > "$source/replacement-sentinel"
+  exit 31
+fi
 if [ "$CRABBOX_FAKE_OVERLAY_MODE" = rsync-failure ]; then
   exit 31
 fi
@@ -3550,7 +3571,7 @@ exit 99
 				}
 			})
 			credentialMarker := ""
-			if mode == "private-origin" {
+			if privateOrigin {
 				credentialMarker = installGitOverlayCredentialCanary(t)
 			}
 			var stdout bytes.Buffer
@@ -3566,7 +3587,24 @@ exit 99
 					t.Fatalf("local SSH fixture consulted ambient Git credentials: %v", err)
 				}
 			}
-			if mode == "rsync-failure" {
+			if mode == "rsync-failure" || mode == "rsync-cleanup-failure" {
+				source, err := os.ReadFile(rsyncSourceLog)
+				if err != nil {
+					t.Fatal(err)
+				}
+				root := strings.TrimSpace(string(source))
+				if filepath.Dir(root) != snapshotParent || !strings.HasPrefix(filepath.Base(root), "crabbox-git-overlay-") {
+					t.Fatalf("rsync failure source=%q", source)
+				}
+				if mode == "rsync-cleanup-failure" {
+					t.Cleanup(func() {
+						for _, path := range []string{root, root + ".retained"} {
+							if err := os.RemoveAll(path); err != nil {
+								t.Errorf("remove fixture snapshot %q: %v", path, err)
+							}
+						}
+					})
+				}
 				if runErr == nil || !strings.Contains(runErr.Error(), "rsync failed") {
 					t.Fatalf("rsync failure not reported: err=%v stderr=%s", runErr, stderr.String())
 				}
@@ -3577,12 +3615,22 @@ exit 99
 						t.Fatalf("pending metadata pattern=%q matches=%v err=%v", pattern, matches, err)
 					}
 				}
-				source, err := os.ReadFile(rsyncSourceLog)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if root := strings.TrimSpace(string(source)); root == "" || !strings.Contains(filepath.Base(root), "crabbox-git-overlay-") {
-					t.Fatalf("rsync failure source=%q", source)
+				if mode == "rsync-cleanup-failure" {
+					if sentinel, err := os.ReadFile(filepath.Join(root, "replacement-sentinel")); err != nil || string(sentinel) != "replacement survives\n" {
+						t.Fatalf("snapshot cleanup touched replacement: sentinel=%q err=%v", sentinel, err)
+					}
+					if retained, err := os.ReadFile(filepath.Join(root+".retained", "unstaged.txt")); err != nil || string(retained) != "snapshot local change\n" {
+						t.Fatalf("retained snapshot payload=%q err=%v", retained, err)
+					}
+					var primary ExitError
+					if !AsExitError(runErr, &primary) || primary.Code != 6 || !strings.HasPrefix(runErr.Error(), "rsync failed") {
+						t.Fatalf("snapshot cleanup replaced primary rsync failure: err=%v exit=%+v", runErr, primary)
+					}
+					for _, diagnostic := range []string{"clean up immutable git overlay snapshot", "root identity changed", root} {
+						if !strings.Contains(runErr.Error(), diagnostic) {
+							t.Fatalf("returned error omitted snapshot cleanup diagnostic %q: %v", diagnostic, runErr)
+						}
+					}
 				} else if _, err := os.Stat(root); !os.IsNotExist(err) {
 					t.Fatalf("failed transfer retained snapshot %q: %v", root, err)
 				}
@@ -3601,6 +3649,15 @@ exit 99
 				} else if _, err := os.Stat(root); !os.IsNotExist(err) {
 					t.Fatalf("snapshot survived until workload execution: %q: %v", root, err)
 				}
+			}
+			if mode == "ordinary-server-failure-reused" {
+				if runErr == nil || !strings.Contains(runErr.Error(), "Git coherence fetch failed") {
+					t.Fatalf("ordinary server failure was not fatal: err=%v stderr=%s", runErr, stderr.String())
+				}
+				if strings.Contains(stderr.String(), "git origin fallback") {
+					t.Fatalf("ordinary server failure downgraded to manifest fallback: %s", stderr.String())
+				}
+				return
 			}
 			if mode == "unsafe-metadata" {
 				if runErr == nil || !strings.Contains(runErr.Error(), "unsafe_overlay_metadata") {
@@ -3693,7 +3750,8 @@ exit 99
 						t.Fatalf("overlay reconciliation did not repair remote drift: %q", content)
 					}
 				}
-			case "classified-fallback", "snapshot-prepare-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "linked-worktree", "checkout-file-obstruction", "post-reset-cache":
+			case "classified-fallback", "snapshot-prepare-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "linked-worktree", "checkout-file-obstruction", "post-reset-cache",
+				"ordinary-private-fresh", "ordinary-private-reused", "ordinary-unavailable-fresh", "ordinary-unavailable-reused":
 				transfer, err := os.ReadFile(rsyncLog)
 				if err != nil || !bytes.Contains(transfer, []byte("clean.txt\x00")) {
 					t.Fatalf("fallback omitted full manifest: data=%q err=%v", transfer, err)
@@ -3701,9 +3759,9 @@ exit 99
 				wantReason := "checkout_failed"
 				if mode == "snapshot-prepare-fallback" {
 					wantReason = "invalid_head"
-				} else if mode == "private-origin" {
+				} else if privateOrigin {
 					wantReason = "origin_auth_required"
-				} else if mode == "origin-unavailable" {
+				} else if unavailableOrigin {
 					wantReason = "origin_unavailable"
 				} else if mode == "missing-origin" {
 					wantReason = "missing_origin"
@@ -3714,7 +3772,15 @@ exit 99
 				} else if mode == "post-reset-cache" {
 					wantReason = "unsafe_cache_root"
 				}
-				if !strings.Contains(stderr.String(), "git overlay fallback reason="+wantReason) {
+				warningPrefix := "git overlay fallback reason="
+				if ordinary {
+					warningPrefix = "git origin fallback reason="
+					manifest, _ := fixture.manifest(t)
+					if !bytes.Equal(transfer, manifest.NUL()) {
+						t.Fatalf("ordinary fallback transferred an incomplete manifest: got=%q want=%q", transfer, manifest.NUL())
+					}
+				}
+				if !strings.Contains(stderr.String(), warningPrefix+wantReason) {
 					t.Fatalf("fallback reason missing: %s", stderr.String())
 				}
 				meta := filepath.Join(workdir, ".crabbox")
@@ -3726,12 +3792,12 @@ exit 99
 				}
 				if mode == "checkout-file-obstruction" || mode == "post-reset-cache" {
 					assertGitOverlayRecoveryCoherent(t, workdir, repo)
-				} else if mode != "snapshot-prepare-fallback" && mode != "private-origin" && mode != "origin-unavailable" && mode != "missing-origin" {
+				} else if mode != "snapshot-prepare-fallback" && !privateOrigin && !unavailableOrigin && mode != "missing-origin" {
 					if _, err := os.Stat(filepath.Join(meta, "git-hydrate-base")); err != nil {
 						t.Fatalf("unmodified fallback lost ordinary Git hydration metadata: %v", err)
 					}
 				}
-				if mode == "snapshot-prepare-fallback" || mode == "private-origin" || mode == "origin-unavailable" || mode == "missing-origin" {
+				if mode == "snapshot-prepare-fallback" || privateOrigin || unavailableOrigin || mode == "missing-origin" {
 					for _, name := range []string{"sync-fingerprint", "git-hydrate-base"} {
 						if _, err := os.Stat(filepath.Join(meta, name)); !os.IsNotExist(err) {
 							t.Fatalf("hardened manifest retained %s: %v", name, err)
@@ -3742,13 +3808,25 @@ exit 99
 						t.Fatal(err)
 					}
 					hardenedCommands := string(sshCommands)
-					if mode == "private-origin" || mode == "origin-unavailable" {
+					if privateOrigin || unavailableOrigin {
 						commands := strings.Split(hardenedCommands, "\n---\n")
+						attemptMarker := ".overlay-git."
+						if ordinary {
+							attemptMarker = "origin_git clone --quiet"
+							if reused {
+								attemptMarker = "Git coherence fetch failed"
+							}
+						}
+						foundAttempt := false
 						for index, command := range commands {
-							if strings.Contains(command, ".overlay-git.") {
+							if strings.Contains(command, attemptMarker) {
 								hardenedCommands = strings.Join(commands[index+1:], "\n---\n")
+								foundAttempt = true
 								break
 							}
+						}
+						if !foundAttempt {
+							t.Fatalf("origin fallback did not attempt %q", attemptMarker)
 						}
 					}
 					for _, forbidden := range []string{"git clone ", "git fetch ", "git ls-remote ", "repair_origin", "base_tmp=", "refs/remotes/origin/"} {
@@ -3989,7 +4067,9 @@ done <"$tmp"
 		t.Fatal(err)
 	}
 	previousTimeout := runBeforeCommandSSHReadyTimeout
-	runBeforeCommandSSHReadyTimeout = 500 * time.Millisecond
+	// Stay below the ten-second readiness retry interval so the first forced
+	// failure still replaces the lease, while healthy probes have time to start.
+	runBeforeCommandSSHReadyTimeout = 5 * time.Second
 	t.Cleanup(func() { runBeforeCommandSSHReadyTimeout = previousTimeout })
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CRABBOX_CONFIG", configPath)

@@ -323,7 +323,7 @@ func parseGitTrackedPaths(tagged []byte) ([]gitTrackedPath, error) {
 			name:            string(name),
 			mode:            mode,
 			stage:           stage,
-			skipWorktree:    record[0] == 'S',
+			skipWorktree:    record[0] == 'S' || record[0] == 's',
 			assumeUnchanged: record[0] >= 'a' && record[0] <= 'z',
 		})
 	}

@@ -234,17 +234,22 @@ userinfo, warns without printing the URL, and uses the normal file sync instead.
 This prevents credentials stored in local Git remotes from reaching lease
 command arguments or the seeded worktree's Git configuration.
 
-If seeding fails because the origin requires authentication or is unreachable
-due to DNS, connectivity, or TLS transport errors, local Actions hydration
-warns with a fixed phase, advisory failure category, and command exit status,
-then falls back to the full, plain manifest sync. Missing repositories or refs,
-ancestry, tree, or integrity verification failures, and HTTP 5xx or other
-server failures remain fatal and abort before file sync. Raw Git/SSH output,
-URLs, paths, and credential-helper messages are never replayed in warnings.
-Capture is limited to 16 KiB in memory; oversized or unrecognized output
-produces an `unknown` diagnosis instead of guessing. Existing Git metadata may
-still be present; a failed seed has not established that it is current or
-usable.
+If an otherwise forwardable origin requires authentication or is unreachable
+due to DNS, connectivity, or TLS transport errors, ordinary POSIX/WSL2 sync
+and local Actions hydration fall back to the full, plain manifest sync. This
+also covers a reused Git worktree whose fetch fails during finalization.
+Fallback warnings contain only a fixed reason. The plain manifest path clears
+reusable fingerprints and Git hydration markers and does not forward local
+credentials.
+
+Local Actions hydration keeps unclassified seeding failures fatal, including
+missing refs, verification failures, and HTTP 5xx or other server failures,
+and aborts before file sync. Seed failure diagnostics report a fixed phase,
+advisory category, and command exit status. Raw Git/SSH output, URLs, paths,
+and credential-helper messages are never replayed in warnings. Capture is
+limited to 16 KiB in memory; oversized or unrecognized output produces an
+`unknown` diagnosis instead of guessing. Existing Git metadata may still be
+present; a failed seed has not established that it is current or usable.
 
 ### Opt-in Git overlay
 
@@ -260,6 +265,13 @@ configured base ref, so `HEAD^`, `git merge-base`, and
 `git diff origin/main...HEAD` continue to work without downloading unrelated
 historical blobs. Origins that cannot support filtered history use ordinary
 sync instead.
+
+Before transferring an eligible overlay, Crabbox copies its payload to a local
+snapshot and checks it against the checkout's index, manifest, exclusions, and
+fingerprint. Rsync reads the accepted snapshot, so edits made after acceptance
+wait for the next sync. If preparation cannot produce a stable supported
+snapshot, Crabbox falls back to ordinary full-manifest sync after successful
+cleanup. Cleanup failures stop the run and report the retained snapshot path.
 
 The optimization is off by default and requires `sync.gitSeed: true`,
 `sync.delete: true`, an unrestricted, complete, conflict-free Git checkout
