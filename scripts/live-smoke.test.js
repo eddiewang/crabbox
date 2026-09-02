@@ -1367,10 +1367,13 @@ case "$1" in
     ;;
   list)
     printf 'crabbox list warning\\n' >&2
-    printf '[{"id":"cbx_123456789abc","serverId":"00000000-0000-0000-0000-000000000001","slug":"tenki-smoke-test","provider":"tenki","state":"ready"}]\\n'
+    printf '[{"id":"cbx_123456789abc","serverId":"00000000-0000-0000-0000-000000000001","slug":"tenki-smoke-test","provider":"tenki","state":"ready","labels":{"crabbox":"true"}}]\\n'
     ;;
   stop)
     printf 'stopped %s\\n' "\${*: -1}"
+    ;;
+  claims)
+    printf '{"version":1,"source":"local-claims","claims":[],"problems":[]}\\n'
     ;;
   admin)
     printf '[]\\n'
@@ -1441,6 +1444,8 @@ esac
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /crabbox-tenki-ok/);
   assert.match(result.stdout, /paused-session readiness check preserved state=paused/);
+  assert.match(result.stdout, /"smoke_matches": 1/);
+  assert.match(result.stdout, /"unmanaged": 0/);
   assert.match(result.stderr, /tenki status warning/);
   assert.match(result.stderr, /crabbox list warning/);
 
@@ -1449,9 +1454,11 @@ esac
   assert.match(crabboxCalls, /warmup --provider tenki --slug tenki-smoke-/);
   assert.match(crabboxCalls, /status --provider tenki --id tenki-smoke-test --wait --wait-timeout 120s/);
   assert.match(crabboxCalls, /run --provider tenki --id tenki-smoke-test --no-sync -- echo crabbox-tenki-ok/);
-  assert.match(crabboxCalls, /list --provider tenki --json/);
+  assert.match(crabboxCalls, /^list --provider tenki --json$/m);
+  assert.match(crabboxCalls, /^list --provider tenki --all --json$/m);
   assert.match(crabboxCalls, /status --provider tenki --id tenki-smoke-test --wait --wait-timeout 2s/);
   assert.match(crabboxCalls, /stop --provider tenki tenki-smoke-test/);
+  assert.match(crabboxCalls, /^claims list --json$/m);
 
   const tenkiCalls = fs.readFileSync(tenkiLog, "utf8");
   assert.match(

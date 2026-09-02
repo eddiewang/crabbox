@@ -1009,6 +1009,15 @@ tenki_smoke() {
     echo "tenki list JSON missing lease=$lease session=$session" >&2
     return 1
   fi
+  local all_list_json
+  capture_stdout all_list_json run_in_repo "$cb" list --provider tenki --all --json
+  printf '%s\n' "$all_list_json" | jq --arg lease "$lease" --arg session "$session" \
+    '{items:length, smoke_matches:(map(select(.id == $lease and .serverId == $session and .provider == "tenki")) | length), unmanaged:(map(select((.labels.crabbox // "") != "true")) | length)}'
+  if ! printf '%s\n' "$all_list_json" | jq -e --arg lease "$lease" --arg session "$session" \
+    'any(.[]; .id == $lease and .serverId == $session and .provider == "tenki")' >/dev/null; then
+    echo "tenki list --all JSON missing lease=$lease session=$session" >&2
+    return 1
+  fi
 
   "$tenki_cli" sandbox pause "${tenki_sandbox_args[@]}" --session "$session"
   local pause_timeout="${CRABBOX_LIVE_TENKI_PAUSE_TIMEOUT:-60}"
@@ -1044,6 +1053,12 @@ tenki_smoke() {
   echo "tenki paused-session readiness check preserved state=paused"
 
   stop_provider_lease tenki "$lease" "$slug"
+  local claims_json
+  capture_stdout claims_json run_in_repo "$cb" claims list --json
+  if printf '%s\n' "$claims_json" | jq -e --arg lease "$lease" 'any(.claims[]; .leaseId == $lease)' >/dev/null; then
+    echo "tenki stop retained local claim lease=$lease" >&2
+    return 1
+  fi
   lease=""
 }
 
