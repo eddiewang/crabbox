@@ -22760,6 +22760,10 @@ function boundedRunEvent(
 }
 
 function applyRunEventSummary(run: RunRecord, event: RunEventRecord): void {
+  // Late deliveries remain in the audit trail without rewriting committed terminal evidence.
+  if (run.terminalFinishSHA256) {
+    return;
+  }
   if (event.phase) {
     run.phase = event.phase;
   } else {

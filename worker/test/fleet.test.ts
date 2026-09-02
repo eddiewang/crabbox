@@ -73,6 +73,7 @@ import type {
   ProvisioningAttempt,
   ReadyPoolEntry,
   ReadyPoolIdentityV1,
+  RunEventRecord,
   RunRecord,
 } from "../src/types";
 
@@ -35780,6 +35781,142 @@ describe("fleet run history", () => {
     expect(original.status).toBe(200);
     await expect(original.json()).resolves.toEqual({ receipt });
     expect(storage.value<RunRecord>(`run:${run.id}`)?.exitCode).toBe(17);
+  });
+
+  it.each([
+    { exitCode: 0, signed: true },
+    { exitCode: 17, signed: true },
+    { exitCode: 0, signed: false },
+  ])(
+    "preserves finalized run metadata when late events arrive after exit $exitCode (signed: $signed)",
+    async ({ exitCode, signed }) => {
+      const storage = new MemoryStorage();
+      const fleet = testFleet(storage);
+      const headers = {
+        "x-crabbox-owner": "alice@example.com",
+        "x-crabbox-org": "example-org",
+      };
+      const lease = testLease({
+        id: "cbx_000000000001",
+        slug: "initial-runner",
+        owner: "alice@example.com",
+        org: "example-org",
+        provider: "aws",
+      });
+      const replacement = testLease({
+        ...lease,
+        id: "cbx_000000000002",
+        slug: "replacement-runner",
+        provider: "hetzner",
+      });
+      storage.seed(`lease:${lease.id}`, lease);
+      storage.seed(`lease:${replacement.id}`, replacement);
+      const create = await fleet.fetch(
+        request("POST", "/v1/runs", {
+          headers,
+          body: { leaseID: lease.id, command: ["echo", "done"] },
+        }),
+      );
+      const { run } = (await create.json()) as { run: RunRecord };
+      const log = "done\n";
+      const receipt = signed
+        ? await testTerminalReceipt({ run, exitCode, syncMs: 0, commandMs: 1, log })
+        : undefined;
+      const body = { exitCode, commandMs: 1, log, receipt };
+      const finish = await fleet.fetch(
+        request("POST", `/v1/runs/${run.id}/finish`, { headers, body }),
+      );
+      expect(finish.status).toBe(200);
+      const { run: finished } = (await finish.json()) as { run: RunRecord };
+      const failure = {
+        type: "run.failed",
+        phase: "failed",
+        message: "finish acknowledgment unavailable",
+      };
+      const lateEvents = [
+        failure,
+        {
+          type: "lease.created",
+          phase: "leased",
+          leaseID: replacement.id,
+          slug: replacement.slug,
+          provider: replacement.provider,
+          target: "windows",
+          windowsMode: "wsl2",
+          class: "large",
+          serverType: "replacement-type",
+        },
+        { type: "stdout", stream: "stdout", data: log },
+        { type: "lease.released", phase: "released" },
+        failure,
+      ];
+      const appendedEvents: RunEventRecord[] = [];
+      for (const lateEvent of lateEvents) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- preserve duplicate and out-of-order delivery in the audit sequence.
+        const response = await fleet.fetch(
+          request("POST", `/v1/runs/${run.id}/events`, { headers, body: lateEvent }),
+        );
+        expect(response.status).toBe(201);
+        // oxlint-disable-next-line eslint/no-await-in-loop -- inspect each append before the next delivery.
+        const { event } = (await response.json()) as { event: RunEventRecord };
+        appendedEvents.push(event);
+        // oxlint-disable-next-line eslint/no-await-in-loop -- assert that no individual late event rewrites terminal metadata.
+        const read = await fleet.fetch(request("GET", `/v1/runs/${run.id}`, { headers }));
+        // oxlint-disable-next-line eslint/no-await-in-loop -- inspect each append before the next delivery.
+        expect(await read.json()).toEqual({
+          run: {
+            ...finished,
+            eventCount: (finished.eventCount ?? 0) + appendedEvents.length,
+            lastEventAt: event.createdAt,
+          },
+        });
+      }
+      expect(appendedEvents.map((event) => event.seq)).toEqual([3, 4, 5, 6, 7]);
+      const events = await fleet.fetch(
+        request("GET", `/v1/runs/${run.id}/events?after=2`, { headers }),
+      );
+      expect(await events.json()).toEqual({ events: appendedEvents });
+      const duplicate = await fleet.fetch(
+        request("POST", `/v1/runs/${run.id}/finish`, { headers, body }),
+      );
+      expect(duplicate.status).toBe(200);
+      expect(await duplicate.json()).toEqual({
+        run: { ...finished, eventCount: 7, lastEventAt: appendedEvents.at(-1)?.createdAt },
+      });
+      const logs = await fleet.fetch(request("GET", `/v1/runs/${run.id}/logs`, { headers }));
+      expect(await logs.text()).toBe(log);
+      const recovered = await fleet.fetch(
+        request("GET", `/v1/runs/${run.id}/receipt`, { headers }),
+      );
+      expect(recovered.status).toBe(signed ? 200 : 404);
+      expect(await recovered.json()).toEqual(
+        signed ? { receipt } : { error: "receipt_unavailable" },
+      );
+    },
+  );
+
+  it("still marks unfinished runs failed when a failure event arrives", async () => {
+    const fleet = testFleet();
+    const headers = {
+      "x-crabbox-owner": "alice@example.com",
+      "x-crabbox-org": "example-org",
+    };
+    const create = await fleet.fetch(
+      request("POST", "/v1/runs", { headers, body: { command: ["echo", "done"] } }),
+    );
+    const { run } = (await create.json()) as { run: RunRecord };
+    const failure = await fleet.fetch(
+      request("POST", `/v1/runs/${run.id}/events`, {
+        headers,
+        body: { type: "run.failed", message: "bootstrap unavailable" },
+      }),
+    );
+    expect(failure.status).toBe(201);
+    const { event } = (await failure.json()) as { event: { createdAt: string } };
+    const read = await fleet.fetch(request("GET", `/v1/runs/${run.id}`, { headers }));
+    expect(await read.json()).toMatchObject({
+      run: { state: "failed", phase: "failed", endedAt: event.createdAt, eventCount: 2 },
+    });
   });
 
   it("keeps committed logs under concurrent identical terminal finishes", async () => {
