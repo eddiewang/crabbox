@@ -1221,7 +1221,7 @@ func safeCaptureName(value string) string {
 func remoteFailureCaptureCommand(workdir, remotePath string) string {
 	var script bytes.Buffer
 	script.WriteString("set -eu\n")
-	script.WriteString("cd " + shellQuote(workdir) + "\n")
+	script.WriteString("cd " + shellPathQuote(workdir) + "\n")
 	script.WriteString("mkdir -p .crabbox\n")
 	script.WriteString("out=" + shellQuote(remotePath) + "\n")
 	script.WriteString(`manifest=.crabbox/capture-manifest.txt
@@ -1257,7 +1257,7 @@ printf '%s\n' "$out"
 }
 
 func remoteRemoveFailureCaptureCommand(workdir, remotePath string) string {
-	script := "set -eu\ncd " + shellQuote(workdir) + "\nrm -f -- " + shellQuote(remotePath)
+	script := "set -eu\ncd " + shellPathQuote(workdir) + "\nrm -f -- " + shellQuote(remotePath)
 	return "bash -lc " + shellQuote(script)
 }
 
