@@ -1857,6 +1857,11 @@ repair_origin() {
 `
 }
 
+// Login-shell logout hooks can overwrite a control script's exit status.
+func remoteGitControlShellCommand(script string) string {
+	return "/usr/bin/env BASH_ENV=/dev/null ENV=/dev/null /bin/bash --noprofile --norc -c " + shellQuote(script)
+}
+
 func remoteGitHydrateStatus(workdir, baseRef, expectedSHA string) string {
 	if baseRef == "" || expectedSHA == "" {
 		return "printf ''"
@@ -1879,7 +1884,7 @@ fi
 if [ -n "$remote_sha" ] && git merge-base --is-ancestor ` + shellQuote(expectedSHA) + ` "$remote_sha" >/dev/null 2>&1; then
   printf 'remote base contains local'
 fi`
-	return "bash -lc " + shellQuote(script)
+	return remoteGitControlShellCommand(script)
 }
 
 func remoteGitSeed(workdir string, plan gitCoherencePlan) string {
@@ -1932,7 +1937,7 @@ mv -- "$tmp" "$workdir"
 rm -f -- "$transport_error"
 trap - EXIT
 `
-	return "bash -lc " + shellQuote(script)
+	return remoteGitControlShellCommand(script)
 }
 
 func remoteGitOriginTransportFunctions() string {
@@ -1976,7 +1981,7 @@ if [ -f "$committed" ] && [ -f "$complete" ] &&
    [ "$(git write-tree 2>/dev/null || true)" = ` + shellQuote(plan.Tree) + ` ]; then
   cat "$meta_dir/sync-fingerprint" 2>/dev/null || true
 fi`
-	return "bash -lc " + shellQuote(script)
+	return remoteGitControlShellCommand(script)
 }
 
 func remoteInvalidateSyncFingerprintForTarget(target SSHTarget, workdir string, plainManifest bool) string {
@@ -2122,7 +2127,7 @@ func remoteWriteSyncManifestsNewForTargetMode(target SSHTarget, workdir, finaliz
 
 func remoteDiscardSyncPendingMetadata(workdir, finalizeToken string, plainManifest bool) string {
 	metadataScript := remoteSyncMetaDirScript()
-	shellCommand := func(script string) string { return "bash -lc " + shellQuote(script) }
+	shellCommand := remoteGitControlShellCommand
 	if plainManifest {
 		metadataScript = remotePlainManifestGitFunction() + remotePlainManifestSyncMetaDirScript()
 		shellCommand = remotePlainManifestShellCommand
@@ -2201,7 +2206,7 @@ if [ ! -f "$old" ] && exact_git_root; then
   git ls-files -z > "$old"
 fi
 `
-	return "bash -lc " + shellQuote(script)
+	return remoteGitControlShellCommand(script)
 }
 
 func remotePruneSyncManifest(workdir, finalizeToken string) string {
@@ -2445,7 +2450,7 @@ coherence_committed=1
 	if opts.PlainManifest {
 		return remotePlainManifestShellCommand(script)
 	}
-	return "bash -lc " + shellQuote(script)
+	return remoteGitControlShellCommand(script)
 }
 
 func runRemoteFinalizeSync(ctx context.Context, target SSHTarget, workdir string, opts remoteSyncFinalizeOptions) (string, error, string, bool) {

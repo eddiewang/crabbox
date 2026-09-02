@@ -3200,6 +3200,7 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 	}
 	for _, mode := range []string{
 		"success", "file-origin", "runtime-state", "classified-fallback", "snapshot-prepare-fallback", "private-origin", "origin-unavailable", "missing-origin", "local-ineligible", "local-fingerprint-reuse", "remote-fingerprint-reuse", "unsafe-metadata",
+		"local-hidden-fingerprint", "local-sparse-hidden-fingerprint", "local-config-hidden-fingerprint", "remote-hidden-fingerprint", "remote-skip-hidden-fingerprint", "remote-inspection-hidden-fingerprint",
 		"ordinary-private-fresh", "ordinary-private-reused", "ordinary-unavailable-fresh", "ordinary-unavailable-reused", "ordinary-server-failure-reused",
 		"symlinked-workdir", "symlinked-git", "symlinked-git-config", "symlinked-git-objects", "linked-worktree",
 		"checkout-file-obstruction", "post-reset-cache", "post-reset-mass-deletion", "late-local-edit", "workload-cleanup", "rsync-failure", "rsync-cleanup-failure", "empty-overlay-finalize",
@@ -3209,6 +3210,8 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 			fixture := newGitOverlayFixture(t)
 			ordinary := strings.HasPrefix(mode, "ordinary-")
 			reused := ordinary && strings.HasSuffix(mode, "-reused")
+			hiddenFingerprint := strings.HasSuffix(mode, "-hidden-fingerprint")
+			fingerprintReuse := mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse" || hiddenFingerprint
 			privateOrigin := mode == "private-origin" || strings.HasPrefix(mode, "ordinary-private-")
 			unavailableOrigin := mode == "origin-unavailable" || strings.HasPrefix(mode, "ordinary-unavailable-")
 			switch mode {
@@ -3269,7 +3272,7 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 			}
 			remoteRoot := filepath.Join(testRoot, "remote")
 			configPath := filepath.Join(testRoot, "config.yaml")
-			config := fmt.Sprintf("workRoot: %q\nsync:\n  gitOverlay: %t\n  gitSeed: true\n  delete: true\n  fingerprint: %t\n  exclude:\n    - excluded.txt\n", remoteRoot, !ordinary, ordinary || mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse")
+			config := fmt.Sprintf("workRoot: %q\nsync:\n  gitOverlay: %t\n  gitSeed: true\n  delete: true\n  fingerprint: %t\n  exclude:\n    - excluded.txt\n", remoteRoot, !ordinary, ordinary || fingerprintReuse)
 			if mode == "post-reset-mass-deletion" {
 				config += "    - bulk\n"
 			}
@@ -3309,7 +3312,7 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 				t.Fatal(err)
 			}
 			workdir := filepath.Join(remoteRoot, "cbx_overlay_runtime", repo.Name)
-			if reused || mode == "runtime-state" || mode == "checkout-file-obstruction" || mode == "post-reset-cache" || mode == "post-reset-mass-deletion" || mode == "classified-fallback" || mode == "missing-origin" || mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse" || mode == "unsafe-metadata" || mode == "symlinked-workdir" || mode == "symlinked-git" || mode == "symlinked-git-config" || mode == "symlinked-git-objects" || mode == "linked-worktree" {
+			if reused || mode == "runtime-state" || mode == "checkout-file-obstruction" || mode == "post-reset-cache" || mode == "post-reset-mass-deletion" || mode == "classified-fallback" || mode == "missing-origin" || fingerprintReuse || mode == "unsafe-metadata" || mode == "symlinked-workdir" || mode == "symlinked-git" || mode == "symlinked-git-config" || mode == "symlinked-git-objects" || mode == "linked-worktree" {
 				if err := os.MkdirAll(filepath.Dir(workdir), 0o755); err != nil {
 					t.Fatal(err)
 				}
@@ -3376,7 +3379,7 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 					mustWriteTestFile(t, filepath.Join(workdir, "shape"), "stale untracked managed file\n")
 					mustWriteTestFile(t, filepath.Join(workdir, ".git", "crabbox", "sync-manifest"), "shape\x00")
 				}
-				if mode == "local-fingerprint-reuse" || mode == "remote-fingerprint-reuse" {
+				if fingerprintReuse {
 					fingerprintConfig, err := loadConfig()
 					if err != nil {
 						t.Fatal(err)
@@ -3409,6 +3412,29 @@ func TestRunGitOverlaySuccessFallbackAndLateLocalEdit(t *testing.T) {
 						if err := os.RemoveAll(fixture.origin); err != nil {
 							t.Fatal(err)
 						}
+					}
+					if hiddenFingerprint {
+						const token = "71717171717171717171717171717171"
+						mustWriteTestFile(t, filepath.Join(meta, remoteSyncPendingManifestName(token)), string(manifest.NUL()))
+						if out, err := runOverlayCommand(t, remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{
+							Token: token, Fingerprint: fingerprint, Coherence: coherence,
+							HydrateGit: true, BaseRef: repo.BaseRef, BaseSHA: repo.Head,
+						}), nil); err != nil {
+							t.Fatalf("finalize ordinary fingerprint before hidden edit: %v\n%s", err, out)
+						}
+						editRoot, flag := workdir, "--assume-unchanged"
+						if strings.HasPrefix(mode, "local-") {
+							editRoot = fixture.root
+						} else if mode == "remote-skip-hidden-fingerprint" {
+							flag = "--skip-worktree"
+						}
+						runGit(t, editRoot, "update-index", flag, "clean.txt")
+						if mode == "local-sparse-hidden-fingerprint" {
+							runGit(t, editRoot, "config", "core.sparseCheckout", "true")
+						} else if mode == "local-config-hidden-fingerprint" {
+							runGit(t, editRoot, "config", "core.filemode", "false")
+						}
+						mustWriteTestFile(t, filepath.Join(editRoot, "clean.txt"), "hidden edit must not survive a fingerprint skip\n")
 					}
 				}
 				if mode == "unsafe-metadata" {
@@ -3461,6 +3487,7 @@ case "$cmd" in
 	  *".overlay-git."*)
 	    case "$CRABBOX_FAKE_OVERLAY_MODE" in
 	      classified-fallback) printf '%%scheckout_failed\n' %s >&2; exit %d ;;
+	      remote-inspection-hidden-fingerprint) printf '%%sindex_inspection_failed\n' %s >&2; exit %d ;;
       checkout-file-obstruction)
         /bin/chmod 0555 "$CRABBOX_FAKE_OVERLAY_WORKDIR"
         /usr/bin/env HOME="$CRABBOX_FAKE_ATTACK_HOME" PATH="$CRABBOX_FAKE_ATTACK_BIN:/usr/bin:/bin" /bin/bash --noprofile --norc -c "$cmd"
@@ -3482,7 +3509,7 @@ case "$CRABBOX_FAKE_OVERLAY_MODE" in
     ;;
 esac
 exec /bin/bash --noprofile --norc -c "$cmd"
-`, shellQuote(gitOverlayFallbackMarker), gitOverlayFallbackExitCode))
+`, shellQuote(gitOverlayFallbackMarker), gitOverlayFallbackExitCode, shellQuote(gitOverlayFallbackMarker), gitOverlayFallbackExitCode))
 			rsyncScript := `#!/bin/bash
 set -euo pipefail
 tmp="$(mktemp)"
@@ -3723,6 +3750,35 @@ exit 99
 				t.Fatalf("read synced clean file: %v\nstderr=%s", err, stderr.String())
 			}
 			switch mode {
+			case "local-hidden-fingerprint", "local-sparse-hidden-fingerprint", "local-config-hidden-fingerprint", "remote-hidden-fingerprint", "remote-skip-hidden-fingerprint", "remote-inspection-hidden-fingerprint":
+				want := "base clean.txt\n"
+				if strings.HasPrefix(mode, "local-") {
+					want = "hidden edit must not survive a fingerprint skip\n"
+				}
+				if string(content) != want {
+					t.Errorf("hidden-index fallback left stale bytes: got=%q want=%q; stderr=%s", content, want, stderr.String())
+				}
+				if strings.Contains(stderr.String(), "No changes detected, skipping sync") {
+					t.Errorf("hidden-index fallback reused an ordinary fingerprint: %s", stderr.String())
+				}
+				manifest, _ := fixture.manifest(t)
+				if transfer, readErr := os.ReadFile(rsyncLog); readErr != nil || !bytes.Equal(transfer, manifest.NUL()) {
+					t.Errorf("hidden-index fallback omitted full manifest: got=%q want=%q err=%v", transfer, manifest.NUL(), readErr)
+				}
+				wantReason := "assume_unchanged_index"
+				if mode == "remote-skip-hidden-fingerprint" {
+					wantReason = "skip_worktree_index"
+				} else if mode == "local-sparse-hidden-fingerprint" {
+					wantReason = "sparse_checkout"
+				} else if mode == "local-config-hidden-fingerprint" {
+					wantReason = "core_filemode"
+				} else if mode == "remote-inspection-hidden-fingerprint" {
+					wantReason = "index_inspection_failed"
+				}
+				if !strings.Contains(stderr.String(), "git overlay fallback reason="+wantReason) {
+					t.Errorf("hidden-index fallback reason missing: %s", stderr.String())
+				}
+				assertGitOverlayRecoveryCoherent(t, workdir, repo)
 			case "success", "file-origin", "runtime-state", "local-fingerprint-reuse", "remote-fingerprint-reuse", "empty-overlay-finalize":
 				if _, err := os.Stat(rsyncLog); !os.IsNotExist(err) {
 					sshCommands, _ := os.ReadFile(sshLog)
