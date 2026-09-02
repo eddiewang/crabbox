@@ -1124,7 +1124,7 @@ func TestGitOverlayFingerprintPreservesLegacySchemaAndHashesLinkIdentity(t *test
 		t.Fatal(err)
 	}
 	want := sha256.New()
-	fmt.Fprintf(want, "v5\nremote=%s\nbranch=%s\nhead=%s\ntree=%s\n", fixture.plan.RemoteURL, fixture.plan.Branch, fixture.plan.Target, fixture.plan.Tree)
+	fmt.Fprintf(want, "v6\nremote=%s\nbranch=%s\nhead=%s\ntree=%s\n", fixture.plan.RemoteURL, fixture.plan.Branch, fixture.plan.Target, fixture.plan.Tree)
 	fmt.Fprintf(want, "delete=%t\nchecksum=%t\n", legacy.Sync.Delete, legacy.Sync.Checksum)
 	fmt.Fprintf(want, "manifest=%x\n", sha256.Sum256(manifest.NUL()))
 	fmt.Fprintf(want, "deleted=%x\n", sha256.Sum256(manifest.DeletedNUL()))

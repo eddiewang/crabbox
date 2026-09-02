@@ -219,9 +219,12 @@ files and config; Crabbox does not delete files there.
 
 When `sync.fingerprint` is enabled (the default), Crabbox derives a fingerprint
 from `HEAD`, the delete/checksum settings, the manifest, the deletion list, the
-excludes, and the content of every changed file. If the remote workdir already
-carries that fingerprint, the sync is skipped entirely. `--full-resync` ignores
-the remote fingerprint and forces a clean transfer.
+excludes, and the content of every changed regular file. Changed symlinks are
+hashed by their target text, without following the link, so retargeting a link
+invalidates the fingerprint even when both targets contain identical bytes.
+Dangling links and links to directories are supported. If the remote workdir
+already carries that fingerprint, the sync is skipped entirely. `--full-resync`
+ignores the remote fingerprint and forces a clean transfer.
 
 Git seeding (`sync.gitSeed`, default on) clones or fetches the base tree on the
 runner before rsync, so only your diff travels over the wire. It activates only
