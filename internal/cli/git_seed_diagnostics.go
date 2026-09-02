@@ -13,12 +13,16 @@ import (
 const gitSeedDiagnosticLimit = 16 << 10
 
 // Remote output is untrusted, including helper output and URLs. Only fixed
-// labels leave this classifier; truncated captures are discarded by the reader.
+// labels leave this classifier; truncated captures are discarded before parsing.
 func warnRemoteGitSeedFailure(w io.Writer, output string, err error) {
 	reportRemoteGitSeedFailure(w, output, err, "continuing with file sync")
 }
 
 func reportRemoteGitSeedFailure(w io.Writer, output string, err error, disposition string) {
+	var truncated *gitOriginDiagnosticsTruncatedError
+	if errors.As(err, &truncated) {
+		output = ""
+	}
 	phase, reason := "unknown", "unknown"
 	lines := strings.Split(output, "\n")
 	detailStart := 0

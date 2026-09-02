@@ -167,6 +167,12 @@ func TestGitOriginAttemptRetainsBoundedTruncatedDiagnosticsWithoutFallback(t *te
 	if reason, fallback := gitOriginRuntimeFallbackResult("https://example.test/repo.git", out, err); fallback || reason != "" {
 		t.Fatalf("truncated output authorized fallback=%t reason=%q", fallback, reason)
 	}
+	var warning bytes.Buffer
+	reportRemoteGitSeedFailure(&warning, out, err, "aborting before file sync")
+	want := "warning: remote git seed failed: phase=unknown reason=unknown exit=78; aborting before file sync; Git metadata was not seeded or verified\n"
+	if warning.String() != want {
+		t.Fatalf("warning=%q want=%q", warning.String(), want)
+	}
 }
 
 func TestActionsSeedDiagnosticFailsSafely(t *testing.T) {

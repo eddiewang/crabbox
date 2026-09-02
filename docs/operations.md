@@ -543,6 +543,33 @@ artifact upload/read URLs. Scope them to the artifact bucket or prefix; they
 should not carry Cloudflare account, Worker deployment, lease-provider, or VM
 permissions.
 
+The shipped production configuration in `worker/wrangler.jsonc` wires the
+existing R2 artifact backend; signing keys remain deployed secrets, and reads
+use expiring signed URLs by default. The **Deploy Coordinator** workflow
+(`.github/workflows/coordinator-deploy.yml`) owns redeploys when these settings
+change on `main`. Missing required backend configuration fails with
+`artifact_upload_unavailable` before any file upload. Checking artifact
+publishing configuration requires no compute lease.
+
+For workflow-managed R2 signing keys, set the optional GitHub environment
+secret `CRABBOX_ARTIFACTS_CREDENTIALS_JSON` in `coordinator` to exactly:
+
+```json
+{
+  "CRABBOX_ARTIFACTS_ACCESS_KEY_ID": "<access-key-id>",
+  "CRABBOX_ARTIFACTS_SECRET_ACCESS_KEY": "<secret-access-key>"
+}
+```
+
+Both values must be nonempty strings; no other fields are accepted. Use
+dedicated keys with Object Read & Write access scoped to the existing artifact
+bucket, not shared deployment keys. Replace the entire bundle to rotate the
+pair atomically, then run **Deploy Coordinator**, the existing serialized
+deployment owner. It deploys both runtime secrets in the same Worker version,
+together with `CRABBOX_DAYTONA_SNAPSHOT` when configured. An absent bundle
+preserves the existing artifact credentials; it does not clear them or change
+unrelated secret bindings.
+
 A typical R2-compatible configuration looks like:
 
 ```text
@@ -872,7 +899,13 @@ image references and never silently fall back to a mutable tag.
 ## Release Checklist
 
 The authoritative serialized release contract is [Release engineering](RELEASING.md).
-No event automatically publishes a tag or updates Homebrew.
+One explicit full release/publish request authorizes the complete normal sequence
+through closeout, without renewed chat approval at each stage. Narrow requests
+stay narrow. The original request supplies authorization; GitHub events alone
+do not. No event automatically publishes a tag. Publication makes the release eligible
+for the ordinary tap updater and independent generic reconciliation. Technical
+gates, identity binding, credential isolation, immutability, exact frozen inputs,
+actual exclusive-writer coordination, and cancellation boundaries still apply.
 
 Before creating or reusing a signed release tag:
 
@@ -893,7 +926,7 @@ Before creating or reusing a signed release tag:
 - Live smoke at least one coordinator-backed `crabbox run`, then verify `crabbox attach`, `crabbox events`, `crabbox logs`, and lease cleanup.
 - Push, pull, and wait for CI green on the release commit.
 
-Then advance exactly one gate at a time:
+Then advance sequentially under that authorization as each technical gate passes:
 
 1. **Tag trust.** Create or reuse an annotated signed `vX.Y.Z` tag. Verify it
    against the repository-pinned signer policy, capture the tag-object and
@@ -908,7 +941,7 @@ Then advance exactly one gate at a time:
    `Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)`, with hardened
    runtime and secure timestamps, then requires accepted notarization and
    online `codesign --check-notarization` proof before packaging.
-3. **Private draft.** With separate explicit authorization, create exactly one
+3. **Private draft.** After local verification succeeds, create exactly one
    GitHub draft for the captured pre-existing signed tag. Its title, exact eight
    assets, and body copied byte-for-byte from the tagged `CHANGELOG.md` section
    are immutable candidate inputs.
@@ -917,34 +950,42 @@ Then advance exactly one gate at a time:
    Intel jobs download assets with narrowly scoped credentials, remove all API,
    Actions, OIDC, and Homebrew credentials, then verify and execute the matching
    candidates in a clean environment.
-5. **Publication.** Stop for an explicit publication gate. Re-read and compare
-   the unchanged draft, successful native proofs, tag, protected verifier SHA,
-   notes, asset IDs, sizes, and digests. Publication is a single draft-state
+5. **Publication.** Establish and verify the administrative freeze of all release
+   writers required by [Release engineering](RELEASING.md#serialized-gates);
+   the release request is not evidence that the freeze is active. Re-read and
+   compare the unchanged draft, successful native proofs, tag, protected verifier
+   SHA, notes, asset IDs, sizes, and digests. Publication is a single draft-state
    transition; it does not rebuild, replace, or delete anything.
-6. **Published verification.** Re-download the public assets by immutable asset
-   ID and repeat the exact metadata, checksum, signature, notarization, native
-   execution, and notes proof. The proof must be newer than publication and
-   every release or asset mutation.
-7. **Public Go installation.** From fresh `HOME`, `GOPATH`, module/build caches,
-   and `GOBIN`, install
-   `github.com/openclaw/crabbox/cmd/crabbox@vX.Y.Z` using only the public Go
-   module proxy. Require exact replacement-free build metadata, the immutable
-   JSON Schema fork version, exact `--version`, `--help`, and `run --help` as
-   documented in [Release engineering](RELEASING.md#operator-command-sequence).
-8. **Homebrew.** Only after published verification and the public Go-install
-   proof, grant a separate tap-update
-   gate. Bind every formula URL and SHA-256 to the frozen release record, then
-   run the documented downstream verifier on clean native Apple Silicon and
-   Intel hosts. The verifier re-fetches the current public release and run,
-   authenticates both supplied native proof ZIPs against GitHub artifact
-   digests, and requires that successful run to be newer than publication and
-   every release or asset update. It then performs `brew update`, a fresh install or reinstall,
-   `brew test`, archive-to-install byte comparison, signature/notarization
-   checks, exact `crabbox --version`, and the Apple Silicon helper's
-   non-mutating `vmd-info` check. Those checks are the bounded installed-binary
-   smoke; they do not create a provider lease or authorize another mutation.
+6. **Homebrew update.** Publication establishes eligibility. Explicitly dispatch
+   the tap's ordinary `update-formula.yml` with `formula=crabbox`, the tag,
+   `repository=openclaw/crabbox`, and the four-target `assets` JSON constructed
+   by the runnable [handoff](RELEASING.md#operator-command-sequence). Do not wait
+   for public native or Go smoke results. The updater owns all-four URL/hash
+   maintenance and preserves maintained formula code. Retry the same handoff
+   after a failure; an already-current update is success. Never rebuild,
+   recreate a draft, or republish to retry Homebrew. Generic tap reconciliation
+   remains a valid fallback.
+7. **Independent channel smokes.** Run public-download/native verification,
+   fresh proxy-only public Go installation, and the installed-Homebrew verifier
+   independently. Homebrew needs only tag, assets, tag object, source commit,
+   verifier commit, and release ID, not public run IDs or proof ZIPs. Before
+   formula evaluation it checks immutable public bytes and static provenance.
+   Tap maintainers own executable Ruby, evaluated only credential-free; native
+   structured metadata must match the exact formula identity, version, URL,
+   and checksum. This is not a Ruby sandbox. Fresh fetch/install or reinstall,
+   installed-byte, signature/notarization, architecture, version, and arm64 VMD
+   trust checks are bounded smokes; they do not authorize unrelated provider mutations.
+8. **Closeout.** Record publication, tap update, and independent smoke results
+   (including outstanding failures). Verify release notes match the finalized
+   changelog; do not prefill the next `Unreleased` section. Finish authorized
+   release commits and leave the intended checkout clean and synchronized.
 
-On cancellation or uncertainty, stop all release and tap writes. Inspect and
-record the exact draft/public release and tap state, but do not delete a partial
-draft or release, replace assets, rewrite the tag, redispatch, publish, or
-update Homebrew. Resume only from a newly authorized serialized gate.
+On cancellation, stop this operator’s release and tap writes. Cancellation
+cannot stop independent reconciliation of an already-public release. Before
+publication, a failed gate or uncertainty also stops release writes.
+Inspect and record the exact draft/public release and tap state, but do not
+delete a partial draft or release, replace assets, rewrite the tag, redispatch, publish, or
+update Homebrew while stopped. Explicit cancellation requires renewed direction
+authorizing the next mutation. For a failed gate or uncertain state, resolve the
+blocker and re-establish the exact frozen state and required proofs before
+continuing under the original release authorization.

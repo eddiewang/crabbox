@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -128,12 +129,12 @@ func (b *coordinatorLeaseBackend) expectedProvider() (string, error) {
 	return canonicalProviderName(selectedProvider)
 }
 
-func (b *coordinatorLeaseBackend) coordinatorLeaseTarget(lease CoordinatorLease, coord *CoordinatorClient) (LeaseTarget, error) {
-	return b.coordinatorLeaseTargetForConfig(lease, b.cfg, coord)
-}
-
 func (b *coordinatorLeaseBackend) coordinatorLeaseTargetForConfig(lease CoordinatorLease, cfg Config, coord *CoordinatorClient) (LeaseTarget, error) {
 	if err := b.validateCoordinatorLeaseProviderIdentity(lease); err != nil {
+		return LeaseTarget{}, err
+	}
+	lease, err := selectCoordinatorLeaseSSHPort(lease, cfg)
+	if err != nil {
 		return LeaseTarget{}, err
 	}
 	server, target, leaseID := leaseToServerTarget(lease, cfg)
@@ -145,6 +146,19 @@ func (b *coordinatorLeaseBackend) coordinatorLeaseTargetForConfig(lease Coordina
 		return LeaseTarget{}, err
 	}
 	return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: coord}, nil
+}
+
+func selectCoordinatorLeaseSSHPort(lease CoordinatorLease, cfg Config) (CoordinatorLease, error) {
+	if !IsSSHPortExplicit(&cfg) || lease.Host == "" || coordinatorProviderReleaseConfirmed(lease) {
+		return lease, nil
+	}
+	// Explicit selection pins an advertised route before any SSH delivery;
+	// it cannot add endpoints or replay a workload on another port.
+	if !slices.Contains(append([]string{lease.SSHPort}, lease.SSHFallbackPorts...), cfg.SSHPort) {
+		return CoordinatorLease{}, exit(2, "SSH port %s is not advertised by coordinator lease %s; select its primary or fallback port, or remove the --ssh-port, ssh.port, or CRABBOX_SSH_PORT override to use automatic selection", cfg.SSHPort, lease.ID)
+	}
+	lease.SSHPort, lease.SSHFallbackPorts = cfg.SSHPort, []string{}
+	return lease, nil
 }
 
 func (b *coordinatorLeaseBackend) RebindResolvedLeaseTarget(target *LeaseTarget, leaseID string) error {
@@ -296,7 +310,7 @@ func reportCoordinatorAcquisitionRollback(stderr io.Writer, leaseID, reason stri
 		state = "retained the provider resource"
 	case coordinatorReleaseCleanupFailed(released):
 		state = "reported a cleanup failure or scheduled retry"
-	case released.State == "released" && released.CleanupStartedAt != "":
+	case coordinatorReleaseCleanupPending(released):
 		state = "is still pending"
 	}
 	fmt.Fprintf(stderr, "warning: release after %s for %s did not confirm provider cleanup (%s); local SSH artifacts were preserved\n", reason, leaseID, state)
@@ -732,7 +746,10 @@ func isCoordinatorStaleInstanceCleanedSignal(err error) bool {
 const coordinatorReleaseResolveTimeout = 10 * time.Second
 
 func (b *coordinatorLeaseBackend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error) {
+	cfg := b.cfg
 	if req.ReleaseOnly {
+		// Provider cleanup must not depend on an optional guest route selection.
+		cfg.explicitSSHPort = ""
 		// Leave the caller's budget available for the provider-scoped release fallback.
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, coordinatorReleaseResolveTimeout)
@@ -747,12 +764,12 @@ func (b *coordinatorLeaseBackend) Resolve(ctx context.Context, req ResolveReques
 			}
 			lease, adminErr = adminCoord.GetLease(ctx, req.ID)
 			if adminErr == nil {
-				return b.coordinatorLeaseTarget(lease, adminCoord)
+				return b.coordinatorLeaseTargetForConfig(lease, cfg, adminCoord)
 			}
 		}
 		return LeaseTarget{}, err
 	}
-	return b.coordinatorLeaseTarget(lease, b.coord)
+	return b.coordinatorLeaseTargetForConfig(lease, cfg, b.coord)
 }
 
 func (b *coordinatorLeaseBackend) Status(ctx context.Context, req StatusRequest) (statusView, error) {
@@ -767,6 +784,10 @@ func (b *coordinatorLeaseBackend) Status(ctx context.Context, req StatusRequest)
 		return statusView{}, err
 	}
 	if err := b.validateCoordinatorLeaseProviderIdentity(lease); err != nil {
+		return statusView{}, err
+	}
+	lease, err = selectCoordinatorLeaseSSHPort(lease, b.cfg)
+	if err != nil {
 		return statusView{}, err
 	}
 	server, target, leaseID := leaseToServerTarget(lease, b.cfg)
@@ -805,6 +826,7 @@ func (b *coordinatorLeaseBackend) Status(ctx context.Context, req StatusRequest)
 		IdleFor:              idleForString(lease.LastTouchedAt, time.Now()),
 		IdleTimeout:          formatSecondsDuration(lease.IdleTimeoutSeconds),
 		ExpiresAt:            lease.ExpiresAt,
+		CleanupStatus:        lease.CleanupStatus,
 		CleanupStartedAt:     lease.CleanupStartedAt,
 		CleanupError:         lease.CleanupError,
 		CleanupRetryAt:       lease.CleanupRetryAt,
@@ -936,6 +958,17 @@ func isCoordinatorUnauthorized(err error) bool {
 }
 
 func (b *coordinatorLeaseBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error {
+	_, err := b.ReleaseLeaseWithOutcome(ctx, req)
+	return err
+}
+
+func (b *coordinatorLeaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req ReleaseLeaseRequest) (ReleaseLeaseOutcome, error) {
+	var outcome ReleaseLeaseOutcome
+	err := b.releaseLease(ctx, req, &outcome)
+	return outcome, err
+}
+
+func (b *coordinatorLeaseBackend) releaseLease(ctx context.Context, req ReleaseLeaseRequest, outcome *ReleaseLeaseOutcome) error {
 	if req.Lease.LeaseID == "" {
 		return exit(2, "missing coordinator lease id")
 	}
@@ -946,7 +979,7 @@ func (b *coordinatorLeaseBackend) ReleaseLease(ctx context.Context, req ReleaseL
 	if err != nil {
 		return err
 	}
-	return finalizeLeaseClaimIfUnchangedAfter(req.Lease.LeaseID, claim, exists, func() (bool, error) {
+	return finalizeLeaseClaimIfUnchangedAfterContext(ctx, req.Lease.LeaseID, claim, exists, func() (bool, error) {
 		authority := claim
 		if !exists {
 			authority.LeaseID = req.Lease.LeaseID
@@ -954,11 +987,11 @@ func (b *coordinatorLeaseBackend) ReleaseLease(ctx context.Context, req ReleaseL
 		if err := AuthorizeCheckpointRelease(authority, req.CheckpointID); err != nil {
 			return false, err
 		}
-		return b.releaseLeaseUnderClaimFence(ctx, req)
+		return b.releaseLeaseUnderClaimFence(ctx, req, outcome)
 	}, syncControllerDirectory)
 }
 
-func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Context, req ReleaseLeaseRequest) (bool, error) {
+func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Context, req ReleaseLeaseRequest, outcome *ReleaseLeaseOutcome) (bool, error) {
 	if req.Lease.LeaseID == "" {
 		return false, exit(2, "missing coordinator lease id")
 	}
@@ -1026,12 +1059,13 @@ func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Contex
 			return false, nil
 		}
 		if coordinatorProviderReleaseConfirmed(released) {
+			outcome.Terminal = true
 			if cleanupReleasedCoordinatorLeaseArtifacts(b.rt.Stderr, req.Lease.LeaseID) != nil {
 				return false, nil
 			}
 			return true, nil
 		}
-		if coordinatorReleaseCleanupFailed(released) || released.State == "released" && released.CleanupStartedAt != "" {
+		if coordinatorReleaseCleanupFailed(released) || coordinatorReleaseCleanupPending(released) {
 			fmt.Fprintf(b.rt.Stderr, "warning: coordinator accepted release for %s; remote cleanup remains pending and local claim/SSH artifacts were preserved\n", req.Lease.LeaseID)
 			return false, nil
 		}
@@ -1045,6 +1079,7 @@ func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Contex
 		return false, nil
 	}
 	if coordinatorProviderReleaseConfirmed(released) {
+		outcome.Terminal = true
 		if cleanupReleasedCoordinatorLeaseArtifacts(b.rt.Stderr, req.Lease.LeaseID) != nil {
 			return false, nil
 		}

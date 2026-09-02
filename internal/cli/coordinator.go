@@ -106,6 +106,7 @@ type CoordinatorLease struct {
 	Telemetry             *LeaseTelemetry                `json:"telemetry,omitempty"`
 	TelemetryHistory      []*LeaseTelemetry              `json:"telemetryHistory,omitempty"`
 	CleanupAttempts       int                            `json:"cleanupAttempts,omitempty"`
+	CleanupStatus         string                         `json:"cleanupStatus,omitempty"`
 	CleanupStartedAt      string                         `json:"cleanupStartedAt,omitempty"`
 	CleanupError          string                         `json:"cleanupError,omitempty"`
 	CleanupRetryAt        string                         `json:"cleanupRetryAt,omitempty"`
@@ -2113,12 +2114,14 @@ func (c *CoordinatorClient) CreateRun(ctx context.Context, leaseID string, cfg C
 
 func (c *CoordinatorClient) FinishRun(ctx context.Context, runID string, exitCode int, sync, command time.Duration, log string, truncated bool, results *TestResultSummary, telemetry *RunTelemetrySummary, classification FailureClassification, receipt *terminalRunReceipt) (CoordinatorRun, error) {
 	var res CoordinatorRunResponse
+	log, changed := retainedRunLogText(log, maxRunLogBytes)
+	truncated = truncated || changed
 	logChunks := splitRunLogChunks(log)
 	body := map[string]any{
 		"exitCode":     exitCode,
 		"syncMs":       sync.Milliseconds(),
 		"commandMs":    command.Milliseconds(),
-		"log":          runLogFallbackPreview(log, truncated),
+		"log":          runLogFallbackPreview(log),
 		"logChunks":    logChunks,
 		"logTruncated": truncated,
 		"results":      results,
