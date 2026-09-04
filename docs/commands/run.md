@@ -34,11 +34,34 @@ The trailing command after `--` is sent to the box verbatim as argv. Use
 `--shell` to run it through the remote shell instead, for multi-statement
 snippets, pipes, or shell expansion.
 
+On POSIX SSH targets, `--shell` runs in a Bash login shell. Its startup and
+logout files are part of that shell's behavior: for example, `set -e` plus a
+failing `~/.bash_logout` command can change an explicit `exit 7` to exit 1.
+Crabbox reports the shell's actual status. To load the login environment but
+run a snippet in a separate non-login Bash, use argv explicitly:
+
+```sh
+crabbox run -- bash -c 'set -eu; ./scripts/test.sh'
+```
+
+This inner Bash inherits exported environment values, not unexported shell
+variables or functions from login startup files.
+
 On POSIX and WSL2 SSH targets, private command staging does not change the
 remote caller's umask for user work. Commands keep the target shell's creation
 policy; Crabbox's staged scripts, input, and workspace-owner state remain private.
 Keeping or reusing a POSIX SSH lease also preserves the remote caller's SIGINT
 and SIGQUIT dispositions, including intentionally ignored signals.
+
+Local Ctrl+C cancels the CLI's non-interactive SSH connection; it does not
+guarantee that the remote foreground process has stopped. A retained lease can
+therefore remain busy until that process exits. Crabbox preserves child
+ownership and refuses conflicting reuse or evidence collection instead of
+discarding the live process record. Stop a disposable lease with `crabbox stop
+--provider <provider> --id <lease>` when it is no longer needed. Static SSH hosts
+are never destroyed by stop: finish or terminate the known remote workload on
+that host before reusing its workspace. Do not delete owner records to bypass
+the busy check.
 
 ## Remote workspace root
 
@@ -139,6 +162,11 @@ not trigger this multiplexing recovery.
 
 Crabbox records a local repo claim for each reused lease. If a lease is already
 claimed by another repo, pass `--reclaim` to move the claim intentionally.
+For already-bound canonical IDs on native AWS, Machine0, and Daytona, run
+admission holds that claim through provider preparation and endpoint publication.
+A concurrent heartbeat cannot invalidate the command between those steps.
+Aliases, explicit reclaim, and coordinator-managed leases retain their existing
+resolution paths; stale heartbeat snapshots still fail the exact-claim check.
 
 `--idle-timeout` controls inactivity expiry (default `30m`); `--ttl` is the
 maximum wall-clock lifetime (default `90m`). Use `--stop-after
@@ -254,8 +282,10 @@ held through sync or fresh checkout, Actions hydration, the command, result and
 artifact collection, failure capture, and ready-pool scrub/return. Separate
 clients and `watch` iterations therefore cannot mutate or execute the same
 reused workspace concurrently. A contending client waits for a bounded interval
-and prints periodic progress. Newly acquired one-shot leases are already
-exclusive and bypass this owner.
+and prints periodic progress. Newly acquired exclusive one-shot leases bypass
+this owner on POSIX and WSL2 targets. Native Windows also uses the owner for
+fresh one-shot runs: its witness stages inherited SSH input into an ordinary
+redirected file stream before upload, sync, or user commands read it.
 
 Ownership is fenced with a random token and renewed while the lifecycle is
 active. If the local client disappears, Crabbox recovers an expired owner only
@@ -263,6 +293,17 @@ after verifying that its witnessed remote child is no longer alive. Ambiguous
 renewal, release, token, or child state fails closed instead of risking a
 concurrent checkout. POSIX, WSL2, and native Windows targets implement the same
 protocol; the small sync-finalization lock remains nested inside it.
+
+Renewal errors retain recognized `MISMATCH`, `EXPIRED`, and `AMBIGUOUS` protocol
+states alongside transport errors. Unrecognized response text is omitted. These
+diagnostics do not retry renewal or permit collection or cleanup after ownership
+fails closed.
+
+Native Windows stages owner scripts and witnessed command input with exact byte
+counts and asynchronous pipe reads. Empty frames complete without initializing
+stdin; nonempty frames leave any following bytes available. Incomplete input
+fails before the staged script or command runs. A transport failure during
+renewal still fails closed.
 
 Use `--full-resync` (alias `--fresh-sync`) when a warm lease smells stale:
 Crabbox deletes the remote workdir, skips the fingerprint fast path, reseeds Git

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -44,7 +43,7 @@ func TestWindowsPowerShellStdinScriptCommandUsesExactLengthFrame(t *testing.T) {
 	decoded := decodePowerShellCommand(t, command)
 	for _, want := range []string{
 		"$remaining = [Int64]12345",
-		"$stdin.Read($buffer, 0, $readSize)",
+		"$stdin.ReadAsync($buffer, 0, $readSize).GetAwaiter().GetResult()",
 		"SSH stdin ended before the framed payload",
 		"$scriptFile.Flush($true)",
 		"-File $path",
@@ -1540,7 +1539,7 @@ printf 'executed once\n'
 			if len(lines) != test.wantCalls {
 				t.Fatalf("ssh calls=%d, want %d:\n%s", len(lines), test.wantCalls, calls)
 			}
-			if got := strings.Contains(lines[len(lines)-1], "ControlMaster=no"); got != test.wantDirect {
+			if got := strings.Contains(lines[len(lines)-1], "ControlMaster=no"); !test.authSecret && got != test.wantDirect {
 				t.Fatalf("last SSH invocation disables multiplexing=%t, want %t:\n%s", got, test.wantDirect, calls)
 			}
 			if (test.wantCode == 0 || test.mode == "nested-ssh" || test.mode == "server-disconnect") && stdout.String() != "executed once\n" {
@@ -3698,6 +3697,125 @@ func requireGitOutput(t *testing.T, workdir, want string, args ...string) {
 	}
 }
 
+func newGitCoherenceFixtureWithDeletedTopic(t *testing.T) gitCoherenceFixture {
+	t.Helper()
+	f := newGitCoherenceFixture(t)
+	runGit(t, f.origin, "update-ref", "refs/heads/alpha-deleted", f.b)
+	runGit(t, f.origin, "update-ref", "refs/heads/release", f.c)
+	runGit(t, f.source, "fetch", "--no-prune", "origin", "+refs/heads/*:refs/remotes/origin/*")
+	runGit(t, f.origin, "update-ref", "-d", "refs/heads/alpha-deleted")
+	runGit(t, f.source, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	runGit(t, f.source, "checkout", "--quiet", "--detach", f.b)
+	requireGitOutput(t, f.origin, "", "for-each-ref", "refs/heads/alpha-deleted")
+	requireGitOutput(t, f.source, f.b, "rev-parse", "refs/remotes/origin/alpha-deleted")
+	refs := gitOutput(f.source, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", "refs/remotes/origin")
+	t.Cleanup(func() {
+		requireGitOutput(t, f.source, refs, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", "refs/remotes/origin")
+		requireGitOutput(t, f.source, f.b, "rev-parse", "HEAD")
+	})
+	return f
+}
+
+func TestRemoteGitSeedAndCoherencePreferContainingBranchOverDeletedTopic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell Git seed/coherence fixture")
+	}
+	t.Parallel()
+	f := newGitCoherenceFixtureWithDeletedTopic(t)
+	for _, tc := range []struct {
+		name, configuredBase, baseRef, want string
+	}{
+		{"repository base", "", "main", "main"},
+		{"origin default", "", "missing", "main"},
+		{"configured base after default deletion", "release", "main", "release"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reusedWorkdir := f.workspace(t, f.c, true)
+			if tc.configuredBase != "" {
+				runGit(t, f.origin, "update-ref", "-d", "refs/heads/main")
+				requireGitOutput(t, f.source, f.c, "rev-parse", "refs/remotes/origin/main")
+			}
+			cfg := baseConfig()
+			cfg.Sync.BaseRef = tc.configuredBase
+			plan, blocked := syncGitCoherencePlan(cfg, Repo{
+				Root: f.source, RemoteURL: f.origin, Head: f.b, BaseRef: tc.baseRef,
+			})
+			if blocked || !plan.enabled() {
+				t.Fatalf("coherence plan unavailable: blocked=%v plan=%#v", blocked, plan)
+			}
+			for _, mode := range []string{"seed", "coherence"} {
+				t.Run(mode, func(t *testing.T) {
+					var workdir string
+					if mode == "seed" {
+						workdir = filepath.Join(t.TempDir(), "work")
+						if out, err := exec.Command("/bin/sh", "-c", remoteGitSeed(workdir, plan)).CombinedOutput(); err != nil {
+							t.Fatalf("seed via %q: %v\n%s", plan.Branch, err, out)
+						}
+					} else {
+						workdir = reusedWorkdir
+						mustWriteTestFile(t, filepath.Join(workdir, "tracked.txt"), "B\n")
+						const token = "abababababababababababababababab"
+						stageCoherenceFinalize(t, workdir, token)
+						if out, err := runCoherenceFinalize(workdir, plan, token, "fp-b"); err != nil {
+							t.Fatalf("coherence via %q: %v\n%s", plan.Branch, err, out)
+						}
+						if got := readCoherentFingerprint(t, workdir, plan); got != "fp-b" {
+							t.Fatalf("coherent fingerprint=%q", got)
+						}
+					}
+					if plan.Branch != tc.want {
+						t.Fatalf("branch=%q, want %q", plan.Branch, tc.want)
+					}
+					requireGitOutput(t, workdir, f.b, "rev-parse", "HEAD")
+					requireGitOutput(t, workdir, gitOutput(f.source, "rev-parse", f.b+"^{tree}"), "write-tree")
+					requireGitOutput(t, workdir, f.c, "rev-parse", "refs/remotes/origin/"+tc.want)
+					requireGitOutput(t, workdir, "", "status", "--porcelain")
+				})
+			}
+		})
+	}
+}
+
+func TestWindowsGitSeedAndCoherenceUseContainingBranch(t *testing.T) {
+	t.Parallel()
+	f := newGitCoherenceFixtureWithDeletedTopic(t)
+	plan, blocked := syncGitCoherencePlan(baseConfig(), Repo{
+		Root: f.source, RemoteURL: f.origin, Head: f.b, BaseRef: "origin/main",
+	})
+	if blocked || !plan.enabled() {
+		t.Fatalf("coherence plan unavailable: blocked=%v plan=%#v", blocked, plan)
+	}
+	tree := gitOutput(f.source, "rev-parse", f.b+"^{tree}")
+	for _, tc := range []struct {
+		name, command string
+		want          []string
+	}{
+		{"seed", windowsGitSeed(`C:\work\repo`, plan), []string{
+			"--single-branch --branch 'main' $expectedOrigin $tmp",
+			"checkout --quiet --detach '" + f.b + "'",
+			"$expectedTree = '" + tree + "'",
+		}},
+		{"coherence", windowsGitCoherence(`C:\work\repo`, plan), []string{
+			`("+refs/heads/" + 'main' + ":" + $tmpRef)`,
+			"$target = '" + f.b + "'; $tree = '" + tree + "'",
+			"git merge-base --is-ancestor $target $tmpRef",
+			"git update-ref --no-deref HEAD $target $oldHead",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decoded := decodePowerShellCommand(t, tc.command)
+			for _, want := range tc.want {
+				if !strings.Contains(decoded, want) {
+					t.Errorf("Windows %s missing %q (plan branch=%q)", tc.name, want, plan.Branch)
+				}
+			}
+			if strings.Contains(decoded, "alpha-deleted") || strings.Contains(decoded, f.c) {
+				t.Error("Windows command selected deleted topic or newer branch tip")
+			}
+		})
+	}
+}
+
 func TestRemoteGitCoherenceExitTrapBehavior(t *testing.T) {
 	fixture := newGitCoherenceFixture(t)
 
@@ -4643,6 +4761,13 @@ func TestRemoteGitOriginTransportClassification(t *testing.T) {
 		{name: "DNS", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: Could not resolve host: example.test", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
 		{name: "TLS", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: SSL certificate problem: unable to get local issuer certificate", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
 		{name: "firewall", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: No route to host", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
+		{name: "disconnected socket Linux", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access 'https://example.test/repo.git/': getpeername() failed with errno 107: Transport endpoint is not connected", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
+		{name: "disconnected socket BSD", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: getpeername() failed with errno 57: Socket is not connected", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
+		{name: "other socket inspection error", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: getpeername() failed with errno 9: Bad file descriptor", exitCode: gitOriginRuntimeFallbackExitCode},
+		{name: "unclassified HTTP failure", remoteURL: "https://example.test/repo.git", message: "fatal: unable to access: unknown transport failure", exitCode: gitOriginRuntimeFallbackExitCode},
+		{name: "HTTP server failure beats disconnected socket", remoteURL: "https://example.test/repo.git", message: "fatal: The requested URL returned error: 503\ngetpeername() failed with errno 107: Transport endpoint is not connected", exitCode: gitOriginRuntimeFallbackExitCode},
+		{name: "disconnected socket wrong exit", remoteURL: "https://example.test/repo.git", message: "getpeername() failed with errno 107: Transport endpoint is not connected", exitCode: 67},
+		{name: "disconnected socket truncated", remoteURL: "https://example.test/repo.git", message: "getpeername() failed with errno 107: Transport endpoint is not connected", exitCode: gitOriginRuntimeFallbackExitCode, truncated: true},
 		{name: "private HTTP repository", remoteURL: "https://example.test/repo.git", message: "remote: Repository not found.", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_auth_required", wantFallback: true},
 		{name: "filesystem unavailable", remoteURL: "/srv/git/repo.git", message: "fatal: '/srv/git/repo.git' does not appear to be a git repository", exitCode: gitOriginRuntimeFallbackExitCode, wantReason: "origin_unavailable", wantFallback: true},
 		{name: "HTTP server failure beats transport", remoteURL: "https://example.test/repo.git", message: "fatal: The requested URL returned error: 503; Failed to connect", exitCode: gitOriginRuntimeFallbackExitCode},
@@ -4721,49 +4846,23 @@ func TestRemoteGitOriginAttemptCommandsDeferPolicyToGo(t *testing.T) {
 func newGitTransportFailureHTTPServer(t *testing.T) string {
 	t.Helper()
 
-	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var (
-		acceptErr error
-		wait      sync.WaitGroup
-	)
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		for {
-			conn, err := listener.AcceptTCP()
-			if err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					acceptErr = err
-				}
-				return
-			}
-			if err := conn.SetLinger(0); err != nil {
-				acceptErr = fmt.Errorf("set transport failure linger: %w", err)
-				_ = conn.Close()
-				_ = listener.Close()
-				return
-			}
-			if err := conn.Close(); err != nil {
-				acceptErr = fmt.Errorf("reset transport failure connection: %w", err)
-				_ = listener.Close()
-				return
-			}
+	// Wait for the HTTP request before closing: resetting immediately after
+	// accept races libcurl's connection inspection and varies its diagnostic.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "" {
+			t.Error("transport failure fixture received origin credentials")
 		}
-	}()
-	t.Cleanup(func() {
-		closeErr := listener.Close()
-		wait.Wait()
-		if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			t.Errorf("close transport failure listener: %v", closeErr)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack transport failure connection: %v", err)
+			return
 		}
-		if acceptErr != nil {
-			t.Errorf("serve transport failure listener: %v", acceptErr)
+		if err := conn.Close(); err != nil {
+			t.Errorf("close transport failure connection: %v", err)
 		}
-	})
-	return "http://" + listener.Addr().String()
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
 }
 
 func runGitControlWithShellHook(t *testing.T, hook, command string) ([]byte, error) {
@@ -4849,12 +4948,14 @@ func TestRemoteGitMetadataControlsIgnoreShellHooks(t *testing.T) {
 	}
 	f := newGitCoherenceFixture(t)
 	for _, hook := range []string{"logout", "BASH_ENV"} {
-		for _, operation := range []string{"hydrate status", "fingerprint", "seed manifest"} {
+		for _, operation := range []string{"hydrate status", "fingerprint", "seed manifest", "discard pending"} {
 			t.Run(hook+"/"+operation, func(t *testing.T) {
 				workdir := f.workspace(t, f.c, false)
 				plan := f.plan(t, f.c)
 				meta := coherenceMetaDir(t, workdir)
 				var command, want string
+				var discarded []string
+				var preserved map[string]string
 				switch operation {
 				case "hydrate status":
 					mustWriteTestFile(t, filepath.Join(meta, "git-hydrate-base"), "main "+f.c+"\n")
@@ -4866,6 +4967,22 @@ func TestRemoteGitMetadataControlsIgnoreShellHooks(t *testing.T) {
 					command, want = remoteReadSyncFingerprint(workdir, plan), "coherent"
 				case "seed manifest":
 					command = remoteSeedSyncManifestFromGit(workdir)
+				case "discard pending":
+					const token = "81818181818181818181818181818181"
+					const neighbor = "82828282828282828282828282828282"
+					discarded = []string{remoteSyncPendingManifestName(token), remoteSyncPendingDeletedName(token)}
+					preserved = map[string]string{
+						remoteSyncPendingManifestName(neighbor): "neighbor.txt\x00",
+						remoteSyncPendingDeletedName(neighbor):  "neighbor-deleted.txt\x00",
+						"sync-manifest":                         "committed.txt\x00",
+					}
+					for _, name := range discarded {
+						mustWriteTestFile(t, filepath.Join(meta, name), "discard.txt\x00")
+					}
+					for name, value := range preserved {
+						mustWriteTestFile(t, filepath.Join(meta, name), value)
+					}
+					command = remoteDiscardSyncPendingMetadata(workdir, token, false)
 				}
 				out, err := runGitControlWithShellHook(t, hook, command)
 				if err != nil || string(out) != want {
@@ -4875,6 +4992,16 @@ func TestRemoteGitMetadataControlsIgnoreShellHooks(t *testing.T) {
 					wantManifest := "deleted.txt\x00modified.txt\x00other/omit.txt\x00src/keep.txt\x00tracked.txt\x00"
 					if data, readErr := os.ReadFile(filepath.Join(meta, "sync-manifest")); readErr != nil || string(data) != wantManifest {
 						t.Fatalf("seeded manifest=%q err=%v", data, readErr)
+					}
+				}
+				for _, name := range discarded {
+					if _, statErr := os.Stat(filepath.Join(meta, name)); !os.IsNotExist(statErr) {
+						t.Fatalf("discarded pending metadata %s survived: %v", name, statErr)
+					}
+				}
+				for name, value := range preserved {
+					if data, readErr := os.ReadFile(filepath.Join(meta, name)); readErr != nil || string(data) != value {
+						t.Fatalf("discard changed neighboring metadata %s: data=%q err=%v", name, data, readErr)
 					}
 				}
 			})
@@ -4941,6 +5068,9 @@ func TestRemoteGitSeedClassifiesRuntimeOriginFailures(t *testing.T) {
 			}
 			out, err := exec.Command("bash", "-lc", remoteGitSeed(workdir, plan)).CombinedOutput()
 			reason, fallback := gitOriginRuntimeFallbackResult(plan.RemoteURL, string(out), err)
+			if kind == "HTTP transport" && !strings.Contains(string(out), "Empty reply from server") {
+				t.Fatalf("transport fixture did not close after the HTTP request: err=%v output=%q", err, out)
+			}
 			wantReason := "origin_unavailable"
 			wantFallback := true
 			if kind == "private HTTP" {

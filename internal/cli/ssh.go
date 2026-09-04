@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -234,6 +235,13 @@ const sshCommandWaitDelay = 5 * time.Second
 
 func sshCommandContext(ctx context.Context, target SSHTarget, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, directSSHExecutable(), args...)
+	// Cmd.Start returns preparation errors before spawning an unowned listener.
+	if cmd.Err == nil {
+		cmd.Err = context.Cause(ctx)
+		if cmd.Err == nil {
+			cmd.Err = ensureSSHControlDirectory(target)
+		}
+	}
 	// A cancelled multiplexed SSH session can leave its ControlPersist master
 	// holding inherited pipes after the session process exits. Bound Go's pipe
 	// drain so cancellation cannot strand the caller in Cmd.Wait.
@@ -467,8 +475,9 @@ func probeWSL2SSHReady(ctx context.Context, target *SSHTarget, profile sshReadin
 		probe := *target
 		probe.Port, probe.FallbackPorts = port, []string{}
 		run := func(remote string) error {
-			args := sshArgsNoInputWithOptions(probe, wsl2ReadinessCommand(remote), profile.connectTimeout, profile.connectionAttempts)
-			return runSSHCommand(sshCommandContext(ctx, probe, args...), io.Discard, io.Discard)
+			command := sshTransportPreparation{command: wsl2ReadinessCommand(remote)}
+			_, err := command.runOnce(ctx, probe, profile.connectTimeout, profile.connectionAttempts, io.Discard, io.Discard, false)
+			return err
 		}
 		if err := run(sshTransportProbeCommand(probe)); err != nil {
 			outcomes = append(outcomes, outcome{err: err})
@@ -601,9 +610,9 @@ func resolveSSHPortNoInput(ctx context.Context, target *SSHTarget, connectTimeou
 	var err error
 	for index, port := range ports {
 		probe.Port = port
-		args := sshArgsNoInputWithOptions(probe, sshTransportProbeCommand(probe), connectTimeout, connectionAttempts)
+		command := sshTransportPreparation{command: sshTransportProbeCommand(probe)}
 		var diagnostic synchronizedBuffer
-		err = runSSHCommand(sshCommandContext(ctx, probe, args...), io.Discard, &diagnostic)
+		_, err = command.runOnce(ctx, probe, connectTimeout, connectionAttempts, io.Discard, &diagnostic, false)
 		if err == nil {
 			target.Port, target.FallbackPorts = port, []string{}
 			return nil
@@ -707,6 +716,20 @@ func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget,
 	args := sshArgsNoInputWithOptions(target, p.command, connectTimeout, connectionAttempts)
 	if p.direct != nil {
 		args = sshArgsWithOptions(target, p.command, connectTimeout, connectionAttempts)
+	}
+	if target.AuthSecret {
+		// Every command, including probes and workspace witnesses, needs the same
+		// private identity config as copy/forward transports. Keep it until Wait.
+		session, sessionErr := newSSHTransportSession(ctx, target, false)
+		if sessionErr != nil {
+			return false, sessionErr
+		}
+		defer func() { err = errors.Join(err, session.Close()) }()
+		args = session.commandPrefixWithOptions(connectTimeout, connectionAttempts)
+		if p.direct == nil {
+			args = append(args, "-n")
+		}
+		args = append(args, session.host(), p.command)
 	}
 	cmd := sshCommandContext(ctx, target, args...)
 	input, err := p.reset()
@@ -1198,6 +1221,10 @@ func sshControlPath(target SSHTarget) string {
 		strings.TrimSpace(target.SSHHostKey),
 		target.ProxyCommand,
 	}, "\x00")
+	if leaseDir := sshControlLeaseDirectory(target); leaseDir != "" {
+		sum := sha256.Sum256([]byte(scope))
+		return filepath.Join(sshControlDirectory(leaseDir), base64.RawURLEncoding.EncodeToString(sum[:16])+"-%C")
+	}
 	sum := sha1.Sum([]byte(scope))
 	return filepath.Join("/tmp", "crabbox-ssh-"+hex.EncodeToString(sum[:4])+"-%C")
 }
@@ -1612,16 +1639,32 @@ func powershellCommand(script string) string {
 	return "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 }
 
+// Win32-OpenSSH inherits an overlapped pipe. Use its asynchronous handle contract
+// so a pending SSH write can complete before the server closes stdin at EOF.
 func windowsPowerShellCopyExactInput(destination string, inputSize int64) string {
-	return `$stdin = [Console]::OpenStandardInput()
-$remaining = [Int64]` + strconv.FormatInt(inputSize, 10) + `
-$buffer = New-Object byte[] 65536
-while ($remaining -gt 0) {
-	$readSize = [int][Math]::Min([Int64]$buffer.Length, $remaining)
-	$read = $stdin.Read($buffer, 0, $readSize)
-	if ($read -le 0) { throw "SSH stdin ended before the framed payload" }
-	` + destination + `.Write($buffer, 0, $read)
-	$remaining -= $read
+	// An empty frame must not bind stdin, which may already be at EOF.
+	// Disable FileStream read-ahead so bytes after this frame remain on stdin.
+	return `$remaining = [Int64]` + strconv.FormatInt(inputSize, 10) + `
+if ($remaining -gt 0) {
+	if (-not ("Cbx.SshStdin" -as [type])) {
+		Add-Type -Name SshStdin -Namespace Cbx -MemberDefinition '[DllImport("kernel32.dll")]public static extern IntPtr GetStdHandle(int n);'
+	}
+	$stdinHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new([Cbx.SshStdin]::GetStdHandle(-10), $false)
+	$stdin = $null
+	try {
+		$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true)
+		$buffer = New-Object byte[] 65536
+		while ($remaining -gt 0) {
+			$readSize = [int][Math]::Min([Int64]$buffer.Length, $remaining)
+			$read = $stdin.ReadAsync($buffer, 0, $readSize).GetAwaiter().GetResult()
+			if ($read -le 0) { throw "SSH stdin ended before the framed payload" }
+			` + destination + `.Write($buffer, 0, $read)
+			$remaining -= $read
+		}
+	} finally {
+		if ($null -ne $stdin) { $stdin.Dispose() }
+		$stdinHandle.Dispose()
+	}
 }
 `
 }
@@ -2123,6 +2166,21 @@ func remoteWriteSyncManifestsNewForTargetMode(target SSHTarget, workdir, finaliz
 		return remoteWriteSyncManifestsNewPythonMode(workdir, finalizeToken, plainManifest)
 	}
 	return remoteWriteSyncManifestsNewMode(workdir, finalizeToken, plainManifest)
+}
+
+func remoteDiscardSyncPendingMetadata(workdir, finalizeToken string, plainManifest bool) string {
+	metadataScript := remoteSyncMetaDirScript()
+	shellCommand := remoteGitControlShellCommand
+	if plainManifest {
+		metadataScript = remotePlainManifestGitFunction() + remotePlainManifestSyncMetaDirScript()
+		shellCommand = remotePlainManifestShellCommand
+	}
+	script := `set -e
+cd ` + shellQuote(workdir) + `
+` + metadataScript + `
+/bin/rm -f -- "$meta_dir/` + remoteSyncPendingManifestName(finalizeToken) + `" "$meta_dir/` + remoteSyncPendingDeletedName(finalizeToken) + `"
+`
+	return shellCommand(script)
 }
 
 func remoteWriteSyncManifestsNewPython(workdir, finalizeToken string) string {

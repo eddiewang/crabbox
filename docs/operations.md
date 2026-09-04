@@ -388,6 +388,31 @@ the shutdown timeout.
 PostgreSQL state and pg-boss jobs are durable, but lifecycle serialization and
 live bridge ownership remain process-local. Do not horizontally scale yet.
 
+Durable provisioning uses the existing KV table for its private sorted due
+index and transactional wake outbox. pg-boss is a notification hint for this
+work: immediate startup reconciliation and a one-second scanner inspect the
+committed due index independently of the legacy alarm queue. Queue deletion,
+enqueue failure, or a missing queued job must not strand an admitted operation.
+Cloudflare commits due changes and native alarms in the same Durable Object
+transaction; legacy reschedule/clear operations preserve the earliest durable
+due time. Constructor repair performs bounded storage work only.
+
+Alarms await the bounded provisioning tick and wake commit. Slow legacy
+maintenance is a runtime-owned single-flight task, with sanitized failures and
+retry scheduling. Node tracks and drains that task during shutdown. Manual
+admin sweep endpoints still await their actual operation. `waitUntil` and
+pg-boss do not replace the durable operation/claim records.
+
+Keep `CRABBOX_DURABLE_PROVISIONING_ADMISSION` unset or `false` until the
+journal-aware version and a stable existing `CRABBOX_SESSION_SECRET` are ready.
+Setting the gate to `false` stops new admissions but resumes existing journals.
+The session secret must be distinct from the shared token and at least 32
+characters; missing, changed or lost encryption material blocks affected
+forward replay without deleting cleanup evidence. Do not provision or rotate a
+secret as an implicit part of enabling this feature. Resolve existing shared
+infrastructure and cleanup debt before enabling new admissions; never erase
+old cleanup records based on the presence of a new operation.
+
 ### Dedicated AWS private-workspace service
 
 Use the checked-in ECS Fargate deployment when one Node/PostgreSQL coordinator
@@ -905,15 +930,17 @@ stay narrow. The original request supplies authorization; GitHub events alone
 do not. No event automatically publishes a tag. Publication makes the release eligible
 for the ordinary tap updater and independent generic reconciliation. Technical
 gates, identity binding, credential isolation, immutability, exact frozen inputs,
-actual exclusive-writer coordination, and cancellation boundaries still apply.
+immediate publication readbacks, and cancellation boundaries still apply.
+Publication does not require a particular PR-approval ruleset or an
+administrative writer freeze; existing GitHub merge protections still apply.
 
 Before creating or reusing a signed release tag:
 
-- Rebase release preparation on the current `main`, restore the full changelog from the latest tag if concurrent work regressed it, and verify every published version remains represented.
-- Reorder `CHANGELOG.md` with the user-facing changes first, date the release section, and keep contributor thanks / co-author notes intact.
+- Rebase release preparation on the current `main`, restore missing published history from the latest tag while preserving `Unreleased` and other new entries, and verify every published version remains represented.
+- Finalize the `Unreleased` entries maintained as work lands into a versioned, dated release section in `CHANGELOG.md`, with user-facing changes first and contributor thanks / co-author notes intact.
 - Update every package metadata file that carries the project version. The current release surface is `worker/package.json` plus both root package entries in `worker/package-lock.json`; the removed root plugin package must not be recreated.
 - `go vet ./...`
-- `go test -race ./...`
+- `go test -race -timeout=15m ./...`
 - `scripts/test-go-modules.sh`
 - `scripts/verify-go-install.sh v0.0.0 "$(git rev-parse HEAD)"`
 - `go build -trimpath -o bin/crabbox ./cmd/crabbox`
@@ -950,12 +977,14 @@ Then advance sequentially under that authorization as each technical gate passes
    Intel jobs download assets with narrowly scoped credentials, remove all API,
    Actions, OIDC, and Homebrew credentials, then verify and execute the matching
    candidates in a clean environment.
-5. **Publication.** Establish and verify the administrative freeze of all release
-   writers required by [Release engineering](RELEASING.md#serialized-gates);
-   the release request is not evidence that the freeze is active. Re-read and
+5. **Publication.** Follow the exact-record checks in
+   [Release engineering](RELEASING.md#serialized-gates). Re-read and
    compare the unchanged draft, successful native proofs, tag, protected verifier
    SHA, notes, asset IDs, sizes, and digests. Publication is a single draft-state
-   transition; it does not rebuild, replace, or delete anything.
+   transition; it does not rebuild, replace, or delete anything. The final read
+   and publication are not atomic: no administrative freeze is required, and
+   a detected post-publication mismatch is an incident, not permission to rewrite
+   the release.
 6. **Homebrew update.** Publication establishes eligibility. Explicitly dispatch
    the tap's ordinary `update-formula.yml` with `formula=crabbox`, the tag,
    `repository=openclaw/crabbox`, and the four-target `assets` JSON constructed
@@ -977,8 +1006,10 @@ Then advance sequentially under that authorization as each technical gate passes
    trust checks are bounded smokes; they do not authorize unrelated provider mutations.
 8. **Closeout.** Record publication, tap update, and independent smoke results
    (including outstanding failures). Verify release notes match the finalized
-   changelog; do not prefill the next `Unreleased` section. Finish authorized
-   release commits and leave the intended checkout clean and synchronized.
+   release section in the changelog. Keep later user-visible work under
+   `Unreleased` on `main`, without rewriting the frozen tagged source or
+   published notes for downstream retries. Finish authorized release commits
+   and leave the intended checkout clean and synchronized.
 
 On cancellation, stop this operator’s release and tap writes. Cancellation
 cannot stop independent reconciliation of an already-public release. Before
@@ -989,3 +1020,20 @@ update Homebrew while stopped. Explicit cancellation requires renewed direction
 authorizing the next mutation. For a failed gate or uncertain state, resolve the
 blocker and re-establish the exact frozen state and required proofs before
 continuing under the original release authorization.
+
+### Durable provisioning record diagnostics
+
+The private `provisioning-quarantine:` namespace records unsupported operation
+schemas or inconsistent attempt revisions. Their original operation, attempt and
+material records remain untouched, and continue to fence legacy cleanup. The
+controller removes their runnable due entry so unrelated jobs can progress.
+Inspect these records with the corresponding implementation version before any
+manual repair; deleting a marker or changing a schema number does not establish
+provider ownership or successful cleanup. Stale due entries without a matching
+live operation are removed transactionally during the bounded controller tick.
+
+Nonsecret plan/attempt histories and exact completed Azure deletion claims are
+retained alongside lease history without automatic pruning. Do not remove
+retained or unresolved histories to clear a cleanup incident. The shared Azure
+scope lock is released after settled terminal/retained completion; an unresolved
+shared-infrastructure write intentionally keeps its lock pending resolution.

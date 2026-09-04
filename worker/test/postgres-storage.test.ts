@@ -8,7 +8,7 @@ import {
   acquireCheckpointUse,
   finishCheckpointUse,
   backfillFailedCheckpointCreateRecovery,
-  bindCheckpointUseProvisioning,
+  bindCheckpointUseProvisioningInTransaction,
   checkpointDueKey,
   checkpointKey,
   checkpointLimits,
@@ -23,6 +23,7 @@ import {
 import type { CoordinatorRuntime } from "../src/coordinator-runtime";
 import {
   FleetCoordinator,
+  readyPoolDesiredCapacityKeyV2,
   readyPoolSeedDigestV1,
   backfillCheckpointCreateAttempt,
 } from "../src/fleet";
@@ -367,7 +368,16 @@ describe("PostgresCoordinatorStorage", () => {
         updatedAt: now,
       } satisfies CreateAttemptRecord;
       await storage.put(`create-attempt:${leaseID}`, attempt);
-      await bindCheckpointUseProvisioning(storage, id, claim.token, principal, attemptID, leaseID);
+      await storage.transaction((transaction) =>
+        bindCheckpointUseProvisioningInTransaction(
+          transaction,
+          id,
+          attempt.checkpointUseClaimHash,
+          principal,
+          attemptID,
+          leaseID,
+        ),
+      );
       await storage.put(`lease:${leaseID}`, {
         id: leaseID,
         state: "active",
@@ -574,6 +584,7 @@ describe("PostgresCoordinatorStorage", () => {
     const claims = await Promise.all(
       checkpointIDs.map(async (id) => await acquireCheckpointUse(storage, id, principal)),
     );
+    const claimHashes = await Promise.all(claims.map((claim) => sha256Hex(claim.token)));
     const ordinaryAttempt = {
       version: 1,
       requestedLeaseID,
@@ -586,32 +597,36 @@ describe("PostgresCoordinatorStorage", () => {
     } satisfies CreateAttemptRecord;
     await storage.put(`create-attempt:${requestedLeaseID}`, ordinaryAttempt);
     await expect(
-      bindCheckpointUseProvisioning(
-        storage,
-        checkpointIDs[0]!,
-        claims[0]!.token,
-        principal,
-        attemptID,
-        requestedLeaseID,
+      storage.transaction((transaction) =>
+        bindCheckpointUseProvisioningInTransaction(
+          transaction,
+          checkpointIDs[0]!,
+          claimHashes[0]!,
+          principal,
+          attemptID,
+          requestedLeaseID,
+        ),
       ),
     ).rejects.toMatchObject({ code: "create_attempt_binding_conflict" });
     expect(await storage.get(`create-attempt:${requestedLeaseID}`)).toEqual(ordinaryAttempt);
     await storage.put(`create-attempt:${requestedLeaseID}`, {
       ...ordinaryAttempt,
       checkpointID: checkpointIDs[0],
-      checkpointUseClaimHash: await sha256Hex(claims[0]!.token),
+      checkpointUseClaimHash: claimHashes[0]!,
     } satisfies CreateAttemptRecord);
 
     const results = await Promise.allSettled(
       checkpointIDs.map(
         async (checkpointID, index) =>
-          await bindCheckpointUseProvisioning(
-            storage,
-            checkpointID,
-            claims[index]!.token,
-            principal,
-            attemptID,
-            requestedLeaseID,
+          await storage.transaction((transaction) =>
+            bindCheckpointUseProvisioningInTransaction(
+              transaction,
+              checkpointID,
+              claimHashes[index]!,
+              principal,
+              attemptID,
+              requestedLeaseID,
+            ),
           ),
       ),
     );
@@ -687,6 +702,7 @@ describe("PostgresCoordinatorStorage", () => {
       target: "linux",
     } satisfies CoordinatorCheckpointRecord);
     const claim = await acquireCheckpointUse(storage, checkpointID, principal);
+    const tokenHash = await sha256Hex(claim.token);
     await storage.put(`create-attempt:${requestedLeaseID}`, {
       version: 1,
       requestedLeaseID,
@@ -695,17 +711,19 @@ describe("PostgresCoordinatorStorage", () => {
       org: principal.org,
       state: "pending",
       checkpointID,
-      checkpointUseClaimHash: await sha256Hex(claim.token),
+      checkpointUseClaimHash: tokenHash,
       createdAt: now,
       updatedAt: now,
     } satisfies CreateAttemptRecord);
-    await bindCheckpointUseProvisioning(
-      storage,
-      checkpointID,
-      claim.token,
-      principal,
-      attemptID,
-      requestedLeaseID,
+    await storage.transaction((transaction) =>
+      bindCheckpointUseProvisioningInTransaction(
+        transaction,
+        checkpointID,
+        tokenHash,
+        principal,
+        attemptID,
+        requestedLeaseID,
+      ),
     );
     if (scenario.attemptState === "canceled") {
       const attempt = (await storage.get<CreateAttemptRecord>(
@@ -1053,10 +1071,18 @@ describe("PostgresCoordinatorStorage", () => {
 
     expect([...(await storage.list({ prefix: "ready-pool:" })).values()]).toEqual([]);
     expect([...(await storage.list({ prefix: "ready-pool-fill-claim:" })).values()]).toEqual([]);
-    expect([...(await storage.list({ prefix: "ready-pool-desired:" })).values()]).toEqual([]);
+    const desiredKey = await readyPoolDesiredCapacityKeyV2({
+      org: orgKeyForLabel("example-org"),
+      owner: "alice@example.com",
+      key: "builders",
+      compatibilityKey: undefined,
+      identity,
+    });
+    expect([...(await storage.list({ prefix: "ready-pool-desired:" })).keys()]).toEqual([]);
+    expect(await storage.get(desiredKey)).toBeTruthy();
     expect(await storage.get(`typed-ready-pool-v1:builders:${leaseID}`)).toBeTruthy();
     expect(await storage.get(`typed-ready-pool-v1-fill-claim:${claim.claim.token}`)).toBeTruthy();
-    expect((await storage.list({ prefix: "typed-ready-pool-v1-desired:" })).size).toBe(1);
+    expect((await storage.list({ prefix: "typed-ready-pool-v1-desired:" })).size).toBe(0);
 
     const rolledBackWorker = new FleetCoordinator(postgresTestRuntime(storage), env);
     const legacyStatus = await rolledBackWorker.fetch(

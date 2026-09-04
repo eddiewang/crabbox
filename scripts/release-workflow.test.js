@@ -432,10 +432,14 @@ test("release source guard pins an allowed signed tag object while permitting la
   }
 });
 
-test("release notes extraction is exact and rejects missing sections", () => {
+test("release notes extraction ignores Unreleased, is exact, and rejects missing sections", () => {
   const extractor = path.join(repoRoot, "scripts", "extract-release-notes.sh");
   const changelog = [
     "# Changelog",
+    "",
+    "## Unreleased",
+    "",
+    "- Pending change, not part of this release.",
     "",
     "## 1.2.3 - 2026-07-10",
     "",
@@ -796,10 +800,11 @@ test("release documentation authorizes normal continuation from one full request
   assert.match(opening, /original explicit (?:release\/publish |release )?request[^.!?]{0,80}authorization/i);
   assert.match(opening, /GitHub events alone[^.!?]{0,80}(?:not|never)[^.!?]{0,40}authoriz/i);
   const releaseProse = release.replace(/\s+/g, " ");
-  assert.match(releaseProse, /fail closed unless the administrative freeze[^.!?]{0,80}active/i);
-  assert.match(releaseProse, /release request[^.!?]{0,80}not evidence[^.!?]{0,80}freeze/i);
-  assert.match(releaseProse, /attests[^.!?]{0,100}actual exclusive-writer coordination/i);
-  assert.match(releaseProse, /does not request[^.!?]{0,40}chat approval/i);
+  assert.match(releaseProse, /no particular approval ruleset or release-team bypass is required/i);
+  assert.match(releaseProse, /no administrative freeze or serialization attestation is required/i);
+  assert.match(releaseProse, /final GET plus PATCH is not an atomic compare-and-swap/i);
+  assert.match(releaseProse, /does not claim exclusive-writer guarantees/i);
+  assert.doesNotMatch(release, /CRABBOX_RELEASE_SERIALIZATION_CONFIRMED/);
   assert.match(releaseProse, /explicit cancellation[^.!?]{0,100}renewed direction/i);
   assert.match(releaseProse, /normal continuation[^.!?]{0,100}original (?:release )?authorization/i);
   assert.match(operations.replace(/\s+/g, " "), /bounded[^.!?]{0,100}smoke[^.!?]{0,100}do not[^.!?]{0,100}unrelated provider mutations/i);

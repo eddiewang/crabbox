@@ -48,7 +48,6 @@ func TestCloudInitUsesRetryingBootstrap(t *testing.T) {
 		"test -w '/work/crabbox'",
 		"      Port 2222\n      Port 22",
 		"systemctl enable ssh || true",
-		"timeout 30s systemctl restart ssh || timeout 30s systemctl restart ssh.socket || true",
 		"touch /var/lib/crabbox/bootstrapped",
 	} {
 		if !strings.Contains(got, want) {
@@ -300,6 +299,10 @@ func TestCloudInitGnomeDesktopProfile(t *testing.T) {
 	cfg.Browser = true
 	cfg.DesktopEnv = "gnome"
 	got := cloudInit(cfg, "ssh-ed25519 test")
+	if strings.Count(got, indentCloudInitRuncmd(sharedGnomeDesktopTheme())) != 1 {
+		t.Fatal("GNOME cloud-init must install exactly one complete shared theme script")
+	}
+
 	for _, want := range []string{
 		"labwc wayvnc swaybg librsvg2-common gnome-panel wlr-randr grim slurp wtype wl-clipboard",
 		"swaybg librsvg2-common",

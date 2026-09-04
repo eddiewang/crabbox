@@ -184,7 +184,18 @@ the checkpoint for inspection.
 
 Before a native snapshot, Crabbox cleans the source: on Linux it runs
 `cloud-init clean --logs` (so a forked box regenerates SSH host keys) and
-`sync` to flush filesystem writes.
+`sync` to flush filesystem writes. Preparation uses the distro's
+`/usr/bin/python3` and installed cloud-init module to resolve its configured
+runtime directory. It requires completed initialization and a runtime directory
+on `tmpfs`, outside cloud-init's disk cache. The existing completion records are
+copied there before cleaning, so the running source remains ready while a new
+VM must complete its own boot. Preparation errors stop capture before creating
+an image.
+
+Direct AWS and Hetzner captures record the accepted image identity before
+waiting for readiness. If the process is interrupted during that wait, the
+checkpoint remains available for `inspect --verify` and provider cleanup;
+do not submit a replacement capture just because the wait was interrupted.
 
 ### Replayable source retirement
 
@@ -540,10 +551,18 @@ crabbox checkpoint fork --provider parallels --parallels-template ubuntu-fast --
   checkpoint, changed create intent, ambiguous resources, or a released lease
   ID fails without allocating a replacement. A later fork failure preserves the
   known fixed-ID lease for recovery instead of deleting adopted work. Direct
-  AWS, Machine0, local-container, and Incus container backends support this
-  checkpoint-bound contract. Archive checkpoints, direct Hetzner, direct Parallels snapshots,
-  coordinator-backed leases, and external providers reject fixed checkpoint
-  forks. Fixed IDs must remain retained and cannot fan out, override the
+  AWS, Machine0, local-container, Incus containers, and coordinator-managed native
+  checkpoint backends support this checkpoint-bound contract. Managed forks bind the
+  checkpoint incarnation and immutable image to the coordinator's fixed intent;
+  replay preserves the original provisioning claim and does not advance checkpoint
+  usage again. A replacement use claim must still be valid and available; replay
+  consumes it once. Only the exact original attempt claim can replay after its
+  consumption. An older coordinator rejects the dedicated fixed-checkpoint route
+  without falling back to ordinary creation. A fresh CLI invocation still needs
+  a valid use claim and refuses a deleted checkpoint; an in-request retry can
+  recover its already-created child after source deletion. Archive checkpoints, direct Hetzner,
+  direct Parallels snapshots, legacy unmanaged brokered checkpoints, and external
+  providers reject fixed checkpoint forks. Fixed IDs must remain retained and cannot fan out, override the
   deterministic workdir, or run commands following `--`.
 - *JSON output:* one fork prints one JSON object; `--count` greater than one
   prints one JSON array. Every object contains `checkpointId`, `leaseId`,
@@ -592,6 +611,12 @@ For native checkpoints, delete removes the provider resource first (AMIs are
 deregistered along with their backing EBS snapshots; disk snapshots are
 deleted), then removes the local record. Archive checkpoints just lose their
 tarball and record.
+
+Direct AWS deletion records all discovered backing snapshot IDs before
+deregistering the AMI. If deletion is interrupted or a snapshot cannot be
+removed, retry the same checkpoint deletion to finish its recorded cleanup.
+An unavailable backing mapping or failed discovery retains the checkpoint;
+it does not count as completed cleanup.
 
 Coordinator-managed checkpoints delete through the checkpoint endpoint, never
 the generic image endpoint. Active use claims, promoted-image catalog pins,

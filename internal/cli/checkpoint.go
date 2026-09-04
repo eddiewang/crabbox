@@ -2067,18 +2067,10 @@ func deleteCheckpointResource(ctx context.Context, store checkpointStore, record
 		if err != nil {
 			return err
 		}
-		if err := client.GuardAccount(ctx, record.Native.AccountID); err != nil {
-			return err
-		}
-		if len(record.Native.SnapshotIDs) == 0 {
-			if image, err := client.GetImageCheckpoint(ctx, providerID); err == nil && len(image.SnapshotIDs) > 0 {
-				record.Native.SnapshotIDs = image.SnapshotIDs
-				if writeErr := store.Write(record); writeErr != nil {
-					return writeErr
-				}
-			}
-		}
-		return client.DeleteImageCheckpoint(ctx, providerID, record.Native.SnapshotIDs, record.Native.AccountID)
+		return client.DeleteImageCheckpoint(ctx, providerID, record.Native.SnapshotIDs, record.Native.AccountID, func(snapshotIDs []string) error {
+			record.Native.SnapshotIDs = snapshotIDs
+			return store.Write(record)
+		})
 	}
 	if cfg, ok := directAzureCheckpointConfig(record); ok {
 		client, err := NewAzureClient(ctx, cfg)
@@ -2742,11 +2734,9 @@ func createCheckpointArchive(ctx context.Context, target SSHTarget, workdir, loc
 		return 0, exit(2, "create checkpoint archive: %v", err)
 	}
 	defer func() { _ = os.Remove(tmpPath) }()
-	cmd := sshCommandContext(ctx, target, sshArgs(target, remoteCheckpointArchiveCommand(workdir))...)
-	cmd.Stdout = file
+	transport := sshTransportPreparation{command: remoteCheckpointArchiveCommand(workdir)}
 	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	_, runErr := transport.runOnce(ctx, target, "10", "3", file, &stderr, false)
 	closeErr := file.Close()
 	if runErr != nil {
 		return 0, exit(7, "archive checkpoint workdir %s: %v: %s", workdir, runErr, trimFailureDetail(stderr.String()))

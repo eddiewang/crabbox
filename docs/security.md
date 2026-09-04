@@ -138,6 +138,14 @@ their leases, including runs that later replace the active backing lease. See
 [auth and admin](features/auth-admin.md) and [broker auth
 routing](features/broker-auth-routing.md) for the full flow.
 
+The separate [`GET /v1/capacity`](commands/capacity.md) diagnostic is a narrow
+exception: normal authentication resolves the self-owner, including for admin
+requests, and the response reveals only that owner's admission count across all
+months/orgs, effective owner limit, resolved identity, and snapshot time. Query
+parameters are rejected. This does not widen monthly usage or lease visibility,
+expose membership or lease records, or reserve/approve allocation. The diagnostic
+performs no domain-storage writes, cleanup, alarm scheduling, or provider calls.
+
 ### Bearer-to-Portal WebVNC bootstrap
 
 `crabbox webvnc --open` does not require GitHub OAuth when the CLI is already
@@ -600,10 +608,13 @@ digests. One explicit full release/publish request authorizes the complete norma
 sequence through closeout without renewed chat approval at each stage. Narrow
 requests stay narrow. The original request supplies authorization; GitHub events
 alone do not. Trust domains, sequential technical gates, credential isolation,
-identity binding, exact frozen inputs, immutability, actual exclusive-writer
-coordination, and cancellation boundaries remain mandatory. Authorization is
-not evidence of an administrative freeze. Publication changes only the verified
-draft state. Publication establishes eligibility for the existing ordinary tap
+identity binding, exact frozen inputs, immutability, immediate publication
+readbacks, and cancellation boundaries remain mandatory. Publication does not
+require a particular PR-approval ruleset or an administrative writer freeze.
+The final read and publication are not atomic, so another writer can still race
+that boundary; a detected post-publication mismatch is an incident, not
+permission to rewrite the release. Publication changes only the verified draft
+state. Publication establishes eligibility for the existing ordinary tap
 updater. The explicit operator handoff supplies four validated archive names
 and hashes; public native and public Go installation smokes neither authorize
 nor delay it. A Homebrew failure is retried independently without rebuilding,

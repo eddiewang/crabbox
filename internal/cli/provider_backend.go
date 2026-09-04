@@ -32,6 +32,12 @@ type ProviderConfigValidator interface {
 	ValidateConfig(cfg Config) error
 }
 
+// CoordinatorAcquireValidator keeps provider-owned creation policy at broker
+// acquisition; configuration checks must not prevent existing-lease cleanup.
+type CoordinatorAcquireValidator interface {
+	ValidateCoordinatorAcquire() error
+}
+
 // ProviderConfigDefaulter owns provider-specific defaults that must be applied
 // after generic config parsing and before target validation.
 type ProviderConfigDefaulter interface {
@@ -61,6 +67,13 @@ type ProviderConfigArchitectureDescriber interface {
 // The adapter must preserve its historical normalization, including whitespace.
 type ProviderClaimScoper interface {
 	ClaimScope(cfg Config) string
+}
+
+// RunLeaseClaimResolver prepares an already-bound canonical lease while core
+// holds its claim lock. It must honor cancellation and must not acquire claim
+// locks or publish local claims; core validates and publishes the result once.
+type RunLeaseClaimResolver interface {
+	ResolveRunLeaseUnderClaim(context.Context, ResolveRequest, LeaseClaim) (LeaseTarget, error)
 }
 
 // ProviderDiagnosticSecretSource contributes runtime-only credentials to the
@@ -237,6 +250,12 @@ type SSHLeaseBackend interface {
 	Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error)
 	List(ctx context.Context, req ListRequest) ([]LeaseView, error)
 	ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error
+}
+
+// SSHRunActivityBackend keeps provider-owned idle activity alive after lease
+// admission, including setup and sync. Stop must cancel and join its work.
+type SSHRunActivityBackend interface {
+	BeginSSHRunActivity(context.Context, LeaseTarget) (stop func(), err error)
 }
 
 // SSHRunFailureEvidenceBackend optionally captures provider-owned state just
@@ -470,7 +489,9 @@ type NativeCheckpointImage struct {
 	Provider     string
 	Kind         string
 	Region       string
+	AccountID    string
 	ResourceID   string
+	SnapshotIDs  []string
 	Architecture string
 	Direct       bool
 }
@@ -676,6 +697,9 @@ const (
 	FeatureRunArtifacts Feature = "run-artifacts"
 	FeatureRunDownloads Feature = "run-downloads"
 	FeatureModuleRun    Feature = "module-run"
+	// FeatureSSHScriptRun routes explicit scripts through the core SSH owner,
+	// while a hybrid backend may delegate ordinary commands.
+	FeatureSSHScriptRun Feature = "ssh-script-run"
 	FeaturePauseResume  Feature = "pause-resume"
 	FeatureMCP          Feature = "mcp-attachments"
 )
@@ -720,6 +744,9 @@ type LocalCommandRequest struct {
 	Stdout               io.Writer
 	Stderr               io.Writer
 	DisableOutputCapture bool
+	// CaptureOutputToFiles gives POSIX children synchronous regular-file output.
+	// Requires a positive capture limit and no streaming writers.
+	CaptureOutputToFiles bool
 	// MaxCapturedOutputBytes bounds each internally captured output stream.
 	// On overflow the command context is canceled so a continuously emitting
 	// child cannot block forever after the capture buffer fills.
@@ -790,6 +817,9 @@ func commandRunnerWithChildCredentialBoundary(next CommandRunner, denied []strin
 }
 
 func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+	if req.CaptureOutputToFiles && (req.DisableOutputCapture || req.MaxCapturedOutputBytes <= 0 || req.Stdout != nil || req.Stderr != nil) {
+		return LocalCommandResult{ExitCode: 1}, errors.New("file output capture requires a positive limit and no streaming writers")
+	}
 	commandCtx := ctx
 	var cancel context.CancelFunc
 	if req.MaxCapturedOutputBytes > 0 && !req.DisableOutputCapture {
@@ -821,33 +851,43 @@ func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (Loca
 	cmd.Stdin = req.Stdin
 	stdout := commandCaptureBuffer{limit: req.MaxCapturedOutputBytes, cancel: cancel}
 	stderr := commandCaptureBuffer{limit: req.MaxCapturedOutputBytes, cancel: cancel}
-	if req.Stdout != nil {
-		if req.DisableOutputCapture {
-			cmd.Stdout = req.Stdout
-		} else {
-			cmd.Stdout = io.MultiWriter(req.Stdout, &stdout)
+	cmd.Stdout = commandOutputWriter(req.Stdout, &stdout, req.DisableOutputCapture)
+	cmd.Stderr = commandOutputWriter(req.Stderr, &stderr, req.DisableOutputCapture)
+	var files *commandFileCapture
+	if req.CaptureOutputToFiles {
+		var err error
+		files, err = newCommandFileCapture(req.MaxCapturedOutputBytes)
+		if err != nil {
+			return LocalCommandResult{ExitCode: 1}, err
 		}
-	} else {
-		if req.DisableOutputCapture {
-			cmd.Stdout = io.Discard
-		} else {
-			cmd.Stdout = &stdout
+		defer files.close()
+		cmd.Stdout, cmd.Stderr = files.streams[0].writer, files.streams[1].writer
+	}
+	err := cmd.Start()
+	if err == nil {
+		var finishCapture func() commandFileCaptureOutcome
+		if files != nil {
+			files.closeWriters()
+			finishCapture = files.watch(cancel, cmd.Cancel, cmd.WaitDelay)
+		}
+		err = cmd.Wait()
+		if finishCapture != nil {
+			observed := finishCapture()
+			err = errors.Join(err, observed.err)
+			if !observed.settled {
+				return LocalCommandResult{ExitCode: exitCode(err)}, err
+			}
+			if readErr := files.read(&stdout, &stderr); readErr != nil {
+				_ = cmd.Cancel()
+				err = errors.Join(err, readErr)
+				return LocalCommandResult{ExitCode: exitCode(err)}, err
+			}
+			stdout.overflow = stdout.overflow || observed.overflow
+			if stdout.overflow || stderr.overflow || err != nil {
+				_ = cmd.Cancel()
+			}
 		}
 	}
-	if req.Stderr != nil {
-		if req.DisableOutputCapture {
-			cmd.Stderr = req.Stderr
-		} else {
-			cmd.Stderr = io.MultiWriter(req.Stderr, &stderr)
-		}
-	} else {
-		if req.DisableOutputCapture {
-			cmd.Stderr = io.Discard
-		} else {
-			cmd.Stderr = &stderr
-		}
-	}
-	err := cmd.Run()
 	if errors.Is(err, exec.ErrWaitDelay) && req.MaxCapturedOutputBytes > 0 && !req.DisableOutputCapture {
 		_ = cmd.Cancel()
 	}
@@ -860,6 +900,16 @@ func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (Loca
 		result.ExitCode = 0
 	}
 	return result, err
+}
+
+func commandOutputWriter(writer io.Writer, capture *commandCaptureBuffer, disabled bool) io.Writer {
+	if writer == nil {
+		writer = io.Discard
+	}
+	if disabled {
+		return writer
+	}
+	return io.MultiWriter(writer, capture)
 }
 
 // Bound pipe draining as well as process exit: CommandContext alone cannot
@@ -1320,6 +1370,17 @@ type LeaseTarget struct {
 	SSH         SSHTarget
 	LeaseID     string
 	Coordinator *CoordinatorClient
+	// Recorded by the validated provider lookup, never inferred from absent SSH.
+	providerRelease *leaseReleaseConfirmation
+}
+
+type leaseReleaseConfirmation struct {
+	backend Backend
+	leaseID string
+}
+
+func (lease LeaseTarget) providerReleaseConfirmedBy(backend Backend) bool {
+	return lease.providerRelease != nil && lease.providerRelease.backend == backend && lease.providerRelease.leaseID == lease.LeaseID
 }
 
 type LeaseView = Server
@@ -1699,7 +1760,7 @@ func loadBackend(cfg Config, rt Runtime) (Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ssh, ok := backend.(SSHLeaseBackend); ok && shouldUseCoordinator(cfg, provider.Spec()) {
+	if ssh, ok := backend.(SSHLeaseBackend); ok && ShouldUseCoordinator(cfg, provider.Spec()) {
 		coord, _, err := newCoordinatorClient(cfg)
 		if err != nil {
 			return nil, err
@@ -1718,7 +1779,9 @@ func configureProviderBackend(provider Provider, cfg *Config, rt Runtime) (Backe
 	return provider.Configure(*cfg, rt)
 }
 
-func shouldUseCoordinator(cfg Config, spec ProviderSpec) bool {
+// ShouldUseCoordinator reports whether provider allocations use the coordinator.
+// Registered mode keeps allocation with the direct provider.
+func ShouldUseCoordinator(cfg Config, spec ProviderSpec) bool {
 	return cfg.BrokerMode != BrokerModeRegistered &&
 		spec.Coordinator == CoordinatorSupported && strings.TrimSpace(cfg.Coordinator) != ""
 }

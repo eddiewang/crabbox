@@ -87,12 +87,23 @@ execution and includes `runID`. A missing receipt is not reconstructed from logs
 or events. A receipt-bearing CLI fails closed against a coordinator that accepts
 the finish but cannot return the exact stored receipt.
 
+If terminal recording fails, the CLI reports the attempted finish submission
+and receipt-verification errors, the attempt count, and the recovery command.
+These diagnostics remain available when the shared 60-second recording deadline
+expires. That failure does not establish the remote command's exit status; use
+the committed receipt to resolve an ambiguous result.
+
 Run records keep the initiating actor in `owner`/`org` and retain every backing
 lease identity used by a replacement flow. Each backing lease owner has
 read-only access to history, details, logs, events, telemetry, live event
 subscriptions, and portal pages for auditing work on their lease. Only the
 initiating actor or an admin can append events or telemetry and finish the run.
 Lease shares do not grant access to runs created by other actors.
+
+Once a finish is committed, later events remain in the ordered audit trail but
+do not change the run's terminal state, phase, end time, or backing lease
+metadata. This includes delayed output, duplicate failure notifications, and
+post-finish lease cleanup events; the committed logs and receipt remain authoritative.
 
 ## Storage limits
 

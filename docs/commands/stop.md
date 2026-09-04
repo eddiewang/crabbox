@@ -24,6 +24,14 @@ release; `--force` still requires successful inspection. Canceling the command
 does not start a release fallback. Cleanup must still be confirmed before local
 claim and SSH artifacts are removed.
 
+If a fixed-ID create was admitted by the coordinator but never allocated a
+machine, `stop` cancels that intent and confirms the cancellation even when
+the preliminary lease lookup returns 404. This includes a create rejected by
+a quota check. The owner, organization, and selected provider must match.
+Delayed creates cannot allocate after this confirmation; a genuinely unknown
+ID still fails, and an allocation already in progress must finish cleanup
+before Stop reports success.
+
 ## Identifying the lease
 
 Pass the lease as a positional argument or with `--id`; both accept the
@@ -177,9 +185,9 @@ non-destructive post-create workflows on a running sandbox. The separate
 and are not supported by Docker Sandbox.
 
 Coordinator-backed stops refresh guest connection state inside the release owner.
-A confirmed deletion skips guest SSH cleanup but still sends the provider-scoped
-release request and verifies its result. Retained machines and pending or failed
-provider cleanup do not count as confirmed deletion.
+A confirmed deletion skips guest SSH cleanup and repeats only local connection
+cleanup, without another provider release request. Retained machines and pending
+or failed provider cleanup do not count as confirmed deletion.
 
 For SSH leases, shared connection cleanup makes best-effort attempts to signal
 [Actions hydration](../features/actions-hydration.md) shutdown, stop local
@@ -196,6 +204,12 @@ inspection through claim acquisition, guest cleanup, release requests, and clean
 observation; an earlier caller deadline wins. Phase limits cannot restart this
 budget. Pending or failed provider cleanup still returns an error and preserves
 the local claim and SSH artifacts for a later retry.
+
+After confirmed coordinator-backed deletion, SSH masters created with canonical
+lease credentials are explicitly closed and observed to exit before local
+artifacts are removed. If that step fails, Stop reports that remote deletion is
+confirmed but local cleanup remains pending;
+the retained claim permits a local-only retry.
 
 Local daemon lock waits also honor the operation context. Once provider deletion
 is confirmed, a canceled local daemon cleanup warns without undoing that result.
