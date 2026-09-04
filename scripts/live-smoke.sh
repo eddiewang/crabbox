@@ -1055,8 +1055,9 @@ tenki_smoke() {
   stop_provider_lease tenki "$lease" "$slug"
   local claims_json
   capture_stdout claims_json run_in_repo "$cb" claims list --json
-  if printf '%s\n' "$claims_json" | jq -e --arg lease "$lease" 'any(.claims[]; .leaseId == $lease)' >/dev/null; then
-    echo "tenki stop retained local claim lease=$lease" >&2
+  if ! printf '%s\n' "$claims_json" | jq -e --arg lease "$lease" \
+    '(.problems == []) and (.claims | type == "array") and all(.claims[]; (.leaseId | type == "string") and .leaseId != $lease)' >/dev/null; then
+    echo "tenki stop did not confirm local claim removal lease=$lease" >&2
     return 1
   fi
   lease=""

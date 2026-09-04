@@ -1328,7 +1328,7 @@ esac
   assert.doesNotMatch(tenkiCalls, /^sandbox /m);
 });
 
-test("Tenki live smoke proves paused status waits do not resume the session", () => {
+test("Tenki live smoke proves paused status waits do not resume the session", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crabbox-live-tenki-"));
   const bin = path.join(dir, "bin");
   const fakeCrabbox = path.join(bin, "crabbox");
@@ -1373,7 +1373,7 @@ case "$1" in
     printf 'stopped %s\\n' "\${*: -1}"
     ;;
   claims)
-    printf '{"version":1,"source":"local-claims","claims":[],"problems":[]}\\n'
+    printf '%s\\n' "\${CRABBOX_FAKE_CLAIMS:?}"
     ;;
   admin)
     printf '[]\\n'
@@ -1422,13 +1422,14 @@ esac
 `,
   );
 
-  const result = spawnSync("bash", ["scripts/live-smoke.sh"], {
+  const runSmoke = (claims) => spawnSync("bash", ["scripts/live-smoke.sh"], {
     cwd: repoRoot,
     env: {
       ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
       CRABBOX_BIN: fakeCrabbox,
       CRABBOX_FAKE_LOG: crabboxLog,
+      CRABBOX_FAKE_CLAIMS: claims,
       CRABBOX_LIVE: "1",
       CRABBOX_LIVE_COORDINATOR: "0",
       CRABBOX_LIVE_PROVIDERS: "tenki",
@@ -1441,6 +1442,7 @@ esac
     encoding: "utf8",
   });
 
+  const result = runSmoke('{"claims":[],"problems":[]}');
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /crabbox-tenki-ok/);
   assert.match(result.stdout, /paused-session readiness check preserved state=paused/);
@@ -1471,6 +1473,19 @@ esac
   );
   assert.doesNotMatch(tenkiCalls, /sandbox resume/);
   assert.equal(fs.readFileSync(stateFile, "utf8").trim(), "PAUSED");
+
+  for (const [name, claims] of [
+    ["malformed output", "not JSON"],
+    ["missing claims", '{"problems":[]}'],
+    ["unreadable claims", '{"claims":[],"problems":[{"error":"unreadable claim"}]}'],
+    ["retained claim", '{"claims":[{"leaseId":"cbx_123456789abc"}],"problems":[]}'],
+  ]) {
+    await t.test(`rejects ${name} as cleanup proof`, () => {
+      const failed = runSmoke(claims);
+      assert.notEqual(failed.status, 0, failed.stdout + failed.stderr);
+      assert.match(failed.stderr, /tenki stop did not confirm local claim removal/);
+    });
+  }
 });
 
 test("Machine0 live smoke proves guarded lifecycle, IP refresh, checkpoint, and cleanup", () => {
