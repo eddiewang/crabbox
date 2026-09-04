@@ -63,7 +63,11 @@ func TestTenkiReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 		liveSessionID      string
 		liveLeaseID        string
 		postTerminateState string
+		postTerminateID    *string
+		postTerminateError string
+		cancelOnAck        bool
 		terminateErr       error
+		terminateStderr    string
 		exitZeroUsage      bool
 		ackTimeout         time.Duration
 		wantErr            string
@@ -80,6 +84,15 @@ func TestTenkiReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 		{name: "failed termination retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", terminateErr: errors.New("provider unavailable"), wantErr: "provider unavailable"},
 		{name: "exit-zero usage retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", exitZeroUsage: true, wantErr: "contract"},
 		{name: "unacknowledged termination retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateState: "RUNNING", ackTimeout: 10 * time.Millisecond, wantErr: "termination", wantTerminated: true},
+		{name: "terminated exact session", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateState: "TERMINATED", wantTerminated: true},
+		{name: "acknowledgement identity mismatch retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateID: new("session-other"), wantErr: "identity", wantTerminated: true},
+		{name: "acknowledgement missing identity retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateID: new(""), wantErr: "identity", wantTerminated: true},
+		{name: "workspace lookup failure retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateError: "workspace not found", ackTimeout: 10 * time.Millisecond, wantErr: "workspace not found", wantTerminated: true},
+		{name: "config lookup failure retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateError: "configuration not found", ackTimeout: 10 * time.Millisecond, wantErr: "configuration not found", wantTerminated: true},
+		{name: "auth lookup failure retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateError: "API key not found", ackTimeout: 10 * time.Millisecond, wantErr: "API key not found", wantTerminated: true},
+		{name: "gateway lookup failure retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", postTerminateError: "no sandbox gateway available", ackTimeout: 10 * time.Millisecond, wantErr: "no sandbox gateway available", wantTerminated: true},
+		{name: "ambiguous termination failure retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", terminateErr: errors.New("exit status 1"), terminateStderr: "workspace not found", wantErr: "workspace not found"},
+		{name: "cancel during acknowledgement retains claim", claimedSessionID: "session-owned", liveSessionID: "session-owned", liveLeaseID: "cbx_abcdef123456", cancelOnAck: true, wantErr: "context canceled", wantTerminated: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("XDG_STATE_HOME", t.TempDir())
@@ -100,6 +113,8 @@ func TestTenkiReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 				}
 			}
 			terminated := false
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			runner := &fakeRunner{run: func(req LocalCommandRequest) (LocalCommandResult, error) {
 				command := strings.Join(req.Args, " ")
 				switch {
@@ -109,10 +124,20 @@ func TestTenkiReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 						metadata = fmt.Sprintf(`{"crabbox_provider":"tenki","crabbox_lease_id":"%s","crabbox_slug":"owned"}`, tc.liveLeaseID)
 					}
 					state := "RUNNING"
+					id := tc.liveSessionID
 					if terminated {
+						if tc.cancelOnAck {
+							cancel()
+						}
+						if tc.postTerminateError != "" {
+							return LocalCommandResult{ExitCode: 1, Stderr: tc.postTerminateError}, errors.New("exit status 1")
+						}
+						if tc.postTerminateID != nil {
+							id = *tc.postTerminateID
+						}
 						state = blank(tc.postTerminateState, "TERMINATING")
 					}
-					return LocalCommandResult{Stdout: fmt.Sprintf(`{"id":"%s","name":"owned","state":"%s","metadata":%s}`, tc.liveSessionID, state, metadata)}, nil
+					return LocalCommandResult{Stdout: fmt.Sprintf(`{"id":"%s","name":"owned","state":"%s","metadata":%s}`, id, state, metadata)}, nil
 				case strings.HasPrefix(command, "sandbox terminate "):
 					if strings.Contains(command, "--workspace") || strings.Contains(command, "--project") {
 						t.Fatalf("legacy scope selector leaked into terminate command: %s", command)
@@ -121,7 +146,7 @@ func TestTenkiReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 						return LocalCommandResult{Stderr: "Incorrect Usage: flag provided but not defined: -future-flag"}, nil
 					}
 					if tc.terminateErr != nil {
-						return LocalCommandResult{ExitCode: 1}, tc.terminateErr
+						return LocalCommandResult{ExitCode: 1, Stderr: tc.terminateStderr}, tc.terminateErr
 					}
 					terminated = true
 					return LocalCommandResult{}, nil
@@ -138,7 +163,7 @@ func TestTenkiReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 					return context.Cause(ctx)
 				}
 			}
-			err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: LeaseTarget{
+			err := backend.ReleaseLease(ctx, ReleaseLeaseRequest{Lease: LeaseTarget{
 				LeaseID: "cbx_abcdef123456", Server: Server{CloudID: "session-owned", Labels: map[string]string{"slug": "owned"}},
 			}})
 			if tc.wantErr != "" {
@@ -152,6 +177,11 @@ func TestTenkiReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatal(err)
+			} else if _, exists, claimErr := core.ReadLeaseClaimWithPresence("cbx_abcdef123456"); claimErr != nil || exists {
+				t.Fatalf("successful release retained claim: exists=%t err=%v", exists, claimErr)
+			}
+			if tc.cancelOnAck && !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation identity lost: %v", err)
 			}
 			if terminated != tc.wantTerminated {
 				t.Fatalf("terminated=%t want=%t", terminated, tc.wantTerminated)

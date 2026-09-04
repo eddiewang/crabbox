@@ -528,33 +528,19 @@ func (b *tenkiBackend) resolveSSHTarget(ctx context.Context, cfg Config, session
 }
 
 func (b *tenkiBackend) getSession(ctx context.Context, sessionID string) (tenkiSession, error) {
-	session, present, err := b.getSessionWithPresence(ctx, sessionID)
-	if err != nil {
-		return tenkiSession{}, err
-	}
-	if !present {
-		return tenkiSession{}, exit(4, "tenki sandbox session %q was not found", sessionID)
-	}
-	return session, nil
-}
-
-func (b *tenkiBackend) getSessionWithPresence(ctx context.Context, sessionID string) (tenkiSession, bool, error) {
 	args := append(b.sandboxArgs("get"), "--output", "json", sessionID)
 	result, err := b.runTenki(ctx, args, nil, nil)
 	if err != nil {
 		if isTenkiCLIContractError(err) {
-			return tenkiSession{}, false, err
+			return tenkiSession{}, err
 		}
-		if tenkiSessionMissing(result) {
-			return tenkiSession{}, false, nil
-		}
-		return tenkiSession{}, false, ExitError{Code: result.ExitCode, Message: fmt.Sprintf("tenki sandbox get failed: %v%s", err, tenkiCommandOutputDetail(result))}
+		return tenkiSession{}, ExitError{Code: result.ExitCode, Message: fmt.Sprintf("tenki sandbox get failed: %v%s", err, tenkiCommandOutputDetail(result))}
 	}
 	var session tenkiSession
 	if err := decodeTenkiJSON("get", result, &session); err != nil {
-		return tenkiSession{}, false, err
+		return tenkiSession{}, err
 	}
-	return session, true, nil
+	return session, nil
 }
 
 func (b *tenkiBackend) ensureSessionReadyForSSH(ctx context.Context, cfg Config, session tenkiSession) (tenkiSession, error) {
@@ -766,9 +752,6 @@ func (b *tenkiBackend) terminateSession(ctx context.Context, sessionID string) e
 		if isTenkiCLIContractError(err) {
 			return err
 		}
-		if tenkiSessionMissing(result) {
-			return nil
-		}
 		return ExitError{Code: result.ExitCode, Message: fmt.Sprintf("tenki sandbox terminate failed: %v%s", err, tenkiCommandOutputDetail(result))}
 	}
 	return nil
@@ -792,26 +775,25 @@ func (b *tenkiBackend) waitForTerminationAcknowledged(ctx context.Context, sessi
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	type observation struct {
-		session tenkiSession
-		present bool
-	}
 	result, err := shared.Poll(waitCtx, 0, time.Second, sleep,
-		func(ctx context.Context) (observation, error) {
-			session, present, err := b.getSessionWithPresence(ctx, sessionID)
-			return observation{session: session, present: present}, err
+		func(ctx context.Context) (tenkiSession, error) {
+			return b.getSession(ctx, sessionID)
 		},
-		func(_ context.Context, observed observation, fetchErr error) (bool, error) {
+		func(ctx context.Context, session tenkiSession, fetchErr error) (bool, error) {
+			if err := context.Cause(ctx); err != nil {
+				return false, err
+			}
 			if fetchErr != nil {
 				if isTenkiCLIContractError(fetchErr) {
 					return false, fetchErr
 				}
+				// A lookup diagnostic does not prove this session is absent.
 				return false, nil
 			}
-			if !observed.present {
-				return true, nil
+			if session.ID == "" || session.ID != sessionID {
+				return false, exit(4, "refusing Tenki termination acknowledgement for session %q: live session identity is %q", sessionID, session.ID)
 			}
-			switch tenkiNormalizedState(observed.session.State) {
+			switch tenkiNormalizedState(session.State) {
 			case "terminating", "terminated":
 				return true, nil
 			default:
@@ -819,7 +801,7 @@ func (b *tenkiBackend) waitForTerminationAcknowledged(ctx context.Context, sessi
 			}
 		}, nil)
 	if err == nil {
-		return nil
+		return context.Cause(waitCtx)
 	}
 	if cause := context.Cause(ctx); cause != nil && err == cause {
 		return cause
@@ -830,7 +812,7 @@ func (b *tenkiBackend) waitForTerminationAcknowledged(ctx context.Context, sessi
 	if result.Err != nil {
 		return exit(5, "could not confirm Tenki session %s termination: %v", sessionID, result.Err)
 	}
-	return exit(5, "Tenki session %s did not acknowledge termination; last state=%s", sessionID, blank(result.Value.session.State, "unknown"))
+	return exit(5, "Tenki session %s did not acknowledge termination; last state=%s", sessionID, blank(result.Value.State, "unknown"))
 }
 
 func (b *tenkiBackend) waitForTenkiSSHCommand(ctx context.Context, sessionID string, timeout time.Duration) (tenkiSSHCommandOutput, error) {
@@ -1141,11 +1123,6 @@ func tenkiCLIContractDiagnostic(result LocalCommandResult) string {
 		}
 	}
 	return ""
-}
-
-func tenkiSessionMissing(result LocalCommandResult) bool {
-	output := strings.ToLower(result.Stdout + "\n" + result.Stderr)
-	return strings.Contains(output, "not found") || strings.Contains(output, "no sandbox")
 }
 
 type tenkiSession struct {

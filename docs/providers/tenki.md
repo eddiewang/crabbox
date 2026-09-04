@@ -139,8 +139,10 @@ These map to Tenki create flags as `--cpu`, `--memory-mb`, and
 4. Let core Crabbox perform rsync, command execution, `ssh`, and artifacts.
 5. On release, verify the exact local claim, session ID, and fresh
    provider-side lease metadata, then run `tenki sandbox terminate <session-id>`
-   under the claim lock. Crabbox removes the claim only after Tenki acknowledges
-   termination; failed or uncertain termination preserves it for a safe retry.
+   under the claim lock. Crabbox removes the claim only after the same session
+   reports `TERMINATING` or `TERMINATED`. A mismatched or missing session ID,
+   lookup error, or cancellation preserves the claim for a safe retry; generic
+   "not found" diagnostics are not proof of session deletion.
 
 Session IDs and inventory metadata only discover sandboxes; they never
 authorize termination. Explicit `--reclaim` can adopt a session through a normal
