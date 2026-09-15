@@ -28,16 +28,16 @@ type fixedTenkiRunner struct {
 	calls        map[string]int
 	key, cert    string
 	listOverride *[]tenkiSession
-	hook         func(context.Context, LocalCommandRequest) (LocalCommandResult, error, bool)
+	hook         func(context.Context, core.LocalCommandRequest) (core.LocalCommandResult, error, bool)
 	createError  error
 	createOutput *string
 }
 
-func (f *fixedTenkiRunner) Run(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+func (f *fixedTenkiRunner) Run(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(req.Args) < 2 {
-		return LocalCommandResult{}, fmt.Errorf("unexpected command %v", req.Args)
+		return core.LocalCommandResult{}, fmt.Errorf("unexpected command %v", req.Args)
 	}
 	command := req.Args[1]
 	f.calls[command]++
@@ -46,9 +46,9 @@ func (f *fixedTenkiRunner) Run(ctx context.Context, req LocalCommandRequest) (Lo
 			return result, err
 		}
 	}
-	out := func(value any) (LocalCommandResult, error) {
+	out := func(value any) (core.LocalCommandResult, error) {
 		data, err := json.Marshal(value)
-		return LocalCommandResult{Stdout: string(data)}, err
+		return core.LocalCommandResult{Stdout: string(data)}, err
 	}
 	arg := func(key string) string {
 		for i := 0; i+1 < len(req.Args); i++ {
@@ -73,10 +73,10 @@ func (f *fixedTenkiRunner) Run(ctx context.Context, req LocalCommandRequest) (Lo
 		}
 		f.sessions[id] = s
 		if f.createOutput != nil {
-			return LocalCommandResult{Stdout: *f.createOutput}, f.createError
+			return core.LocalCommandResult{Stdout: *f.createOutput}, f.createError
 		}
 		if f.createError != nil {
-			return LocalCommandResult{ExitCode: 1}, f.createError
+			return core.LocalCommandResult{ExitCode: 1}, f.createError
 		}
 		return out(tenkiSession{ID: id})
 	case "list":
@@ -92,7 +92,7 @@ func (f *fixedTenkiRunner) Run(ctx context.Context, req LocalCommandRequest) (Lo
 		if s, ok := f.sessions[req.Args[len(req.Args)-1]]; ok {
 			return out(s)
 		}
-		return LocalCommandResult{ExitCode: 1}, errors.New("session not found")
+		return core.LocalCommandResult{ExitCode: 1}, errors.New("session not found")
 	case "ssh-command":
 		return out(tenkiSSHCommandOutput{SessionID: arg("--session"), User: "tenki", Host: "sandbox", Port: 22, IdentityFile: f.key, CertificateFile: f.cert, ProxyCommand: "tenki sandbox ssh-proxy"})
 	case "resume", "terminate":
@@ -106,13 +106,13 @@ func (f *fixedTenkiRunner) Run(ctx context.Context, req LocalCommandRequest) (Lo
 			s.State = "TERMINATING"
 		}
 		f.sessions[id] = s
-		return LocalCommandResult{}, nil
+		return core.LocalCommandResult{}, nil
 	default:
-		return LocalCommandResult{}, fmt.Errorf("unexpected command %v", req.Args)
+		return core.LocalCommandResult{}, fmt.Errorf("unexpected command %v", req.Args)
 	}
 }
 
-func newFixedTenkiTest(t *testing.T) (*tenkiBackend, *fixedTenkiRunner, AcquireRequest) {
+func newFixedTenkiTest(t *testing.T) (*tenkiBackend, *fixedTenkiRunner, core.AcquireRequest) {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	dir := t.TempDir()
@@ -123,13 +123,13 @@ func newFixedTenkiTest(t *testing.T) (*tenkiBackend, *fixedTenkiRunner, AcquireR
 		}
 	}
 	oldWait := waitForSSHReadyFunc
-	waitForSSHReadyFunc = func(ctx context.Context, _ *SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+	waitForSSHReadyFunc = func(ctx context.Context, _ *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
 		return ctx.Err()
 	}
 	t.Cleanup(func() { waitForSSHReadyFunc = oldWait })
-	cfg := Config{Provider: tenkiProvider, TargetOS: targetLinux, Network: networkPublic, TTL: time.Hour, IdleTimeout: 30 * time.Minute, Tenki: TenkiConfig{CLIPath: "tenki", Image: "example/image:latest", CPUs: 2, MemoryMB: 4096, DiskGB: 20}}
-	b := &tenkiBackend{cfg: cfg, spec: Provider{}.Spec(), rt: Runtime{Exec: f, Stdout: io.Discard, Stderr: io.Discard}, sleep: func(ctx context.Context, _ time.Duration) error { <-ctx.Done(); return ctx.Err() }, terminationAckTimeout: 10 * time.Millisecond}
-	return b, f, AcquireRequest{RequestedLeaseID: testFixedTenkiID, RequestedSlug: "build-linux", Keep: true, Repo: Repo{Root: t.TempDir()}}
+	cfg := core.Config{Provider: tenkiProvider, TargetOS: targetLinux, Network: networkPublic, TTL: time.Hour, IdleTimeout: 30 * time.Minute, Tenki: core.TenkiConfig{CLIPath: "tenki", Image: "example/image:latest", CPUs: 2, MemoryMB: 4096, DiskGB: 20}}
+	b := &tenkiBackend{cfg: cfg, spec: Provider{}.Spec(), rt: core.Runtime{Exec: f, Stdout: io.Discard, Stderr: io.Discard}, sleep: func(ctx context.Context, _ time.Duration) error { <-ctx.Done(); return ctx.Err() }, terminationAckTimeout: 10 * time.Millisecond}
+	return b, f, core.AcquireRequest{RequestedLeaseID: testFixedTenkiID, RequestedSlug: "build-linux", Keep: true, Repo: core.Repo{Root: t.TempDir()}}
 }
 
 func TestTenkiFixedAcquireReplay(t *testing.T) {
@@ -201,7 +201,7 @@ func TestTenkiInspectDiagnosticsResolvesSSHWithoutClaimMutation(t *testing.T) {
 				t.Fatal(err)
 			}
 			sshCalls := f.calls["ssh-command"]
-			inspected, err := b.Resolve(context.Background(), ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true, IncludeDiagnostics: true})
+			inspected, err := b.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true, IncludeDiagnostics: true})
 			if err != nil {
 				t.Fatal(err)
 			}

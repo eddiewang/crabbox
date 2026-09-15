@@ -16,13 +16,17 @@ func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	if !ok {
 		return nil
 	}
-	v.Apply(&cfg.AnthropicSRT, fs)
+	applied, err := v.Apply(&cfg.AnthropicSRT, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	if err != nil {
+		return err
+	}
 	return validateConfig(*cfg)
 }
 
-func validateConfig(cfg Config) error {
+func validateConfig(cfg core.Config) error {
 	if strings.TrimSpace(cfg.AnthropicSRT.CLIPath) == "" {
-		return exit(2, "anthropicSandboxRuntime cliPath must not be empty")
+		return core.Exit(2, "anthropicSandboxRuntime cliPath must not be empty")
 	}
 	return nil
 }

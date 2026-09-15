@@ -83,7 +83,7 @@ func TestCoordinatorFreshWindowsBootstrapTargets(t *testing.T) {
 					t.Fatalf("bootstrap lost authoritative host-key pin: %q, %v", pin, err)
 				}
 				// Resolution for subsequent commands still uses the strict selector.
-				reused, err := backend.coordinatorLeaseTargetForConfig(lease, cfg, nil)
+				reused, err := backend.coordinatorLeaseTargetForConfig(lease, cfg, nil, false)
 				if err != nil || reused.SSH.Port != workload.SSH.Port || !slices.Equal(reused.SSH.FallbackPorts, workload.SSH.FallbackPorts) || reused.SSH.User != lease.SSHUser {
 					t.Fatalf("reuse changed its port or user contract: %+v, %v", reused.SSH, err)
 				}
@@ -137,7 +137,11 @@ func TestCoordinatorFreshWindowsBootstrapDelivery(t *testing.T) {
 			// A synthetic proxy routes all SSH to the fake executable; no guest
 			// sockets, provider credentials, or privileged local ports are needed.
 			initial.SSHConfigProxy, workload.SSH.SSHConfigProxy = true, true
-			initial.NoControlMaster, workload.SSH.NoControlMaster = true, true
+			if mode == windowsModeWSL2 {
+				initial.NoControlMaster, workload.SSH.NoControlMaster = true, true
+			} else {
+				t.Setenv("CRABBOX_TEST_WINDOWS_REQUIRE_FRESH", "1")
+			}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 			defer cancel()
 			if err := bootstrapPreparedManagedWindowsDesktop(ctx, cfg, &workload.SSH, initial, "ssh-ed25519 fixture", io.Discard); err != nil {
@@ -161,12 +165,16 @@ func TestCoordinatorFreshWindowsBootstrapDelivery(t *testing.T) {
 				t.Fatalf("bootstrap did not transition from 22 to pinned 2222:\n%s", calls)
 			}
 			payload, err := os.ReadFile(filepath.Join(logDir, "bootstrap.ps1"))
-			if err != nil || string(payload) != windowsBootstrapPowerShell(cfg, "ssh-ed25519 fixture") {
+			if err != nil || string(payload) != WindowsBootstrapPowerShell(cfg, "ssh-ed25519 fixture") {
 				t.Fatalf("bootstrap did not receive the configured final-port script: %v", err)
 			}
 			if mode == windowsModeNormal {
+				if workload.SSH.NoControlMaster {
+					t.Fatal("bootstrap changed the workload control-master policy")
+				}
+				t.Setenv("CRABBOX_TEST_WINDOWS_REQUIRE_FRESH", "")
 				t.Setenv("CRABBOX_TEST_WINDOWS_WORKLOAD_FAIL", "1")
-				err := runSSHInput(ctx, workload.SSH, powershellCommand("exit 73"), nil, io.Discard, io.Discard)
+				err := runSSHInput(ctx, workload.SSH, PowershellCommand("exit 73"), nil, io.Discard, io.Discard)
 				var exitErr *exec.ExitError
 				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 73 {
 					t.Fatalf("fake workload failure was lost: %v", err)
@@ -215,10 +223,13 @@ func installWindowsBootstrapSSH(t *testing.T) string {
 	dir := t.TempDir()
 	script := `#!/bin/sh
 port=
+fresh=
 while [ "$#" -gt 0 ]; do
+  if [ "$1" = ControlMaster=no ]; then fresh=1; fi
   if [ "$1" = -p ]; then shift; port=$1; fi
   shift
 done
+if [ "${CRABBOX_TEST_WINDOWS_REQUIRE_FRESH:-}" = 1 ] && [ "$fresh" != 1 ]; then exit 74; fi
 phase=initial
 if [ -f "$CRABBOX_TEST_WINDOWS_SSH/ready" ]; then phase=ready; fi
 printf '%s %s\n' "$phase" "$port" >> "$CRABBOX_TEST_WINDOWS_SSH/calls"

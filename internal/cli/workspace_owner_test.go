@@ -36,6 +36,75 @@ func (f workspaceOwnerTransportFunc) Do(ctx context.Context, req workspaceOwnerR
 	return f(ctx, req)
 }
 
+func TestWorkspaceOwnerTransportErrorDiagnostics(t *testing.T) {
+	original := errors.New("ordinary transport error")
+	for _, response := range []string{"MISMATCH", "EXPIRED", "AMBIGUOUS", "", "unrecognized response", "CHILD", "OWNED"} {
+		recognized := response == "MISMATCH" || response == "EXPIRED" || response == "AMBIGUOUS"
+		annotated := workspaceOwnerProtocolError(response, original)
+		if !errors.Is(annotated, original) {
+			t.Fatal("annotation lost original error")
+		}
+		if !recognized && annotated != original {
+			t.Fatal("unknown response changed original error")
+		}
+		for _, operation := range []string{"renew", "inspect", "wait"} {
+			t.Run(operation+"/"+response, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				calls := 0
+				owner := &workspaceOwner{
+					ctx: ctx, cancel: cancel, stop: make(chan struct{}), done: make(chan struct{}),
+					transport: workspaceOwnerTransportFunc(func(_ context.Context, req workspaceOwnerRemoteRequest) (string, error) {
+						calls++
+						wantAction := workspaceOwnerInspect
+						if operation == "renew" {
+							wantAction = workspaceOwnerRenew
+						}
+						if req.Action != wantAction {
+							t.Fatalf("action=%v", req.Action)
+						}
+						return response, original
+					}),
+				}
+				var err error
+				var prefix string
+				switch operation {
+				case "renew":
+					ticks := make(chan time.Time, 1)
+					ticks <- time.Now()
+					owner.renewLoopWithTicks(ticks, time.Second)
+					err = owner.Err()
+					prefix = "remote workspace owner renewal failed closed: "
+					if ctx.Err() != context.Canceled {
+						t.Fatal("renewal no longer cancels")
+					}
+				case "inspect":
+					var result workspaceOwnerInspectResult
+					result, err = owner.inspectChild(ctx)
+					prefix = "confirm remote workspace owner child state: ambiguous remote state: "
+					if result != workspaceOwnerQuiescent {
+						t.Fatal("inspection failure result changed")
+					}
+				case "wait":
+					err = owner.WaitForChild(ctx, time.Second)
+					prefix = "confirm remote workspace phase witness: ambiguous remote state: "
+				}
+				want := prefix + original.Error()
+				if recognized {
+					want = prefix + "protocol state " + response + ": " + original.Error()
+				}
+				var exitErr ExitError
+				if calls != 1 || !AsExitError(err, &exitErr) || exitErr.Code != 7 || err.Error() != want {
+					t.Fatalf("calls=%d err=%v want=%q", calls, err, want)
+				}
+				if operation != "renew" && ctx.Err() != nil {
+					t.Fatal("diagnostic canceled caller context")
+				}
+			})
+		}
+	}
+}
+
 func newFakeWorkspaceOwnerRemote() *fakeWorkspaceOwnerRemote {
 	return &fakeWorkspaceOwnerRemote{changed: make(chan struct{})}
 }
@@ -159,7 +228,11 @@ func TestWorkspaceOwnerSerializesIndependentClientsAndRevisions(t *testing.T) {
 		if active.Add(1) != 1 {
 			overlap.Store(true)
 		}
-		defer active.Add(-1)
+		var result error
+		defer func() {
+			active.Add(-1)
+			done <- result
+		}()
 		workspace.Lock()
 		workspace.revision = revision
 		workspace.Unlock()
@@ -173,10 +246,8 @@ func TestWorkspaceOwnerSerializesIndependentClientsAndRevisions(t *testing.T) {
 		executed := workspace.revision
 		workspace.Unlock()
 		if executed != revision {
-			done <- fmt.Errorf("executed revision %s, want %s", executed, revision)
-			return
+			result = fmt.Errorf("executed revision %s, want %s", executed, revision)
 		}
-		done <- nil
 	}
 	go run(ownerA, "revision-a", startedA, releaseA)
 	<-startedA
@@ -495,7 +566,7 @@ func TestWorkspaceOwnerProtocolGeneration(t *testing.T) {
 		t.Fatalf("POSIX owner protocol must use the portable launcher: %q", posixTransport[:min(len(posixTransport), 80)])
 	}
 	posix := remoteWorkspaceOwnerPOSIX(req)
-	for _, want := range []string{".crabbox/workspace-owners", key + ".gate", "$key.owner", "$key.child", "flock -x -w 0", "lockf -t 0", "ps -o lstart=", "RECOVERED", "MISMATCH", "EXPIRED", "AMBIGUOUS", `[ "$state_expiry" -gt "$(date +%s)" ]`} {
+	for _, want := range []string{".crabbox/workspace-owners", key + ".gate", "$key.owner", "$key.child", "flock -x -w 0", "lockf -k -t 0", "ps -o lstart=", "RECOVERED", "MISMATCH", "EXPIRED", "AMBIGUOUS", `[ "$state_expiry" -gt "$(date +%s)" ]`} {
 		if !strings.Contains(posix, want) {
 			t.Fatalf("POSIX protocol missing %q:\n%s", want, posix)
 		}

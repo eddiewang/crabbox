@@ -273,13 +273,35 @@ Configure the `image-publisher` GitHub environment with:
   secrets when the coordinator is behind Cloudflare Access.
 
 Add required reviewers to that environment so paid image creation and
-fleet-wide promotion need explicit administrator approval. Dispatch one
-platform at a time from the protected default branch:
+fleet-wide promotion need explicit administrator approval.
+
+Before publishing, dispatch `Verify Image Publisher Auth` from the protected
+default branch to check the existing environment credential without creating
+leases, building images, or changing the fleet:
+
+```bash
+gh workflow run image-publisher-auth-check.yml --ref main
+```
+
+The check retains the `image-publisher` approval rules, including independent
+approval when self-review is disabled. It requires `CRABBOX_COORDINATOR` to be
+exactly `https://crabbox.openclaw.ai`, makes one read-only `/v1/whoami` request,
+and fails unless the response confirms administrator access. It never follows
+redirects or retries; the request has a 10-second deadline and 64 KiB response
+limit. Logs contain only a fixed result status, HTTP status, recognized auth
+kind, and administrator boolean. Success verifies only the current credential,
+not image readiness or permission to publish. A pending approval is not auth
+proof; inspect the completed verification job before proceeding. HTTP, transport,
+or response-validation failures do not by themselves prove that the credential
+is invalid; resolve the reported failure before changing credentials.
+
+Dispatch publication one platform at a time from the protected default branch:
 
 ```bash
 gh workflow run devtools-image-publish.yml \
   --ref main \
   -f target=linux \
+  -f linux_os=ubuntu:24.04 \
   -f region=eu-west-1
 
 gh workflow run devtools-image-publish.yml \
@@ -293,6 +315,13 @@ gh workflow run devtools-image-publish.yml \
   -f region=eu-west-1 \
   -f macos_host=use-existing
 ```
+
+Linux publication defaults to `linux_os=ubuntu:26.04`; the example explicitly
+selects Ubuntu 24.04. The selector applies only to the Linux mint command and
+scopes its source, candidate, and promoted proof leases, promotion, and receipt
+rollback. Windows and macOS commands do not receive this Linux selector.
+Existing explicit image overrides still take precedence; requesting an OS does
+not prove the guest's actual OS or qualify the image.
 
 Use `macos_host=allocate` only when no suitable EC2 Mac Dedicated Host is
 available. Unmeasured publication uploads its complete mint logs and macOS
@@ -319,6 +348,17 @@ instead of hand-running the prep and image commands:
 scripts/mint-aws-devtools-image.sh --target linux
 scripts/mint-aws-devtools-image.sh --target windows
 ```
+
+For an explicit Ubuntu 24.04 Linux plan, use:
+
+```bash
+CRABBOX_OS=ubuntu:24.04 scripts/mint-aws-devtools-image.sh --target linux
+```
+
+The standalone wrapper leaves existing CLI/config selection unchanged when
+`CRABBOX_OS` is unset. When it is set for Linux, promotion and receipt rollback
+receive the same explicit `--os`; final proof still uses normal image selection
+without a candidate AMI override.
 
 The default is a no-spend plan that prints what it would do and stops. Add
 `--run` only when the selected AWS account, region, quotas, and image name are
@@ -631,10 +671,27 @@ boots independently rerun the declared probes under a sanitized system PATH
 before skipping baseline APT. Use the timing logs to compare provider request,
 network readiness, bootstrap, and end-to-end time before and after each bake.
 
-Linux source, candidate, and promoted smokes require a nonroot user and execute
-the normal `pnpm --version` command in that user's existing environment, preserving
-its readiness check and first-use cache warming. This normal command is not
-used to authenticate cached archives or skip their verification.
+Linux source, candidate, and promoted smokes require a nonroot user. After
+successful bundled Linux preparation, the wrapper activates the selected pnpm
+release as the lease user: the privileged installer only seeds root's Corepack
+cache. The existing `CRABBOX_LINUX_PNPM_VERSION` selector is passed unchanged to
+Corepack, including tags, ranges, and integrity-qualified versions.
+
+Before image capture, the wrapper records the resolved ordinary `pnpm --version`
+outside the checkout, using the lease user's normal home/cache and disabling
+Corepack network access for the probe. It also requires `corepack pnpm --version`
+to agree, rejecting version disagreement from a shadowing command. Each later
+smoke checks that same resolved default offline without reactivating it or
+resolving the selector again.
+Preparation, capture, or version mismatch failures stop publication and follow
+the existing lease cleanup and promotion rollback paths.
+
+This establishes the image user's initial default, not a permanent version lock.
+Project `packageManager` pins and existing cached releases remain usable; no
+shared Corepack home is introduced. Custom prep scripts and Windows retain their
+existing behavior, and the standalone root installer does not configure arbitrary
+users. These normal-command checks do not authenticate cached archives or skip
+their verification.
 
 For the bundled Node-24/amd64 builder, each smoke additionally revalidates public
 archive bytes in private temporary directories. It executes fresh Node and both

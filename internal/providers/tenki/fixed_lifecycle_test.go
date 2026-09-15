@@ -16,7 +16,7 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
-func requireFixedClaim(t *testing.T) LeaseClaim {
+func requireFixedClaim(t *testing.T) core.LeaseClaim {
 	t.Helper()
 	claim, exists, err := core.ReadLeaseClaimWithPresence(testFixedTenkiID)
 	if err != nil || !exists || claim.FixedCreateIntent == nil {
@@ -32,7 +32,7 @@ func requireFixedConflict(t *testing.T, err error) {
 	}
 }
 
-func requireFixedAcquire(t *testing.T, b *tenkiBackend, req AcquireRequest) LeaseTarget {
+func requireFixedAcquire(t *testing.T, b *tenkiBackend, req core.AcquireRequest) core.LeaseTarget {
 	t.Helper()
 	lease, err := b.Acquire(context.Background(), req)
 	if err != nil {
@@ -41,9 +41,9 @@ func requireFixedAcquire(t *testing.T, b *tenkiBackend, req AcquireRequest) Leas
 	return lease
 }
 
-func requireFixedReleaseTarget(t *testing.T, b *tenkiBackend) LeaseTarget {
+func requireFixedReleaseTarget(t *testing.T, b *tenkiBackend) core.LeaseTarget {
 	t.Helper()
-	lease, err := b.Resolve(context.Background(), ResolveRequest{ID: testFixedTenkiID, ReleaseOnly: true})
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: testFixedTenkiID, ReleaseOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,26 +53,26 @@ func requireFixedReleaseTarget(t *testing.T, b *tenkiBackend) LeaseTarget {
 func TestTenkiFixedReplayRejectsRequestDrift(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		change func(*Config, *AcquireRequest)
+		change func(*core.Config, *core.AcquireRequest)
 	}{
-		{"slug", func(_ *Config, r *AcquireRequest) { r.RequestedSlug = "different-operation" }},
-		{"keep", func(_ *Config, r *AcquireRequest) { r.Keep = false }},
-		{"ttl", func(c *Config, _ *AcquireRequest) { c.TTL += time.Second }},
-		{"idle", func(c *Config, _ *AcquireRequest) { c.IdleTimeout += time.Second }},
-		{"endpoint", func(c *Config, _ *AcquireRequest) { c.Tenki.Endpoint = "https://other.example" }},
-		{"gateway", func(c *Config, _ *AcquireRequest) { c.Tenki.Gateway = "wss://other.example" }},
-		{"cli", func(c *Config, _ *AcquireRequest) { c.Tenki.CLIPath = "/other/tenki" }},
-		{"work root", func(c *Config, _ *AcquireRequest) { c.Tenki.WorkRoot = "/home/tenki/other" }},
-		{"image", func(c *Config, _ *AcquireRequest) { c.Tenki.Image = "other/image" }},
-		{"snapshot", func(c *Config, _ *AcquireRequest) { c.Tenki.Image, c.Tenki.Snapshot = "", "snapshot-other" }},
-		{"cpu", func(c *Config, _ *AcquireRequest) { c.Tenki.CPUs++ }},
-		{"memory", func(c *Config, _ *AcquireRequest) { c.Tenki.MemoryMB++ }},
-		{"disk", func(c *Config, _ *AcquireRequest) { c.Tenki.DiskGB++ }},
-		{"profile", func(c *Config, _ *AcquireRequest) { c.Profile = "other" }},
-		{"pond", func(c *Config, _ *AcquireRequest) { c.Pond = "other" }},
-		{"desktop", func(c *Config, _ *AcquireRequest) { c.Desktop = true }},
-		{"cache", func(c *Config, _ *AcquireRequest) { c.Cache.PurgeOnRelease = true }},
-		{"foreign repo even with reclaim", func(_ *Config, r *AcquireRequest) { r.Repo.Root += "/other"; r.Reclaim = true }},
+		{"slug", func(_ *core.Config, r *core.AcquireRequest) { r.RequestedSlug = "different-operation" }},
+		{"keep", func(_ *core.Config, r *core.AcquireRequest) { r.Keep = false }},
+		{"ttl", func(c *core.Config, _ *core.AcquireRequest) { c.TTL += time.Second }},
+		{"idle", func(c *core.Config, _ *core.AcquireRequest) { c.IdleTimeout += time.Second }},
+		{"endpoint", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.Endpoint = "https://other.example" }},
+		{"gateway", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.Gateway = "wss://other.example" }},
+		{"cli", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.CLIPath = "/other/tenki" }},
+		{"work root", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.WorkRoot = "/home/tenki/other" }},
+		{"image", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.Image = "other/image" }},
+		{"snapshot", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.Image, c.Tenki.Snapshot = "", "snapshot-other" }},
+		{"cpu", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.CPUs++ }},
+		{"memory", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.MemoryMB++ }},
+		{"disk", func(c *core.Config, _ *core.AcquireRequest) { c.Tenki.DiskGB++ }},
+		{"profile", func(c *core.Config, _ *core.AcquireRequest) { c.Profile = "other" }},
+		{"pond", func(c *core.Config, _ *core.AcquireRequest) { c.Pond = "other" }},
+		{"desktop", func(c *core.Config, _ *core.AcquireRequest) { c.Desktop = true }},
+		{"cache", func(c *core.Config, _ *core.AcquireRequest) { c.Cache.PurgeOnRelease = true }},
+		{"foreign repo even with reclaim", func(_ *core.Config, r *core.AcquireRequest) { r.Repo.Root += "/other"; r.Reclaim = true }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b, f, req := newFixedTenkiTest(t)
@@ -95,7 +95,7 @@ func TestTenkiFixedReplayPreservesHeartbeatLabels(t *testing.T) {
 	first := requireFixedAcquire(t, b, req)
 	before := requireFixedClaim(t)
 	idle := 15 * time.Minute
-	touched, err := b.Touch(context.Background(), TouchRequest{Lease: first, State: "ready", IdleTimeout: idle, IdleTimeoutOverride: &idle})
+	touched, err := b.Touch(context.Background(), core.TouchRequest{Lease: first, State: "ready", IdleTimeout: idle, IdleTimeoutOverride: &idle})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,11 +126,11 @@ func TestTenkiFixedForeignClaimsAndUnownedInventory(t *testing.T) {
 				if mode == "foreign provider" {
 					cfg.Provider = "ssh"
 				}
-				if err := core.ClaimLeaseTargetForRepoConfig(req.RequestedLeaseID, req.RequestedSlug, cfg, Server{Provider: cfg.Provider, CloudID: "foreign"}, SSHTarget{}, req.Repo.Root, time.Minute, false); err != nil {
+				if err := core.ClaimLeaseTargetForRepoConfig(req.RequestedLeaseID, req.RequestedSlug, cfg, core.Server{Provider: cfg.Provider, CloudID: "foreign"}, core.SSHTarget{}, req.Repo.Root, time.Minute, false); err != nil {
 					t.Fatal(err)
 				}
 			case "foreign session":
-				f.sessions["foreign"] = tenkiSession{ID: "foreign", Name: leaseProviderName(req.RequestedLeaseID, req.RequestedSlug), State: "RUNNING", Metadata: map[string]string{tenkiMetadataProvider: tenkiProvider, tenkiMetadataLease: req.RequestedLeaseID, tenkiMetadataSlug: req.RequestedSlug}}
+				f.sessions["foreign"] = tenkiSession{ID: "foreign", Name: core.LeaseProviderName(req.RequestedLeaseID, req.RequestedSlug), State: "RUNNING", Metadata: map[string]string{tenkiMetadataProvider: tenkiProvider, tenkiMetadataLease: req.RequestedLeaseID, tenkiMetadataSlug: req.RequestedSlug}}
 			case "duplicate inventory", "missing local attempt":
 				requireFixedAcquire(t, b, req)
 				if mode == "duplicate inventory" {
@@ -145,7 +145,7 @@ func TestTenkiFixedForeignClaimsAndUnownedInventory(t *testing.T) {
 				if _, err := b.Acquire(context.Background(), req); err == nil {
 					t.Fatal("expected lost response")
 				}
-				if err := core.WithDurableLeaseClaimLock(req.RequestedLeaseID, func(claim *LeaseClaim, _ bool, persist func() error) error {
+				if err := core.WithDurableLeaseClaimLock(req.RequestedLeaseID, func(claim *core.LeaseClaim, _ bool, persist func() error) error {
 					claim.FixedCreateIntent.Attempt = nil
 					return persist()
 				}); err != nil {
@@ -196,11 +196,11 @@ func TestTenkiFixedCreateFailuresRetainAttempt(t *testing.T) {
 			f.createOutput, f.createError = nil, nil
 			invisible := []tenkiSession{}
 			f.listOverride = &invisible
-			f.hook = func(_ context.Context, r LocalCommandRequest) (LocalCommandResult, error, bool) {
+			f.hook = func(_ context.Context, r core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
 				if r.Args[1] == "get" {
-					return LocalCommandResult{ExitCode: 1}, errors.New("API key not found"), true
+					return core.LocalCommandResult{ExitCode: 1}, errors.New("API key not found"), true
 				}
-				return LocalCommandResult{}, nil, false
+				return core.LocalCommandResult{}, nil, false
 			}
 			for i := 0; i < 2; i++ {
 				fresh := *b
@@ -220,11 +220,11 @@ func TestTenkiFixedCreateFailuresRetainAttempt(t *testing.T) {
 
 func TestTenkiFixedGetFailureAfterCreateRetainsReturnedID(t *testing.T) {
 	b, f, req := newFixedTenkiTest(t)
-	f.hook = func(_ context.Context, r LocalCommandRequest) (LocalCommandResult, error, bool) {
+	f.hook = func(_ context.Context, r core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
 		if r.Args[1] == "get" {
-			return LocalCommandResult{ExitCode: 1}, errors.New("detail unavailable"), true
+			return core.LocalCommandResult{ExitCode: 1}, errors.New("detail unavailable"), true
 		}
-		return LocalCommandResult{}, nil, false
+		return core.LocalCommandResult{}, nil, false
 	}
 	if _, err := b.Acquire(context.Background(), req); err == nil {
 		t.Fatal("expected detail error")
@@ -268,14 +268,14 @@ func TestTenkiFixedDetailAttestationBeforeSSH(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b, f, req := newFixedTenkiTest(t)
-			f.hook = func(_ context.Context, r LocalCommandRequest) (LocalCommandResult, error, bool) {
+			f.hook = func(_ context.Context, r core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
 				if r.Args[1] != "get" {
-					return LocalCommandResult{}, nil, false
+					return core.LocalCommandResult{}, nil, false
 				}
 				s := cloneTenkiSession(f.sessions["session-1"])
 				tc.change(&s)
 				data, _ := json.Marshal(s)
-				return LocalCommandResult{Stdout: string(data)}, nil, true
+				return core.LocalCommandResult{Stdout: string(data)}, nil, true
 			}
 			_, err := b.Acquire(context.Background(), req)
 			requireFixedConflict(t, err)
@@ -296,7 +296,7 @@ func TestTenkiFixedReadinessReattestsBeforeResumeAndAfterSSH(t *testing.T) {
 			getCalls := f.calls["get"]
 			s := f.sessions["session-1"]
 			if state == "SSH ready" {
-				waitForSSHReadyFunc = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
+				waitForSSHReadyFunc = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 					s.Metadata[tenkiMetadataAttempt] = "foreign"
 					f.sessions[s.ID] = s
 					return nil
@@ -304,14 +304,14 @@ func TestTenkiFixedReadinessReattestsBeforeResumeAndAfterSSH(t *testing.T) {
 			} else {
 				s.State = state
 				f.sessions[s.ID] = s
-				f.hook = func(_ context.Context, r LocalCommandRequest) (LocalCommandResult, error, bool) {
+				f.hook = func(_ context.Context, r core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
 					if r.Args[1] != "get" || f.calls["get"] <= getCalls+1 {
-						return LocalCommandResult{}, nil, false
+						return core.LocalCommandResult{}, nil, false
 					}
 					bad := cloneTenkiSession(s)
 					bad.ID, bad.State = "wrong-session", "PAUSED"
 					data, _ := json.Marshal(bad)
-					return LocalCommandResult{Stdout: string(data)}, nil, true
+					return core.LocalCommandResult{Stdout: string(data)}, nil, true
 				}
 			}
 			_, err := b.Acquire(context.Background(), req)
@@ -344,14 +344,14 @@ func TestTenkiFixedCancellationRetainsEvidence(t *testing.T) {
 			case "before create":
 				cancel()
 			case "during create":
-				f.hook = func(_ context.Context, r LocalCommandRequest) (LocalCommandResult, error, bool) {
+				f.hook = func(_ context.Context, r core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
 					if r.Args[1] == "create" {
 						cancel()
 					}
-					return LocalCommandResult{}, nil, false
+					return core.LocalCommandResult{}, nil, false
 				}
 			case "readiness":
-				waitForSSHReadyFunc = func(ctx context.Context, _ *SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+				waitForSSHReadyFunc = func(ctx context.Context, _ *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
 					cancel()
 					return ctx.Err()
 				}
@@ -380,7 +380,7 @@ func TestTenkiFixedCancellationRetainsEvidence(t *testing.T) {
 				t.Fatal("readiness preceded immutable binding")
 			}
 			f.hook = nil
-			waitForSSHReadyFunc = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error { return nil }
+			waitForSSHReadyFunc = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error { return nil }
 			requireFixedAcquire(t, b, req)
 			if f.calls["create"] != 1 {
 				t.Fatalf("resubmitted after cancellation: %v", f.calls)
@@ -400,7 +400,7 @@ func TestTenkiFixedResolvePreservesIntentAndReadOnlyInspection(t *testing.T) {
 			before := requireFixedClaim(t)
 			sshCalls := f.calls["ssh-command"]
 			for _, id := range []string{lease.LeaseID, req.RequestedSlug, lease.Server.CloudID} {
-				got, err := b.Resolve(context.Background(), ResolveRequest{ID: id, StatusOnly: true, NoLocalStateMutations: true, IncludeDiagnostics: true})
+				got, err := b.Resolve(context.Background(), core.ResolveRequest{ID: id, StatusOnly: true, NoLocalStateMutations: true, IncludeDiagnostics: true})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -423,11 +423,11 @@ func TestTenkiFixedResolvePreservesIntentAndReadOnlyInspection(t *testing.T) {
 				t.Fatalf("inspection side effect: %v", f.calls)
 			}
 			if state == "TERMINATED" {
-				_, err := b.Resolve(context.Background(), ResolveRequest{ID: lease.LeaseID, Repo: req.Repo, Reclaim: true})
+				_, err := b.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, Repo: req.Repo, Reclaim: true})
 				requireFixedConflict(t, err)
 				return
 			}
-			got, err := b.Resolve(context.Background(), ResolveRequest{ID: lease.LeaseID, Repo: req.Repo})
+			got, err := b.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, Repo: req.Repo})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -446,7 +446,7 @@ func TestTenkiFixedResolveUnboundAttemptAndForeignMetadata(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	before := requireFixedClaim(t)
-	status, err := b.Resolve(context.Background(), ResolveRequest{ID: req.RequestedLeaseID, StatusOnly: true, NoLocalStateMutations: true, IncludeDiagnostics: true})
+	status, err := b.Resolve(context.Background(), core.ResolveRequest{ID: req.RequestedLeaseID, StatusOnly: true, NoLocalStateMutations: true, IncludeDiagnostics: true})
 	if err != nil || status.Server.CloudID != "session-1" || status.SSH.Host != "" || f.calls["ssh-command"] != 0 {
 		t.Fatalf("status=%+v err=%v calls=%v", status, err, f.calls)
 	}
@@ -454,7 +454,7 @@ func TestTenkiFixedResolveUnboundAttemptAndForeignMetadata(t *testing.T) {
 		t.Fatal("inspection bound uncertain claim")
 	}
 	lease := requireFixedReleaseTarget(t, b)
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err != nil {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
 		t.Fatal(err)
 	}
 	if f.calls["terminate"] != 1 {
@@ -462,7 +462,7 @@ func TestTenkiFixedResolveUnboundAttemptAndForeignMetadata(t *testing.T) {
 	}
 	core.RemoveLeaseClaim(req.RequestedLeaseID)
 	for _, id := range []string{req.RequestedLeaseID, "session-1"} {
-		_, err := b.Resolve(context.Background(), ResolveRequest{ID: id, Repo: req.Repo, Reclaim: true})
+		_, err := b.Resolve(context.Background(), core.ResolveRequest{ID: id, Repo: req.Repo, Reclaim: true})
 		requireFixedConflict(t, err)
 	}
 }
@@ -472,7 +472,7 @@ func TestTenkiFixedReleaseRetainsSingleUseReceipt(t *testing.T) {
 	requireFixedAcquire(t, b, req)
 	lease := requireFixedReleaseTarget(t, b)
 	previous := requireFixedClaim(t)
-	outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), ReleaseLeaseRequest{Lease: lease})
+	outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), core.ReleaseLeaseRequest{Lease: lease})
 	if err != nil || !outcome.Terminal {
 		t.Fatalf("outcome=%+v err=%v", outcome, err)
 	}
@@ -484,12 +484,12 @@ func TestTenkiFixedReleaseRetainsSingleUseReceipt(t *testing.T) {
 		t.Fatalf("receipt not retained: retained=%t err=%v", retained, err)
 	}
 	calls := maps.Clone(f.calls)
-	f.hook = func(context.Context, LocalCommandRequest) (LocalCommandResult, error, bool) {
-		return LocalCommandResult{}, errors.New("terminal replay must not use Tenki"), true
+	f.hook = func(context.Context, core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
+		return core.LocalCommandResult{}, errors.New("terminal replay must not use Tenki"), true
 	}
 	for i := 0; i < 2; i++ {
 		lease = requireFixedReleaseTarget(t, b)
-		outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), ReleaseLeaseRequest{Lease: lease})
+		outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), core.ReleaseLeaseRequest{Lease: lease})
 		if err != nil || !outcome.Terminal {
 			t.Fatalf("repeated stop outcome=%+v err=%v", outcome, err)
 		}
@@ -497,13 +497,13 @@ func TestTenkiFixedReleaseRetainsSingleUseReceipt(t *testing.T) {
 			t.Fatalf("retention=%t err=%v", retained, err)
 		}
 	}
-	status, err := b.Resolve(context.Background(), ResolveRequest{ID: req.RequestedLeaseID, StatusOnly: true, IncludeDiagnostics: true, NoLocalStateMutations: true})
+	status, err := b.Resolve(context.Background(), core.ResolveRequest{ID: req.RequestedLeaseID, StatusOnly: true, IncludeDiagnostics: true, NoLocalStateMutations: true})
 	if err != nil || status.Server.Status != "terminated" || status.SSH.Host != "" {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
 	_, err = b.Acquire(context.Background(), req)
 	requireFixedConflict(t, err)
-	_, err = b.Resolve(context.Background(), ResolveRequest{ID: req.RequestedLeaseID, Reclaim: true})
+	_, err = b.Resolve(context.Background(), core.ResolveRequest{ID: req.RequestedLeaseID, Reclaim: true})
 	requireFixedConflict(t, err)
 	if !maps.Equal(calls, f.calls) || !reflect.DeepEqual(terminal, requireFixedClaim(t)) {
 		t.Fatalf("terminal replay mutated state: calls=%v want=%v", f.calls, calls)
@@ -519,15 +519,15 @@ func TestTenkiFixedReleaseUncertaintyAndWrongAcknowledgement(t *testing.T) {
 			before := requireFixedClaim(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			f.hook = func(_ context.Context, r LocalCommandRequest) (LocalCommandResult, error, bool) {
+			f.hook = func(_ context.Context, r core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
 				if r.Args[1] == "terminate" && mode == "terminate error" {
-					return LocalCommandResult{ExitCode: 1}, errors.New("workspace not found"), true
+					return core.LocalCommandResult{ExitCode: 1}, errors.New("workspace not found"), true
 				}
 				if r.Args[1] != "get" || f.calls["terminate"] == 0 {
-					return LocalCommandResult{}, nil, false
+					return core.LocalCommandResult{}, nil, false
 				}
 				if mode == "get error" {
-					return LocalCommandResult{ExitCode: 1}, errors.New("API key not found"), true
+					return core.LocalCommandResult{ExitCode: 1}, errors.New("API key not found"), true
 				}
 				s := cloneTenkiSession(f.sessions["session-1"])
 				switch mode {
@@ -545,9 +545,9 @@ func TestTenkiFixedReleaseUncertaintyAndWrongAcknowledgement(t *testing.T) {
 					cancel()
 				}
 				data, _ := json.Marshal(s)
-				return LocalCommandResult{Stdout: string(data)}, nil, true
+				return core.LocalCommandResult{Stdout: string(data)}, nil, true
 			}
-			outcome, err := b.ReleaseLeaseWithOutcome(ctx, ReleaseLeaseRequest{Lease: lease})
+			outcome, err := b.ReleaseLeaseWithOutcome(ctx, core.ReleaseLeaseRequest{Lease: lease})
 			if err == nil || outcome.Terminal {
 				t.Fatalf("uncertain release finalized: outcome=%+v err=%v", outcome, err)
 			}
@@ -556,7 +556,7 @@ func TestTenkiFixedReleaseUncertaintyAndWrongAcknowledgement(t *testing.T) {
 			}
 			f.hook = nil
 			lease = requireFixedReleaseTarget(t, b)
-			if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err != nil {
+			if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
 				t.Fatal(err)
 			}
 			want := 1
@@ -605,16 +605,16 @@ func TestTenkiFixedReleaseAndResolveRejectChangedIdentity(t *testing.T) {
 			case "bound missing":
 				f.sessions = map[string]tenkiSession{}
 			case "list error":
-				f.hook = func(context.Context, LocalCommandRequest) (LocalCommandResult, error, bool) {
-					return LocalCommandResult{ExitCode: 1}, errors.New("inventory unavailable"), true
+				f.hook = func(context.Context, core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
+					return core.LocalCommandResult{ExitCode: 1}, errors.New("inventory unavailable"), true
 				}
 			}
 			before := requireFixedClaim(t)
-			if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err == nil {
+			if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err == nil {
 				t.Fatal("unsafe release succeeded")
 			}
 			if !strings.HasPrefix(mode, "target") && mode != "claim revision" {
-				if _, err := b.Resolve(context.Background(), ResolveRequest{ID: req.RequestedLeaseID, Repo: req.Repo}); err == nil {
+				if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: req.RequestedLeaseID, Repo: req.Repo}); err == nil {
 					t.Fatal("unsafe reuse succeeded")
 				}
 				if _, err := b.Acquire(context.Background(), req); err == nil {
@@ -632,10 +632,10 @@ func TestTenkiFixedCallbackRunsOutsideLockAndRetainsFailure(t *testing.T) {
 	b, f, req := newFixedTenkiTest(t)
 	req.Keep = false
 	callbackErr := errors.New("callback failed")
-	req.OnAcquired = func(lease LeaseTarget) error {
+	req.OnAcquired = func(lease core.LeaseTarget) error {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		if err := core.WithDurableLeaseClaimLockContext(ctx, lease.LeaseID, func(claim *LeaseClaim, exists bool, _ func() error) error {
+		if err := core.WithDurableLeaseClaimLockContext(ctx, lease.LeaseID, func(claim *core.LeaseClaim, exists bool, _ func() error) error {
 			if !exists || claim.CloudID != lease.Server.CloudID || claim.FixedCreateIntent.State != "acquired" {
 				return fmt.Errorf("callback saw uncommitted identity")
 			}
@@ -661,9 +661,9 @@ func TestTenkiFixedCallbackRunsOutsideLockAndRetainsFailure(t *testing.T) {
 
 func TestTenkiFixedAttemptIsDurableBeforeSubmissionAndSSH(t *testing.T) {
 	b, f, req := newFixedTenkiTest(t)
-	f.hook = func(_ context.Context, r LocalCommandRequest) (LocalCommandResult, error, bool) {
+	f.hook = func(_ context.Context, r core.LocalCommandRequest) (core.LocalCommandResult, error, bool) {
 		if r.Args[1] != "create" {
-			return LocalCommandResult{}, nil, false
+			return core.LocalCommandResult{}, nil, false
 		}
 		claim := requireFixedClaim(t)
 		attempt, err := b.fixedAttempt(claim)
@@ -676,9 +676,9 @@ func TestTenkiFixedAttemptIsDurableBeforeSubmissionAndSSH(t *testing.T) {
 				t.Fatalf("submitted request differs from durable attempt: missing %q", value)
 			}
 		}
-		return LocalCommandResult{}, nil, false
+		return core.LocalCommandResult{}, nil, false
 	}
-	waitForSSHReadyFunc = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error {
+	waitForSSHReadyFunc = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 		claim := requireFixedClaim(t)
 		if claim.CloudID != "session-1" || claim.CloudImmutableID != "session-1" {
 			t.Fatalf("SSH preceded immutable binding: %+v", claim)
@@ -713,7 +713,7 @@ func TestTenkiFixedTouchRejectsStaleAndTerminalClaims(t *testing.T) {
 	b, f, req := newFixedTenkiTest(t)
 	first := requireFixedAcquire(t, b, req)
 	idle := 15 * time.Minute
-	touch := TouchRequest{Lease: first, State: "ready", IdleTimeoutOverride: &idle}
+	touch := core.TouchRequest{Lease: first, State: "ready", IdleTimeoutOverride: &idle}
 	if _, err := b.Touch(context.Background(), touch); err != nil {
 		t.Fatal(err)
 	}
@@ -725,12 +725,12 @@ func TestTenkiFixedTouchRejectsStaleAndTerminalClaims(t *testing.T) {
 		t.Fatal("stale heartbeat changed evidence")
 	}
 	lease := requireFixedReleaseTarget(t, b)
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err != nil {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
 		t.Fatal(err)
 	}
 	terminal := requireFixedReleaseTarget(t, b)
 	before = requireFixedClaim(t)
-	if _, err := b.Touch(context.Background(), TouchRequest{Lease: terminal, State: "ready", IdleTimeoutOverride: &idle}); err == nil {
+	if _, err := b.Touch(context.Background(), core.TouchRequest{Lease: terminal, State: "ready", IdleTimeoutOverride: &idle}); err == nil {
 		t.Fatal("heartbeat revived a terminal claim")
 	}
 	if !reflect.DeepEqual(before, requireFixedClaim(t)) || f.calls["create"] != 1 || f.calls["resume"] != 0 || f.calls["ssh-command"] != 1 {
@@ -743,10 +743,10 @@ func TestTenkiFixedTerminalReceiptRejectsTampering(t *testing.T) {
 	requireFixedAcquire(t, b, req)
 	lease := requireFixedReleaseTarget(t, b)
 	before := requireFixedClaim(t)
-	if err := b.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease}); err != nil {
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
 		t.Fatal(err)
 	}
-	if err := core.WithDurableLeaseClaimLock(req.RequestedLeaseID, func(claim *LeaseClaim, _ bool, persist func() error) error {
+	if err := core.WithDurableLeaseClaimLock(req.RequestedLeaseID, func(claim *core.LeaseClaim, _ bool, persist func() error) error {
 		claim.CloudID, claim.CloudImmutableID, claim.Labels["tenki_session_id"] = "foreign", "foreign", "foreign"
 		return persist()
 	}); err != nil {
@@ -766,7 +766,7 @@ func TestTenkiFixedTerminalReceiptRejectsTampering(t *testing.T) {
 func TestTenkiFixedConcurrentSameIDCallers(t *testing.T) {
 	b, f, req := newFixedTenkiTest(t)
 	var wg sync.WaitGroup
-	results := make(chan LeaseTarget, 4)
+	results := make(chan core.LeaseTarget, 4)
 	errorsCh := make(chan error, 4)
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
